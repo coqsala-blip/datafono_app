@@ -1,0 +1,30 @@
+{
+  "cli": {
+    "version": ">= 21.7.0",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "env": {
+        "EXPO_PUBLIC_DOCUMENT_API_URL": "http://192.168.1.135:4000"
+      }
+    },
+    "preview": {
+      "distribution": "internal",
+      "env": {
+        "EXPO_PUBLIC_DOCUMENT_API_URL": "https://REEMPLAZAR_POR_BACKEND_DE_PREPRODUCCION"
+      }
+    },
+    "production": {
+      "autoIncrement": true,
+      "env": {
+        "EXPO_PUBLIC_DOCUMENT_API_URL": "https://REEMPLAZAR_POR_BACKEND_DE_PRODUCCION"
+      }
+    }
+  },
+  "submit": {
+    "production": {}
+  }
+}
