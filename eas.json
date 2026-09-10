@@ -14,13 +14,13 @@
     "preview": {
       "distribution": "internal",
       "env": {
-        "EXPO_PUBLIC_DOCUMENT_API_URL": "https://REEMPLAZAR_POR_BACKEND_DE_PREPRODUCCION"
+        "EXPO_PUBLIC_DOCUMENT_API_URL": "https://tpv-gestor-backend.onrender.com"
       }
     },
     "production": {
       "autoIncrement": true,
       "env": {
-        "EXPO_PUBLIC_DOCUMENT_API_URL": "https://REEMPLAZAR_POR_BACKEND_DE_PRODUCCION"
+        "EXPO_PUBLIC_DOCUMENT_API_URL": "https://tpv-gestor-backend.onrender.com"
       }
     }
   },
