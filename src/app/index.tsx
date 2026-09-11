@@ -6,6 +6,7 @@ import * as MailComposer from 'expo-mail-composer';
 import * as Print from 'expo-print';
 import * as SecureStore from 'expo-secure-store';
 import * as Sharing from 'expo-sharing';
+import * as WebBrowser from 'expo-web-browser';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Alert,
@@ -150,6 +151,12 @@ export default function TpvScreen() {
   const [authFullName, setAuthFullName] = useState('');
   const [authCompanyName, setAuthCompanyName] = useState('');
   const [authError, setAuthError] = useState('');
+  const [subscriptionLoading, setSubscriptionLoading] = useState(false);
+  const [hasActiveSubscription, setHasActiveSubscription] = useState(false);
+  const [subscriptionStatus, setSubscriptionStatus] = useState('missing');
+  const [subscriptionAdditionalUsers, setSubscriptionAdditionalUsers] = useState('0');
+  const [subscriptionError, setSubscriptionError] = useState('');
+  const [checkoutLoading, setCheckoutLoading] = useState(false);
 
   // Estados para envío al gestor por rango de fechas (Global)
   const [managerModalVisible, setManagerModalVisible] = useState(false);
@@ -284,6 +291,32 @@ export default function TpvScreen() {
   }, []);
 
   useEffect(() => {
+    if (!accessToken || !configuredDocumentApiUrl) return;
+
+    (async () => {
+      setSubscriptionLoading(true);
+      try {
+        const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/billing/status`, {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        }, 10000);
+        const result = await response.json() as { active?: boolean; status?: string; error?: string };
+        if (response.status === 401) {
+          await SecureStore.deleteItemAsync(AUTH_TOKEN_KEY);
+          setAccessToken(null);
+          return;
+        }
+        setHasActiveSubscription(Boolean(result.active));
+        setSubscriptionStatus(result.status || 'missing');
+        setSubscriptionError(response.ok ? '' : (result.error || 'No se pudo consultar la suscripción.'));
+      } catch {
+        setSubscriptionError('No se pudo comprobar la suscripción. Comprueba tu conexión.');
+      } finally {
+        setSubscriptionLoading(false);
+      }
+    })();
+  }, [accessToken]);
+
+  useEffect(() => {
     (async () => {
       const storedToken = await SecureStore.getItemAsync(AUTH_TOKEN_KEY);
       if (!storedToken) {
@@ -358,6 +391,44 @@ export default function TpvScreen() {
     await SecureStore.deleteItemAsync(AUTH_TOKEN_KEY);
     setAccessToken(null);
     setAuthPassword('');
+  };
+
+  const startSubscriptionCheckout = async () => {
+    if (!accessToken || !configuredDocumentApiUrl) return;
+    setCheckoutLoading(true);
+    setSubscriptionError('');
+    const additionalUsers = Math.max(0, Math.min(50, Number(subscriptionAdditionalUsers) || 0));
+
+    try {
+      const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/billing/checkout`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify({ additionalUsers }),
+      }, 15000);
+      const result = await response.json() as { checkoutUrl?: string; error?: string };
+      if (!response.ok || !result.checkoutUrl) {
+        setSubscriptionError(result.error || 'No se pudo iniciar el pago.');
+        return;
+      }
+
+      await WebBrowser.openBrowserAsync(result.checkoutUrl);
+      const statusResponse = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/billing/status`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      }, 10000);
+      const statusResult = await statusResponse.json() as { active?: boolean; status?: string };
+      setHasActiveSubscription(Boolean(statusResult.active));
+      setSubscriptionStatus(statusResult.status || 'missing');
+      if (!statusResult.active) {
+        setSubscriptionError('El pago todavía no aparece activo. Cierra la página de Stripe y vuelve a comprobarlo en unos segundos.');
+      }
+    } catch {
+      setSubscriptionError('No se pudo completar la conexión con Stripe.');
+    } finally {
+      setCheckoutLoading(false);
+    }
   };
 
   // GUARDAR TRANSACCIONES AUTOMÁTICAMENTE
@@ -2054,6 +2125,55 @@ export default function TpvScreen() {
             </Pressable>
             <Pressable style={[styles.secondaryButton, { marginTop: 8 }]} onPress={() => { setAuthMode(authMode === 'login' ? 'register' : 'login'); setAuthError(''); }}>
               <Text style={styles.secondaryButtonText}>{authMode === 'login' ? 'Crear una cuenta nueva' : 'Ya tengo una cuenta'}</Text>
+            </Pressable>
+          </View>
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
+  if (subscriptionLoading) {
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24 }}>
+          <Text style={styles.modalTitle}>Comprobando suscripción...</Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  if (!hasActiveSubscription) {
+    const additionalUsers = Math.max(0, Math.min(50, Number(subscriptionAdditionalUsers) || 0));
+    const monthlyTotal = subscriptionBasePrice + (additionalUsers * subscriptionAdditionalUserPrice);
+
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <ScrollView contentContainerStyle={{ flexGrow: 1, justifyContent: 'center', padding: 24 }}>
+          <View style={[styles.card, { padding: 20 }]}>
+            <Text style={styles.modalTitle}>ACTIVA TU SUSCRIPCIÓN</Text>
+            <Text style={[styles.modalSubtitle, { marginBottom: 14 }]}>Para usar el TPV, presupuestos, facturas y gastos necesitas una suscripción activa.</Text>
+            <View style={{ padding: 12, backgroundColor: '#f8fafc', borderRadius: 8, borderWidth: 1, borderColor: '#cbd5e1' }}>
+              <Text style={styles.modalSubtitle}>Plan principal</Text>
+              <Text style={[styles.headerTitle, { marginTop: 4 }]}>7,00 € / mes</Text>
+              <Text style={[styles.modalSubtitle, { marginTop: 4 }]}>Cada usuario adicional: 2,00 € / mes</Text>
+            </View>
+            <Text style={[styles.modalSubtitle, { marginTop: 16 }]}>Usuarios adicionales</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="0"
+              placeholderTextColor="#94a3b8"
+              keyboardType="number-pad"
+              value={subscriptionAdditionalUsers}
+              onChangeText={(value) => setSubscriptionAdditionalUsers(value.replace(/[^0-9]/g, ''))}
+            />
+            <Text style={[styles.modalSubtitle, { fontWeight: 'bold', color: '#0f172a', marginTop: 8 }]}>Total mensual: {formatCurrency(monthlyTotal)}</Text>
+            {subscriptionStatus !== 'missing' ? <Text style={[styles.modalSubtitle, { marginTop: 6 }]}>Estado actual: {subscriptionStatus}</Text> : null}
+            {subscriptionError ? <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 10 }}>{subscriptionError}</Text> : null}
+            <Pressable style={[styles.primaryButton, { marginTop: 16 }]} onPress={startSubscriptionCheckout} disabled={checkoutLoading}>
+              <Text style={styles.primaryButtonText}>{checkoutLoading ? 'Abriendo pago...' : 'Pagar y activar suscripción'}</Text>
+            </Pressable>
+            <Pressable style={[styles.secondaryButton, { marginTop: 8 }]} onPress={signOut}>
+              <Text style={styles.secondaryButtonText}>Cerrar sesión</Text>
             </Pressable>
           </View>
         </ScrollView>

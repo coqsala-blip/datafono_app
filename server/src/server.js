@@ -115,6 +115,103 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
   res.json({ ok: true, user: req.user });
 });
 
+const activeSubscriptionStatuses = new Set(['active', 'trialing']);
+
+app.get('/api/billing/status', requireAuth, async (req, res) => {
+  const customerId = req.user.user_metadata?.stripe_customer_id;
+  if (!customerId) {
+    return res.json({ ok: true, active: false, status: 'missing' });
+  }
+
+  try {
+    const subscriptions = await stripe.subscriptions.list({
+      customer: customerId,
+      status: 'all',
+      limit: 10,
+    });
+    const subscription = subscriptions.data
+      .sort((left, right) => right.created - left.created)[0];
+
+    return res.json({
+      ok: true,
+      active: Boolean(subscription && activeSubscriptionStatuses.has(subscription.status)),
+      status: subscription?.status || 'missing',
+      subscriptionId: subscription?.id || null,
+      currentPeriodEnd: subscription?.current_period_end || null,
+    });
+  } catch (error) {
+    console.error('Error consultando suscripción:', error.message);
+    return res.status(502).json({ ok: false, error: 'No se pudo consultar la suscripción.' });
+  }
+});
+
+app.post('/api/billing/checkout', requireAuth, async (req, res) => {
+  const additionalUsers = Math.max(0, Math.min(50, Math.floor(Number(req.body?.additionalUsers) || 0)));
+  const basePriceId = process.env.STRIPE_BASE_PRICE_ID;
+  const extraPriceId = process.env.STRIPE_EXTRA_PRICE_ID;
+
+  if (!basePriceId || !extraPriceId || basePriceId.includes('REEMPLAZAR') || extraPriceId.includes('REEMPLAZAR')) {
+    return res.status(503).json({ ok: false, error: 'La facturación todavía no está configurada en Stripe.' });
+  }
+
+  try {
+    const customerId = req.user.user_metadata?.stripe_customer_id || (
+      await stripe.customers.create({
+        email: req.user.email,
+        name: req.user.user_metadata?.full_name || undefined,
+        metadata: { supabase_user_id: req.user.id },
+      })
+    ).id;
+
+    await supabase.auth.admin.updateUserById(req.user.id, {
+      user_metadata: {
+        ...req.user.user_metadata,
+        stripe_customer_id: customerId,
+      },
+    });
+
+    const lineItems = [{ price: basePriceId, quantity: 1 }];
+    if (additionalUsers > 0) {
+      lineItems.push({ price: extraPriceId, quantity: additionalUsers });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      customer: customerId,
+      line_items: lineItems,
+      success_url: `${PUBLIC_API_URL}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${PUBLIC_API_URL}/billing/cancelled`,
+      subscription_data: {
+        metadata: {
+          supabase_user_id: req.user.id,
+          additional_users: String(additionalUsers),
+        },
+      },
+      metadata: {
+        supabase_user_id: req.user.id,
+        additional_users: String(additionalUsers),
+      },
+    });
+
+    return res.status(201).json({
+      ok: true,
+      checkoutUrl: session.url,
+      totalMonthly: 7 + (additionalUsers * 2),
+    });
+  } catch (error) {
+    console.error('Error creando checkout de suscripción:', error.message);
+    return res.status(502).json({ ok: false, error: 'No se pudo iniciar el pago de la suscripción.' });
+  }
+});
+
+app.get('/billing/success', (req, res) => {
+  res.type('html').send('<h1>Pago recibido</h1><p>Puedes volver a la aplicación. Comprobaremos tu suscripción automáticamente.</p>');
+});
+
+app.get('/billing/cancelled', (req, res) => {
+  res.type('html').send('<h1>Pago cancelado</h1><p>Puedes cerrar esta página y volver a la aplicación.</p>');
+});
+
 app.post('/api/documents', async (req, res) => {
   const { id, ticketCode, documentType, amount, originalAmount, relatedTicketCode, refundHistory, isRefunded, createdAt, issuer, client, items, subtotal, iva, ivaRateApplied, type } = req.body;
 
