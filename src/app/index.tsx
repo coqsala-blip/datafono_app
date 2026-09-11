@@ -1,4 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { useStripeTerminal } from '@stripe/stripe-terminal-react-native';
 import { Camera, CameraView } from 'expo-camera';
 import * as FileSystemLegacy from 'expo-file-system/legacy';
 import * as ImagePicker from 'expo-image-picker';
@@ -44,6 +45,7 @@ type PendingInvoice = { client: Client; items: InvoiceItem[]; ivaRate: number; t
 
 const configuredDocumentApiUrl = process.env.EXPO_PUBLIC_DOCUMENT_API_URL?.replace(/\/$/, '');
 const DOCUMENT_API_URL_CANDIDATES = configuredDocumentApiUrl ? [configuredDocumentApiUrl] : [];
+const terminalLocationId = process.env.EXPO_PUBLIC_STRIPE_TERMINAL_LOCATION_ID;
 
 const fetchWithTimeout = async (url: string, options: RequestInit = {}, timeoutMs = 1500) => {
   const controller = new AbortController();
@@ -157,6 +159,24 @@ export default function TpvScreen() {
   const [subscriptionAdditionalUsers, setSubscriptionAdditionalUsers] = useState('0');
   const [subscriptionError, setSubscriptionError] = useState('');
   const [checkoutLoading, setCheckoutLoading] = useState(false);
+  const [terminalLoading, setTerminalLoading] = useState(false);
+  const [terminalError, setTerminalError] = useState('');
+  const [terminalReady, setTerminalReady] = useState(false);
+
+  const {
+    initialize,
+    easyConnect,
+    connectedReader,
+    processPaymentIntent,
+    retrievePaymentIntent,
+  } = useStripeTerminal({
+    onDidRequestReaderInput: (options) => {
+      Alert.alert('Acerca la tarjeta', options.join(' / '));
+    },
+    onDidRequestReaderDisplayMessage: (message) => {
+      Alert.alert('Stripe Terminal', message);
+    },
+  });
 
   // Estados para envío al gestor por rango de fechas (Global)
   const [managerModalVisible, setManagerModalVisible] = useState(false);
@@ -317,6 +337,16 @@ export default function TpvScreen() {
   }, [accessToken]);
 
   useEffect(() => {
+    if (!accessToken) return;
+
+    void initialize().then(({ error }) => {
+      if (error) {
+        setTerminalError(error.message || 'No se pudo inicializar Stripe Terminal.');
+      }
+    });
+  }, [accessToken, initialize]);
+
+  useEffect(() => {
     (async () => {
       const storedToken = await SecureStore.getItemAsync(AUTH_TOKEN_KEY);
       if (!storedToken) {
@@ -428,6 +458,41 @@ export default function TpvScreen() {
       setSubscriptionError('No se pudo completar la conexión con Stripe.');
     } finally {
       setCheckoutLoading(false);
+    }
+  };
+
+  const connectTapToPay = async () => {
+    if (!terminalLocationId) {
+      setTerminalError('Falta configurar la ubicación de Stripe Terminal.');
+      return false;
+    }
+
+    if (connectedReader) {
+      setTerminalReady(true);
+      return true;
+    }
+
+    setTerminalLoading(true);
+    setTerminalError('');
+    try {
+      const { reader, error } = await easyConnect({
+        discoveryMethod: 'tapToPay',
+        locationId: terminalLocationId,
+        autoReconnectOnUnexpectedDisconnect: true,
+        merchantDisplayName: issuer.name,
+      });
+      if (error || !reader) {
+        setTerminalError(error?.message || 'Este móvil no se puede conectar a Tap to Pay.');
+        return false;
+      }
+
+      setTerminalReady(true);
+      return true;
+    } catch (error) {
+      setTerminalError(error instanceof Error ? error.message : 'No se pudo conectar Tap to Pay.');
+      return false;
+    } finally {
+      setTerminalLoading(false);
     }
   };
 
@@ -919,27 +984,59 @@ export default function TpvScreen() {
     setNfcModalVisible(true);
   };
 
-  const completePayment = () => {
-    setNfcModalVisible(false);
-
-    if (pendingInvoice) {
-      createTransaction(
-        'COBRO',
-        pendingInvoice.docType,
-        'Tarjeta Contactless',
-        pendingInvoice.total,
-        pendingInvoice.client,
-        pendingInvoice.items,
-        pendingInvoice.ivaRate,
-      );
-      setPendingInvoice(null);
-      setClient({ name: '', nif: '', address: '' });
-      setInvoiceItems([{ id: '1', description: '', price: '' }]);
-      setInvoiceIvaInput('21');
+  const completePayment = async () => {
+    if (!accessToken || !configuredDocumentApiUrl) {
+      Alert.alert('Sesión requerida', 'Inicia sesión para poder cobrar.');
       return;
     }
 
-    createTransaction('COBRO', pendingDocumentType, 'Tarjeta Contactless');
+    const paymentAmount = pendingInvoice ? pendingInvoice.total : amount;
+    const transactionId = `terminal-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    setTerminalLoading(true);
+    setTerminalError('');
+
+    try {
+      const connected = await connectTapToPay();
+      if (!connected) return;
+
+      const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/terminal/payment-intent`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify({ amount: paymentAmount, transactionId }),
+      }, 15000);
+      const result = await response.json() as { clientSecret?: string; error?: string };
+      if (!response.ok || !result.clientSecret) {
+        throw new Error(result.error || 'No se pudo preparar el cobro en Stripe.');
+      }
+
+      const retrieved = await retrievePaymentIntent(result.clientSecret);
+      if (retrieved.error || !retrieved.paymentIntent) {
+        throw new Error(retrieved.error?.message || 'No se pudo recuperar el cobro preparado.');
+      }
+
+      const processed = await processPaymentIntent({ paymentIntent: retrieved.paymentIntent });
+      if (processed.error || !processed.paymentIntent) {
+        throw new Error(processed.error?.message || 'El cobro no se pudo completar.');
+      }
+
+      setNfcModalVisible(false);
+      if (pendingInvoice) {
+        createTransaction('COBRO', pendingInvoice.docType, 'Tarjeta Contactless', paymentAmount, pendingInvoice.client, pendingInvoice.items, pendingInvoice.ivaRate);
+        setPendingInvoice(null);
+        setClient({ name: '', nif: '', address: '' });
+        setInvoiceItems([{ id: '1', description: '', price: '' }]);
+        setInvoiceIvaInput('21');
+      } else {
+        createTransaction('COBRO', pendingDocumentType, 'Tarjeta Contactless');
+      }
+    } catch (error) {
+      setTerminalError(error instanceof Error ? error.message : 'El cobro no se pudo completar.');
+    } finally {
+      setTerminalLoading(false);
+    }
   };
 
   const cancelPayment = () => {
@@ -2583,9 +2680,10 @@ export default function TpvScreen() {
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
             <Text style={styles.modalTitle}>💳 COBRO CON TARJETA / CONTACTLESS</Text>
-            <Text style={styles.modalSubtitle}>Acerca la tarjeta o pulsa simular para completar la operación de {formatCurrency(pendingInvoice ? pendingInvoice.total : amount)}.</Text>
-            <Pressable style={[styles.primaryButton, { backgroundColor: '#16a34a', marginTop: 15 }]} onPress={completePayment}>
-              <Text style={styles.primaryButtonText}>Simular Cobro Éxitoso</Text>
+            <Text style={styles.modalSubtitle}>Acerca la tarjeta o el móvil al Redmi Note 14 Pro+ para cobrar {formatCurrency(pendingInvoice ? pendingInvoice.total : amount)}.</Text>
+            {terminalError ? <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 10 }}>{terminalError}</Text> : null}
+            <Pressable style={[styles.primaryButton, { backgroundColor: '#16a34a', marginTop: 15 }]} onPress={completePayment} disabled={terminalLoading}>
+              <Text style={styles.primaryButtonText}>{terminalLoading ? 'Preparando Tap to Pay...' : terminalReady ? 'Acercar tarjeta para cobrar' : 'Activar Tap to Pay y cobrar'}</Text>
             </Pressable>
             <Pressable style={[styles.secondaryButton, { marginTop: 10 }]} onPress={cancelPayment}>
               <Text style={styles.secondaryButtonText}>Cancelar</Text>
