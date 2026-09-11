@@ -21,6 +21,26 @@ try {
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
 
+const stripeV2Request = async (path, method, body) => {
+  const response = await fetch(`https://api.stripe.com${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${process.env.STRIPE_SECRET_KEY}`,
+      'Content-Type': 'application/json',
+      'Stripe-Version': '2026-08-26.dahlia',
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const result = await response.json();
+  if (!response.ok) {
+    const error = new Error(result.error?.message || 'Stripe API error');
+    error.code = result.error?.code;
+    error.type = result.error?.type;
+    throw error;
+  }
+  return result;
+};
+
 app.set('trust proxy', 1);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -146,15 +166,25 @@ app.post('/api/connect/onboarding', requireAuth, async (req, res) => {
 
   try {
     if (!accountId) {
-      const account = await stripe.accounts.create({
-        type: 'express',
-        country: 'ES',
-        email: req.user.email,
-        capabilities: {
-          card_payments: { requested: true },
-          transfers: { requested: true },
+      const account = await stripeV2Request('/v2/core/accounts', 'POST', {
+        contact_email: req.user.email,
+        display_name: req.user.user_metadata?.company_name || req.user.user_metadata?.full_name || 'Comercio TPV',
+        dashboard: 'express',
+        configuration: {
+          merchant: {
+            capabilities: {
+              card_payments: { requested: true },
+            },
+          },
+        },
+        defaults: {
+          responsibilities: {
+            fees_collector: 'application',
+            losses_collector: 'application',
+          },
         },
         metadata: { supabase_user_id: req.user.id },
+        include: ['configuration.merchant', 'identity', 'defaults'],
       });
       accountId = account.id;
       onboardingStage = 'metadata_save';
