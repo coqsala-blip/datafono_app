@@ -39,6 +39,82 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, service: 'TPV & GESTOR backend' });
 });
 
+const getBearerToken = (req) => {
+  const authorization = req.headers.authorization || '';
+  return authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : null;
+};
+
+const requireAuth = async (req, res, next) => {
+  const token = getBearerToken(req);
+  if (!token) {
+    return res.status(401).json({ ok: false, error: 'Se requiere autenticación.' });
+  }
+
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data.user) {
+    return res.status(401).json({ ok: false, error: 'La sesión no es válida o ha caducado.' });
+  }
+
+  req.user = data.user;
+  return next();
+};
+
+app.post('/api/auth/register', async (req, res) => {
+  const { email, password, fullName, companyName } = req.body || {};
+  const normalizedEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+
+  if (!normalizedEmail || typeof password !== 'string' || password.length < 8) {
+    return res.status(400).json({ ok: false, error: 'Indica un email válido y una contraseña de al menos 8 caracteres.' });
+  }
+
+  const { data, error } = await supabase.auth.signUp({
+    email: normalizedEmail,
+    password,
+    options: {
+      data: {
+        full_name: typeof fullName === 'string' ? fullName.trim() : '',
+        company_name: typeof companyName === 'string' ? companyName.trim() : '',
+        role: 'principal',
+      },
+    },
+  });
+
+  if (error) {
+    return res.status(400).json({ ok: false, error: error.message });
+  }
+
+  return res.status(201).json({
+    ok: true,
+    user: data.user,
+    session: data.session,
+    requiresEmailConfirmation: !data.session,
+  });
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body || {};
+  const normalizedEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+
+  if (!normalizedEmail || typeof password !== 'string' || password.length === 0) {
+    return res.status(400).json({ ok: false, error: 'Indica email y contraseña.' });
+  }
+
+  const { data, error } = await supabase.auth.signInWithPassword({
+    email: normalizedEmail,
+    password,
+  });
+
+  if (error || !data.user || !data.session) {
+    return res.status(401).json({ ok: false, error: 'Email o contraseña incorrectos.' });
+  }
+
+  return res.json({ ok: true, user: data.user, session: data.session });
+});
+
+app.get('/api/auth/me', requireAuth, (req, res) => {
+  res.json({ ok: true, user: req.user });
+});
+
 app.post('/api/documents', async (req, res) => {
   const { id, ticketCode, documentType, amount, originalAmount, relatedTicketCode, refundHistory, isRefunded, createdAt, issuer, client, items, subtotal, iva, ivaRateApplied, type } = req.body;
 
