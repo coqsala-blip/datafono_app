@@ -169,6 +169,10 @@ app.post('/api/connect/onboarding', requireAuth, async (req, res) => {
       const account = await stripeV2Request('/v2/core/accounts', 'POST', {
         contact_email: req.user.email,
         display_name: req.user.user_metadata?.company_name || req.user.user_metadata?.full_name || 'Comercio TPV',
+        identity: {
+          country: 'ES',
+          entity_type: 'company',
+        },
         dashboard: 'express',
         configuration: {
           merchant: {
