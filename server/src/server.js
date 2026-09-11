@@ -115,6 +115,72 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
   res.json({ ok: true, user: req.user });
 });
 
+const getConnectReturnUrl = () => `${PUBLIC_API_URL}/api/connect/return`;
+
+app.get('/api/connect/status', requireAuth, async (req, res) => {
+  const accountId = req.user.user_metadata?.stripe_connect_account_id;
+  if (!accountId) {
+    return res.json({ ok: true, connected: false, accountId: null, chargesEnabled: false, payoutsEnabled: false });
+  }
+
+  try {
+    const account = await stripe.accounts.retrieve(accountId);
+    return res.json({
+      ok: true,
+      connected: true,
+      accountId: account.id,
+      chargesEnabled: Boolean(account.charges_enabled),
+      payoutsEnabled: Boolean(account.payouts_enabled),
+      detailsSubmitted: Boolean(account.details_submitted),
+      currentlyDue: account.requirements?.currently_due || [],
+    });
+  } catch (error) {
+    console.error('Error consultando cuenta Connect:', error.message);
+    return res.status(502).json({ ok: false, error: 'No se pudo consultar la cuenta de cobros.' });
+  }
+});
+
+app.post('/api/connect/onboarding', requireAuth, async (req, res) => {
+  try {
+    let accountId = req.user.user_metadata?.stripe_connect_account_id;
+    if (!accountId) {
+      const account = await stripe.accounts.create({
+        type: 'express',
+        country: 'ES',
+        email: req.user.email,
+        capabilities: {
+          card_payments: { requested: true },
+          transfers: { requested: true },
+        },
+        metadata: { supabase_user_id: req.user.id },
+      });
+      accountId = account.id;
+      await supabase.auth.admin.updateUserById(req.user.id, {
+        user_metadata: {
+          ...req.user.user_metadata,
+          stripe_connect_account_id: accountId,
+        },
+      });
+    }
+
+    const accountLink = await stripe.accountLinks.create({
+      account: accountId,
+      refresh_url: getConnectReturnUrl(),
+      return_url: getConnectReturnUrl(),
+      type: 'account_onboarding',
+    });
+
+    return res.status(201).json({ ok: true, accountId, onboardingUrl: accountLink.url });
+  } catch (error) {
+    console.error('Error creando onboarding Connect:', error.message);
+    return res.status(502).json({ ok: false, error: 'No se pudo iniciar la configuración de cobros.' });
+  }
+});
+
+app.get('/api/connect/return', (req, res) => {
+  res.type('html').send('<h1>Configuración recibida</h1><p>Puedes volver a la aplicación para comprobar el estado de tu cuenta de cobros.</p>');
+});
+
 const activeSubscriptionStatuses = new Set(['active', 'trialing']);
 
 app.get('/api/billing/status', requireAuth, async (req, res) => {

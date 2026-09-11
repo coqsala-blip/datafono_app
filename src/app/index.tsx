@@ -159,6 +159,13 @@ export default function TpvScreen() {
   const [subscriptionAdditionalUsers, setSubscriptionAdditionalUsers] = useState('0');
   const [subscriptionError, setSubscriptionError] = useState('');
   const [checkoutLoading, setCheckoutLoading] = useState(false);
+  const [connectLoading, setConnectLoading] = useState(false);
+  const [connectStatus, setConnectStatus] = useState<{ connected: boolean; chargesEnabled: boolean; payoutsEnabled: boolean; detailsSubmitted?: boolean }>({
+    connected: false,
+    chargesEnabled: false,
+    payoutsEnabled: false,
+  });
+  const [connectError, setConnectError] = useState('');
   const [terminalLoading, setTerminalLoading] = useState(false);
   const [terminalError, setTerminalError] = useState('');
   const [terminalReady, setTerminalReady] = useState(false);
@@ -337,6 +344,29 @@ export default function TpvScreen() {
   }, [accessToken]);
 
   useEffect(() => {
+    if (!accessToken || !configuredDocumentApiUrl) return;
+
+    (async () => {
+      try {
+        const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/connect/status`, {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        }, 10000);
+        const result = await response.json() as { connected?: boolean; chargesEnabled?: boolean; payoutsEnabled?: boolean; detailsSubmitted?: boolean };
+        if (response.ok) {
+          setConnectStatus({
+            connected: Boolean(result.connected),
+            chargesEnabled: Boolean(result.chargesEnabled),
+            payoutsEnabled: Boolean(result.payoutsEnabled),
+            detailsSubmitted: Boolean(result.detailsSubmitted),
+          });
+        }
+      } catch {
+        setConnectError('No se pudo consultar la cuenta de cobros.');
+      }
+    })();
+  }, [accessToken]);
+
+  useEffect(() => {
     if (!accessToken) return;
 
     void initialize().then(({ error }) => {
@@ -458,6 +488,41 @@ export default function TpvScreen() {
       setSubscriptionError('No se pudo completar la conexión con Stripe.');
     } finally {
       setCheckoutLoading(false);
+    }
+  };
+
+  const startConnectOnboarding = async () => {
+    if (!accessToken || !configuredDocumentApiUrl) return;
+    setConnectLoading(true);
+    setConnectError('');
+
+    try {
+      const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/connect/onboarding`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${accessToken}` },
+      }, 15000);
+      const result = await response.json() as { onboardingUrl?: string; error?: string };
+      if (!response.ok || !result.onboardingUrl) {
+        throw new Error(result.error || 'No se pudo abrir la configuración de cobros.');
+      }
+
+      await WebBrowser.openBrowserAsync(result.onboardingUrl);
+      const statusResponse = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/connect/status`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      }, 10000);
+      const statusResult = await statusResponse.json() as { connected?: boolean; chargesEnabled?: boolean; payoutsEnabled?: boolean; detailsSubmitted?: boolean };
+      if (statusResponse.ok) {
+        setConnectStatus({
+          connected: Boolean(statusResult.connected),
+          chargesEnabled: Boolean(statusResult.chargesEnabled),
+          payoutsEnabled: Boolean(statusResult.payoutsEnabled),
+          detailsSubmitted: Boolean(statusResult.detailsSubmitted),
+        });
+      }
+    } catch (error) {
+      setConnectError(error instanceof Error ? error.message : 'No se pudo configurar la cuenta de cobros.');
+    } finally {
+      setConnectLoading(false);
     }
   };
 
@@ -2603,6 +2668,14 @@ export default function TpvScreen() {
               <TextInput style={styles.input} placeholder="Correo electrónico del gestor" placeholderTextColor="#94a3b8" keyboardType="email-address" value={issuer.managerEmail || ''} onChangeText={(t) => setIssuer(i => ({ ...i, managerEmail: t }))} />
 
               <Text style={[styles.cardTitle, { marginTop: 10 }]}>💳 CUENTA PARA RECIBIR PAGOS</Text>
+              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>Stripe verificará los datos legales y bancarios del negocio mediante un formulario seguro.</Text>
+              <Pressable style={[styles.primaryButton, { marginTop: 10 }]} onPress={startConnectOnboarding} disabled={connectLoading}>
+                <Text style={styles.primaryButtonText}>{connectLoading ? 'Abriendo Stripe...' : connectStatus.payoutsEnabled ? 'Cuenta de cobros verificada' : 'Configurar cuenta de cobros'}</Text>
+              </Pressable>
+              <Text style={[styles.emptyText, { textAlign: 'left', marginTop: 6, color: connectStatus.payoutsEnabled ? '#166534' : '#b45309' }]}>
+                {connectStatus.payoutsEnabled ? 'Stripe puede recibir pagos y enviar fondos a tu cuenta bancaria.' : connectStatus.connected ? 'La configuración está pendiente de verificación.' : 'Aún no has configurado la cuenta de cobros.'}
+              </Text>
+              {connectError ? <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 6 }}>{connectError}</Text> : null}
               <TextInput style={styles.input} placeholder="Titular de la cuenta" placeholderTextColor="#94a3b8" value={issuer.accountHolder || ''} onChangeText={(t) => setIssuer(i => ({ ...i, accountHolder: t }))} />
               <TextInput style={styles.input} placeholder="IBAN" placeholderTextColor="#94a3b8" value={issuer.iban || ''} onChangeText={(t) => setIssuer(i => ({ ...i, iban: t }))} />
               <TextInput style={styles.input} placeholder="Banco / Entidad" placeholderTextColor="#94a3b8" value={issuer.bankName || ''} onChangeText={(t) => setIssuer(i => ({ ...i, bankName: t }))} />
