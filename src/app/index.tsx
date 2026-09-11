@@ -5,6 +5,7 @@ import * as ImagePicker from 'expo-image-picker';
 import * as MailComposer from 'expo-mail-composer';
 import * as Print from 'expo-print';
 import * as Sharing from 'expo-sharing';
+import * as SecureStore from 'expo-secure-store';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Alert,
@@ -104,6 +105,7 @@ const STORAGE_KEY_ISSUER = '@tpv_issuer_v1';
 const STORAGE_KEY_OWNER_PIN = '@tpv_owner_pin_v1';
 const STORAGE_KEY_OWNER_RECOVERY_EMAIL = '@tpv_owner_recovery_email_v1';
 const STORAGE_KEY_OWNER_RECOVERY_PHONE = '@tpv_owner_recovery_phone_v1';
+const AUTH_TOKEN_KEY = 'tpv_access_token';
 
 const formatCurrency = (amount: number) =>
   new Intl.NumberFormat('es-ES', { style: 'currency', currency: 'EUR' }).format(amount);
@@ -138,6 +140,14 @@ export default function TpvScreen() {
   const [selectedTicket, setSelectedTicket] = useState<Transaction | null>(null);
   const [selectedExpense, setSelectedExpense] = useState<Expense | null>(null);
   const [isLoaded, setIsLoaded] = useState(false);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [accessToken, setAccessToken] = useState<string | null>(null);
+  const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authFullName, setAuthFullName] = useState('');
+  const [authCompanyName, setAuthCompanyName] = useState('');
+  const [authError, setAuthError] = useState('');
 
   // Estados para envío al gestor por rango de fechas (Global)
   const [managerModalVisible, setManagerModalVisible] = useState(false);
@@ -270,6 +280,83 @@ export default function TpvScreen() {
       }
     })();
   }, []);
+
+  useEffect(() => {
+    (async () => {
+      const storedToken = await SecureStore.getItemAsync(AUTH_TOKEN_KEY);
+      if (!storedToken) {
+        setAuthLoading(false);
+        return;
+      }
+
+      try {
+        const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/auth/me`, {
+          headers: { Authorization: `Bearer ${storedToken}` },
+        }, 5000);
+        if (response.ok) {
+          setAccessToken(storedToken);
+        } else {
+          await SecureStore.deleteItemAsync(AUTH_TOKEN_KEY);
+        }
+      } catch {
+        setAccessToken(storedToken);
+      } finally {
+        setAuthLoading(false);
+      }
+    })();
+  }, []);
+
+  const submitAuth = async () => {
+    setAuthError('');
+    const email = authEmail.trim().toLowerCase();
+    if (!configuredDocumentApiUrl) {
+      setAuthError('No hay una URL de backend configurada.');
+      return;
+    }
+
+    try {
+      const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/auth/${authMode}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email,
+          password: authPassword,
+          fullName: authFullName,
+          companyName: authCompanyName,
+        }),
+      }, 10000);
+      const result = await response.json() as { error?: string; session?: { access_token?: string }; requiresEmailConfirmation?: boolean };
+
+      if (!response.ok) {
+        setAuthError(result.error || 'No se pudo completar la operación.');
+        return;
+      }
+
+      if (authMode === 'register' && result.requiresEmailConfirmation) {
+        Alert.alert('Confirma tu email', 'Revisa tu correo para activar la cuenta y después inicia sesión.');
+        setAuthMode('login');
+        return;
+      }
+
+      const token = result.session?.access_token;
+      if (!token) {
+        setAuthError('El servidor no devolvió una sesión válida.');
+        return;
+      }
+
+      await SecureStore.setItemAsync(AUTH_TOKEN_KEY, token);
+      setAccessToken(token);
+      setAuthPassword('');
+    } catch {
+      setAuthError('No se pudo conectar con el servidor. Comprueba tu conexión.');
+    }
+  };
+
+  const signOut = async () => {
+    await SecureStore.deleteItemAsync(AUTH_TOKEN_KEY);
+    setAccessToken(null);
+    setAuthPassword('');
+  };
 
   // GUARDAR TRANSACCIONES AUTOMÁTICAMENTE
   useEffect(() => {
@@ -1912,6 +1999,44 @@ export default function TpvScreen() {
       Alert.alert('Error', 'No se pudo generar o enviar el informe de gastos.');
     }
   };
+
+  if (authLoading) {
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24 }}>
+          <Text style={styles.modalTitle}>Cargando sesión...</Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  if (!accessToken) {
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <ScrollView contentContainerStyle={{ flexGrow: 1, justifyContent: 'center', padding: 24 }}>
+          <View style={[styles.card, { padding: 20 }]}>
+            <Text style={styles.modalTitle}>TPV & GESTIÓN FISCAL</Text>
+            <Text style={[styles.modalSubtitle, { marginBottom: 18 }]}>Accede a tu cuenta para continuar</Text>
+            {authMode === 'register' ? (
+              <>
+                <TextInput style={styles.input} placeholder="Nombre completo" placeholderTextColor="#94a3b8" value={authFullName} onChangeText={setAuthFullName} />
+                <TextInput style={styles.input} placeholder="Nombre de la empresa" placeholderTextColor="#94a3b8" value={authCompanyName} onChangeText={setAuthCompanyName} />
+              </>
+            ) : null}
+            <TextInput style={styles.input} placeholder="Email" placeholderTextColor="#94a3b8" keyboardType="email-address" autoCapitalize="none" value={authEmail} onChangeText={setAuthEmail} />
+            <TextInput style={styles.input} placeholder="Contraseña (mínimo 8 caracteres)" placeholderTextColor="#94a3b8" secureTextEntry value={authPassword} onChangeText={setAuthPassword} />
+            {authError ? <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 8 }}>{authError}</Text> : null}
+            <Pressable style={[styles.primaryButton, { marginTop: 14 }]} onPress={submitAuth}>
+              <Text style={styles.primaryButtonText}>{authMode === 'login' ? 'Iniciar sesión' : 'Crear cuenta'}</Text>
+            </Pressable>
+            <Pressable style={[styles.secondaryButton, { marginTop: 8 }]} onPress={() => { setAuthMode(authMode === 'login' ? 'register' : 'login'); setAuthError(''); }}>
+              <Text style={styles.secondaryButtonText}>{authMode === 'login' ? 'Crear una cuenta nueva' : 'Ya tengo una cuenta'}</Text>
+            </Pressable>
+          </View>
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
 
   return (
     <SafeAreaView style={styles.safeArea}>
