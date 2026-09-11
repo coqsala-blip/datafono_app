@@ -278,11 +278,19 @@ app.post('/api/terminal/connection-token', requireAuth, async (req, res) => {
 });
 
 app.post('/api/terminal/payment-intent', requireAuth, async (req, res) => {
-  const amount = Math.round(Number(req.body?.amount) * 100);
+  const rawAmount = req.body?.amount;
+  const amountNumber = typeof rawAmount === 'string'
+    ? Number(rawAmount.replace(',', '.'))
+    : Number(rawAmount);
+  const amount = Math.round(amountNumber * 100);
   const transactionId = typeof req.body?.transactionId === 'string' ? req.body.transactionId.trim() : '';
 
-  if (!Number.isInteger(amount) || amount < 50 || amount > 99999999 || !transactionId) {
-    return res.status(400).json({ ok: false, error: 'El importe o identificador de la operación no es válido.' });
+  if (!Number.isFinite(amountNumber) || !Number.isInteger(amount) || amount < 50 || amount > 99999999) {
+    return res.status(400).json({ ok: false, error: `Importe no válido: ${String(rawAmount)}. Usa al menos 0,50 €.` });
+  }
+
+  if (!transactionId) {
+    return res.status(400).json({ ok: false, error: 'Falta el identificador de la operación.' });
   }
 
   try {
