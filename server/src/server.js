@@ -141,8 +141,9 @@ app.get('/api/connect/status', requireAuth, async (req, res) => {
 });
 
 app.post('/api/connect/onboarding', requireAuth, async (req, res) => {
+  let accountId = req.user.user_metadata?.stripe_connect_account_id;
+
   try {
-    let accountId = req.user.user_metadata?.stripe_connect_account_id;
     if (!accountId) {
       const account = await stripe.accounts.create({
         type: 'express',
@@ -155,12 +156,16 @@ app.post('/api/connect/onboarding', requireAuth, async (req, res) => {
         metadata: { supabase_user_id: req.user.id },
       });
       accountId = account.id;
-      await supabase.auth.admin.updateUserById(req.user.id, {
+
+      const { error: metadataError } = await supabase.auth.admin.updateUserById(req.user.id, {
         user_metadata: {
           ...req.user.user_metadata,
           stripe_connect_account_id: accountId,
         },
       });
+      if (metadataError) {
+        console.error('Cuenta Connect creada, pero no se pudo guardar la asociación en Supabase:', metadataError.message);
+      }
     }
 
     const accountLink = await stripe.accountLinks.create({
@@ -172,8 +177,14 @@ app.post('/api/connect/onboarding', requireAuth, async (req, res) => {
 
     return res.status(201).json({ ok: true, accountId, onboardingUrl: accountLink.url });
   } catch (error) {
-    console.error('Error creando onboarding Connect:', error.message);
-    return res.status(502).json({ ok: false, error: 'No se pudo iniciar la configuración de cobros.' });
+    console.error('Error creando onboarding Connect:', {
+      message: error.message,
+      code: error.code,
+      type: error.type,
+      accountId,
+      userId: req.user.id,
+    });
+    return res.status(502).json({ ok: false, error: 'Stripe no pudo iniciar la configuración de cobros. Revisa el estado de tu cuenta de plataforma.' });
   }
 });
 
