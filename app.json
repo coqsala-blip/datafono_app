@@ -3,7 +3,7 @@
     "name": "TPV",
     "slug": "tpv-app",
     "version": "1.0.0",
-    "icon": "./assets/images/icon.png",
+    "icon": "./assets/icon.png",
     "scheme": "tpvapp",
     "plugins": [
       [
@@ -20,11 +20,7 @@
         "android.permission.CAMERA",
         "android.permission.RECORD_AUDIO"
       ],
-      "package": "com.hichfla.tpvapp",
-      "adaptiveIcon": {
-        "foregroundImage": "./assets/images/android-icon-foreground.png",
-        "backgroundColor": "#ffffff"
-      }
+      "package": "com.hichfla.tpvapp"
     },
     "extra": {
       "eas": {
