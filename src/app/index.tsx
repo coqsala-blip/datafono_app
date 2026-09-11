@@ -1,5 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { useStripeTerminal } from '@stripe/stripe-terminal-react-native';
+import { requestNeededAndroidPermissions, useStripeTerminal } from '@stripe/stripe-terminal-react-native';
 import { Camera, CameraView } from 'expo-camera';
 import * as FileSystemLegacy from 'expo-file-system/legacy';
 import * as ImagePicker from 'expo-image-picker';
@@ -540,6 +540,18 @@ export default function TpvScreen() {
     setTerminalLoading(true);
     setTerminalError('');
     try {
+      const permissionResult = await requestNeededAndroidPermissions({
+        accessFineLocation: {
+          title: 'Permiso de ubicación',
+          message: 'Stripe Terminal necesita tu ubicación para aceptar pagos con Tap to Pay.',
+          buttonPositive: 'Permitir',
+        },
+      });
+      if (permissionResult.error) {
+        setTerminalError('Debes conceder el permiso de ubicación para usar Tap to Pay.');
+        return false;
+      }
+
       const { reader, error } = await easyConnect({
         discoveryMethod: 'tapToPay',
         locationId: terminalLocationId,

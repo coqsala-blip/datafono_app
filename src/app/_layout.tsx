@@ -25,7 +25,11 @@ const fetchTerminalToken = async () => {
 
 export default function RootLayout() {
   return (
-    <StripeTerminalProvider tokenProvider={fetchTerminalToken} logLevel="verbose">
+    <StripeTerminalProvider
+      tokenProvider={fetchTerminalToken}
+      logLevel="verbose"
+      localeConfig={{ type: 'hardcoded', locale: 'es-ES' }}
+    >
       <Stack screenOptions={{ headerShown: false }}>
         <Stack.Screen name="index" />
       </Stack>
