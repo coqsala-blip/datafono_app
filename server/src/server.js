@@ -265,13 +265,15 @@ app.get('/api/billing/status', requireAuth, async (req, res) => {
 
 app.post('/api/terminal/connection-token', requireAuth, async (req, res) => {
   try {
-    const token = await stripe.terminal.connectionTokens.create({
-      metadata: { supabase_user_id: req.user.id },
-    });
+    const token = await stripe.terminal.connectionTokens.create();
     return res.json({ ok: true, secret: token.secret });
   } catch (error) {
-    console.error('Error creando token de conexión Terminal:', error.message);
-    return res.status(502).json({ ok: false, error: 'No se pudo iniciar el lector de pagos.' });
+    console.error('Error creando token de conexión Terminal:', {
+      message: error.message,
+      code: error.code,
+      type: error.type,
+    });
+    return res.status(502).json({ ok: false, error: `Stripe no pudo crear el token de conexión. ${error.message}` });
   }
 });
 
