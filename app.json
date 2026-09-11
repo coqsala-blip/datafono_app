@@ -15,6 +15,14 @@
       "expo-mail-composer",
       "expo-secure-store",
       [
+        "expo-build-properties",
+        {
+          "android": {
+            "minSdkVersion": 26
+          }
+        }
+      ],
+      [
         "@stripe/stripe-terminal-react-native",
         {
           "appDelegate": true,
