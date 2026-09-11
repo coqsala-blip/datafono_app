@@ -587,39 +587,54 @@ export default function TpvScreen() {
       ? await convertImageToBase64(transaction.issuer.logoUri)
       : undefined;
 
+    const requestBody = JSON.stringify({
+      ...transaction,
+      issuer: {
+        name: transaction.issuer.name,
+        nif: transaction.issuer.nif,
+        address: transaction.issuer.address,
+        logoUri: logoDataUrl || transaction.issuer.logoUri,
+      },
+    });
+
     const attempts = DOCUMENT_API_URL_CANDIDATES.map(async (baseUrl) => {
-      const response = await fetchWithTimeout(`${baseUrl}/api/documents`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...transaction,
-          issuer: {
-            name: transaction.issuer.name,
-            nif: transaction.issuer.nif,
-            address: transaction.issuer.address,
-            logoUri: logoDataUrl || transaction.issuer.logoUri,
-          },
-        }),
-      }, 1500);
+      let lastError: unknown;
 
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          const response = await fetchWithTimeout(`${baseUrl}/api/documents`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: requestBody,
+          }, 10000);
+
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+
+          const result = await response.json() as { publicUrl?: string };
+          if (!result.publicUrl) {
+            throw new Error('No se recibió una URL pública del backend.');
+          }
+
+          const publishedTransaction = { ...transaction, publicUrl: result.publicUrl };
+
+          setTransactions((current) => current.map((item) =>
+            item.id === transaction.id ? publishedTransaction : item
+          ));
+          setSelectedTicket((current) =>
+            current?.id === transaction.id ? publishedTransaction : current
+          );
+          return publishedTransaction;
+        } catch (error) {
+          lastError = error;
+          if (attempt < 2) {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+          }
+        }
       }
 
-      const result = await response.json() as { publicUrl?: string };
-      if (!result.publicUrl) {
-        throw new Error('No se recibió una URL pública del backend.');
-      }
-
-      const publishedTransaction = { ...transaction, publicUrl: result.publicUrl };
-
-      setTransactions((current) => current.map((item) =>
-        item.id === transaction.id ? publishedTransaction : item
-      ));
-      setSelectedTicket((current) =>
-        current?.id === transaction.id ? publishedTransaction : current
-      );
-      return publishedTransaction;
+      throw lastError instanceof Error ? lastError : new Error('No se pudo publicar el documento.');
     });
 
     try {
