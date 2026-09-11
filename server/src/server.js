@@ -142,6 +142,7 @@ app.get('/api/connect/status', requireAuth, async (req, res) => {
 
 app.post('/api/connect/onboarding', requireAuth, async (req, res) => {
   let accountId = req.user.user_metadata?.stripe_connect_account_id;
+  let onboardingStage = accountId ? 'account_link' : 'account_create';
 
   try {
     if (!accountId) {
@@ -156,6 +157,7 @@ app.post('/api/connect/onboarding', requireAuth, async (req, res) => {
         metadata: { supabase_user_id: req.user.id },
       });
       accountId = account.id;
+      onboardingStage = 'metadata_save';
 
       const { error: metadataError } = await supabase.auth.admin.updateUserById(req.user.id, {
         user_metadata: {
@@ -168,6 +170,7 @@ app.post('/api/connect/onboarding', requireAuth, async (req, res) => {
       }
     }
 
+    onboardingStage = 'account_link';
     const accountLink = await stripe.accountLinks.create({
       account: accountId,
       refresh_url: getConnectReturnUrl(),
@@ -182,9 +185,13 @@ app.post('/api/connect/onboarding', requireAuth, async (req, res) => {
       code: error.code,
       type: error.type,
       accountId,
+      onboardingStage,
       userId: req.user.id,
     });
-    return res.status(502).json({ ok: false, error: 'Stripe no pudo iniciar la configuración de cobros. Revisa el estado de tu cuenta de plataforma.' });
+    return res.status(502).json({
+      ok: false,
+      error: `Stripe no pudo iniciar la configuración (${onboardingStage}). ${error.message || 'Revisa el estado de tu cuenta de plataforma.'}`,
+    });
   }
 });
 
