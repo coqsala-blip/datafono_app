@@ -94,7 +94,7 @@ const initialIssuer: Issuer = {
   nif: 'B98765432',
   address: 'Calle Mayor 45, Santander',
   logoUri: undefined,
-  managerEmail: 'gestor@tuasesoria.com',
+  managerEmail: 'gestor@tugestoria.com',
   accountHolder: 'Comercio Local Autónomo S.L.',
   iban: 'ES9121000418450200051332',
   bankName: 'Banco Santander',
@@ -1728,7 +1728,7 @@ export default function TpvScreen() {
 
     const clientHtml = transaction.client ? `
       <div style="margin-top: 10px; border-top: 1px dashed #000; padding-top: 8px;">
-        <div style="font-weight: bold; font-size: 11px;">DATOS FISCALES DEL CLIENTE:</div>
+        <div style="font-weight: bold; font-size: 11px;">DATOS DEL CLIENTE:</div>
         <div style="font-size: 10px;">${transaction.client.name}</div>
         <div style="font-size: 10px;">NIF/CIF: ${transaction.client.nif}</div>
         <div style="font-size: 10px;">${transaction.client.address}</div>
@@ -1949,8 +1949,9 @@ export default function TpvScreen() {
           </style>
         </head>
         <body>
-          <h1>INFORME FISCAL PARA GESTORÍA</h1>
+          <h1>INFORME DE FACTURACIÓN Y GASTOS PARA TU GESTORÍA</h1>
           <p style="text-align: center; font-size: 12px; color: #64748b;">Periodo: ${startDateInput} al ${endDateInput}</p>
+          <p style="text-align: center; font-size: 10px; color: #64748b;">Documento preparado para revisión del gestor. Esta aplicación no sustituye a un asesor fiscal ni a una gestoría.</p>
           
           <div class="summary">
             <strong>Emisor:</strong> ${issuer.name} (NIF: ${issuer.nif})<br/>
@@ -2012,8 +2013,8 @@ export default function TpvScreen() {
 
       await MailComposer.composeAsync({
         recipients: [issuer.managerEmail || ''],
-        subject: `Informe Gestoría (${startDateInput} a ${endDateInput}) - ${issuer.name}`,
-        body: `Adjunto informe fiscal consolidado del periodo ${startDateInput} al ${endDateInput}.\n\nAtentamente,\n${issuer.name}`,
+        subject: `Informe de facturación y gastos (${startDateInput} a ${endDateInput}) - ${issuer.name}`,
+        body: `Adjunto el informe de facturación y gastos del periodo ${startDateInput} al ${endDateInput}, preparado para revisión del gestor.\n\nAtentamente,\n${issuer.name}`,
         attachments: [uri],
       });
       setManagerModalVisible(false);
@@ -2271,7 +2272,7 @@ export default function TpvScreen() {
       <SafeAreaView style={styles.safeArea}>
         <ScrollView contentContainerStyle={{ flexGrow: 1, justifyContent: 'center', padding: 24 }}>
           <View style={[styles.card, { padding: 20 }]}>
-            <Text style={styles.modalTitle}>TPV & GESTIÓN FISCAL</Text>
+            <Text style={styles.modalTitle}>TPV & GESTIÓN DE NEGOCIO</Text>
             <Text style={[styles.modalSubtitle, { marginBottom: 18 }]}>Accede a tu cuenta para continuar</Text>
             {authMode === 'register' ? (
               <>
@@ -2348,7 +2349,7 @@ export default function TpvScreen() {
       <View style={styles.header}>
         <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
           <View style={{ flex: 1 }}>
-            <Text style={styles.headerTitle}>TPV & GESTIÓN FISCAL</Text>
+            <Text style={styles.headerTitle}>TPV & GESTIÓN DE NEGOCIO</Text>
             <Text style={styles.headerSubtitle}>{issuer.name}</Text>
           </View>
           <Pressable
@@ -2646,6 +2647,7 @@ export default function TpvScreen() {
           <ScrollView contentContainerStyle={styles.scrollContent}>
             <View style={styles.card}>
               <Text style={styles.cardTitle}>📦 PLAN TPV & GESTOR</Text>
+              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 6 }]}>La aplicación te ayuda a organizar la información de tu negocio y prepararla para revisión profesional. No sustituye a un asesor fiscal ni a una gestoría.</Text>
               <View style={styles.statRow}>
                 <Text style={styles.statLabel}>Suscripción base:</Text>
                 <Text style={[styles.statValue, { color: '#0f172a', fontWeight: 'bold' }]}>{formatCurrency(subscriptionBasePrice)}</Text>
@@ -2661,10 +2663,11 @@ export default function TpvScreen() {
             </View>
 
             <View style={styles.card}>
-              <Text style={styles.cardTitle}>⚙️ DATOS FISCALES DEL EMISOR</Text>
+              <Text style={styles.cardTitle}>⚙️ DATOS DEL NEGOCIO</Text>
+              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>La aplicación organiza tus facturas y gastos para facilitar su revisión por tu gestoría.</Text>
               <TextInput style={styles.input} placeholder="Nombre Comercial / Razón Social" placeholderTextColor="#94a3b8" value={issuer.name} onChangeText={(t) => setIssuer(i => ({ ...i, name: t }))} />
               <TextInput style={styles.input} placeholder="NIF / CIF" placeholderTextColor="#94a3b8" value={issuer.nif} onChangeText={(t) => setIssuer(i => ({ ...i, nif: t }))} />
-              <TextInput style={styles.input} placeholder="Dirección Fiscal Completa" placeholderTextColor="#94a3b8" value={issuer.address} onChangeText={(t) => setIssuer(i => ({ ...i, address: t }))} />
+              <TextInput style={styles.input} placeholder="Dirección del negocio" placeholderTextColor="#94a3b8" value={issuer.address} onChangeText={(t) => setIssuer(i => ({ ...i, address: t }))} />
               <TextInput style={styles.input} placeholder="Correo electrónico del gestor" placeholderTextColor="#94a3b8" keyboardType="email-address" value={issuer.managerEmail || ''} onChangeText={(t) => setIssuer(i => ({ ...i, managerEmail: t }))} />
 
               <Text style={[styles.cardTitle, { marginTop: 10 }]}>💳 CUENTA PARA RECIBIR PAGOS</Text>
@@ -3164,11 +3167,11 @@ export default function TpvScreen() {
         </View>
       </Modal>
 
-      {/* MODAL: ENVÍO INFORME GESTOR POR RANGO DE FECHAS (Global) */}
+      {/* MODAL: ENVÍO DE INFORME AL GESTOR POR RANGO DE FECHAS (Global) */}
       <Modal visible={managerModalVisible} animationType="fade" transparent={true}>
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
-            <Text style={styles.modalTitle}>📤 ENVIAR INFORME A ASESORÍA</Text>
+            <Text style={styles.modalTitle}>📤 ENVIAR INFORME AL GESTOR</Text>
             <Text style={styles.modalSubtitle}>Introduce el rango de fechas (YYYY-MM-DD):</Text>
             <TextInput
               style={styles.input}
