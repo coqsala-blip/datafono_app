@@ -2691,10 +2691,6 @@ export default function TpvScreen() {
                 {connectStatus.payoutsEnabled ? 'Stripe puede recibir pagos y enviar fondos a tu cuenta bancaria.' : connectStatus.connected ? 'La configuración está pendiente de verificación.' : 'Aún no has configurado la cuenta de cobros.'}
               </Text>
               {connectError ? <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 6 }}>{connectError}</Text> : null}
-              <TextInput style={styles.input} placeholder="Titular de la cuenta" placeholderTextColor="#94a3b8" value={issuer.accountHolder || ''} onChangeText={(t) => setIssuer(i => ({ ...i, accountHolder: t }))} />
-              <TextInput style={styles.input} placeholder="IBAN" placeholderTextColor="#94a3b8" value={issuer.iban || ''} onChangeText={(t) => setIssuer(i => ({ ...i, iban: t }))} />
-              <TextInput style={styles.input} placeholder="Banco / Entidad" placeholderTextColor="#94a3b8" value={issuer.bankName || ''} onChangeText={(t) => setIssuer(i => ({ ...i, bankName: t }))} />
-              <TextInput style={styles.input} placeholder="País (ISO, ejemplo ES)" placeholderTextColor="#94a3b8" value={issuer.country || ''} onChangeText={(t) => setIssuer(i => ({ ...i, country: t }))} />
               <TextInput
                 style={styles.input}
                 placeholder="Usuarios adicionales (+2 €/mes cada uno)"
