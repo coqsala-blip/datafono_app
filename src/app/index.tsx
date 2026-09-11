@@ -4,8 +4,8 @@ import * as FileSystemLegacy from 'expo-file-system/legacy';
 import * as ImagePicker from 'expo-image-picker';
 import * as MailComposer from 'expo-mail-composer';
 import * as Print from 'expo-print';
-import * as Sharing from 'expo-sharing';
 import * as SecureStore from 'expo-secure-store';
+import * as Sharing from 'expo-sharing';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Alert,
@@ -131,6 +131,8 @@ export default function TpvScreen() {
   const [ownerPinChangeConfirm, setOwnerPinChangeConfirm] = useState('');
   const [ownerRecoveryCode, setOwnerRecoveryCode] = useState('');
   const [pinModalVisible, setPinModalVisible] = useState(false);
+  const [roleSwitchPinModalVisible, setRoleSwitchPinModalVisible] = useState(false);
+  const [recoverySectionVisible, setRecoverySectionVisible] = useState(false);
   const [userPermissionsModalVisible, setUserPermissionsModalVisible] = useState(false);
   const [pendingRefund, setPendingRefund] = useState<{ ticket: Transaction; amount: number } | null>(null);
   const [ivaPercentage, setIvaPercentage] = useState('21');
@@ -1263,6 +1265,27 @@ export default function TpvScreen() {
     setPinModalVisible(false);
     setPendingRefund(null);
     if (refund) void applyRefundToTicket(refund.ticket, refund.amount, true);
+  };
+
+  const requestPrincipalRole = () => {
+    if (userRole === 'principal') return;
+    if (!ownerPin) {
+      Alert.alert('PIN no configurado', 'El usuario principal debe configurar primero su PIN.');
+      return;
+    }
+    setOwnerPinInput('');
+    setRoleSwitchPinModalVisible(true);
+  };
+
+  const confirmPrincipalRole = () => {
+    if (ownerPinInput !== ownerPin) {
+      Alert.alert('PIN incorrecto', 'El PIN del jefe no es válido.');
+      setOwnerPinInput('');
+      return;
+    }
+    setRoleSwitchPinModalVisible(false);
+    setOwnerPinInput('');
+    setUserRole('principal');
   };
 
   const handleSetupOwnerPin = () => {
@@ -2695,6 +2718,32 @@ export default function TpvScreen() {
         </View>
       </Modal>
 
+      <Modal visible={roleSwitchPinModalVisible} animationType="fade" transparent={true}>
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <Text style={styles.modalTitle}>🔐 ACCESO PRINCIPAL</Text>
+            <Text style={styles.modalSubtitle}>Introduce el PIN del jefe para volver al perfil principal.</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="PIN del jefe"
+              placeholderTextColor="#94a3b8"
+              keyboardType="number-pad"
+              secureTextEntry
+              maxLength={6}
+              value={ownerPinInput}
+              onChangeText={(value) => setOwnerPinInput(value.replace(/[^0-9]/g, ''))}
+              autoFocus
+            />
+            <Pressable style={[styles.primaryButton, { marginTop: 10 }]} onPress={confirmPrincipalRole}>
+              <Text style={styles.primaryButtonText}>Entrar como principal</Text>
+            </Pressable>
+            <Pressable style={[styles.secondaryButton, { marginTop: 8 }]} onPress={() => { setRoleSwitchPinModalVisible(false); setOwnerPinInput(''); }}>
+              <Text style={styles.secondaryButtonText}>Cancelar</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
+
       {/* MODAL: USUARIOS Y PERMISOS */}
       <Modal visible={userPermissionsModalVisible} animationType="fade" transparent={true}>
         <View style={styles.modalOverlay}>
@@ -2702,21 +2751,19 @@ export default function TpvScreen() {
             <Text style={styles.modalTitle}>👥 USUARIOS Y PERMISOS</Text>
             <Text style={styles.modalSubtitle}>Ajusta el perfil activo y la seguridad del usuario principal.</Text>
 
-            <View style={styles.rowButtons}>
-              <Pressable style={[styles.secondaryButton, { flex: 1, backgroundColor: userRole === 'principal' ? '#dcfce7' : '#f1f5f9' }]} onPress={() => setUserRole('principal')}>
-                <Text style={styles.secondaryButtonText}>Principal</Text>
-              </Pressable>
-              <Pressable style={[styles.secondaryButton, { flex: 1, marginLeft: 8, backgroundColor: userRole === 'empleado' ? '#dbeafe' : '#f1f5f9' }]} onPress={() => setUserRole('empleado')}>
-                <Text style={styles.secondaryButtonText}>Empleado</Text>
-              </Pressable>
-            </View>
-
-            <View style={{ marginTop: 14, padding: 10, borderRadius: 8, backgroundColor: '#f8fafc', borderWidth: 1, borderColor: '#e2e8f0' }}>
-              <Text style={[styles.modalSubtitle, { fontWeight: 'bold', color: '#0f172a' }]}>PIN principal</Text>
-              <Text style={[styles.emptyText, { textAlign: 'left', marginTop: 4, color: ownerPin ? '#166534' : '#b45309' }]}>
-                {ownerPin ? 'PIN principal configurado y activo.' : 'Aún no has configurado el PIN principal.'}
-              </Text>
-            </View>
+            {ownerPin ? (
+              <>
+                <View style={styles.rowButtons}>
+                  <Pressable style={[styles.secondaryButton, { flex: 1, backgroundColor: '#dcfce7' }]} onPress={requestPrincipalRole}>
+                    <Text style={styles.secondaryButtonText}>Principal</Text>
+                  </Pressable>
+                  <Pressable style={[styles.secondaryButton, { flex: 1, marginLeft: 8, backgroundColor: userRole === 'empleado' ? '#dbeafe' : '#f1f5f9' }]} onPress={() => setUserRole('empleado')}>
+                    <Text style={styles.secondaryButtonText}>Empleado</Text>
+                  </Pressable>
+                </View>
+                <Text style={[styles.emptyText, { textAlign: 'left', marginTop: 10, color: '#166534' }]}>PIN principal configurado y activo.</Text>
+              </>
+            ) : null}
 
             {!ownerPin ? (
               <View style={{ marginTop: 12 }}>
@@ -2784,35 +2831,40 @@ export default function TpvScreen() {
               </View>
             )}
 
-            <View style={{ marginTop: 12, padding: 10, borderRadius: 8, backgroundColor: '#eff6ff', borderWidth: 1, borderColor: '#bfdbfe' }}>
-              <Text style={[styles.modalSubtitle, { fontWeight: 'bold', color: '#0f172a' }]}>Recuperación de acceso</Text>
-              <Text style={[styles.modalSubtitle, { color: '#475569', marginTop: 4 }]}>Añade un email o teléfono para recuperar el PIN si lo olvidas.</Text>
-              <TextInput
-                style={styles.input}
-                placeholder="Email de recuperación"
-                placeholderTextColor="#94a3b8"
-                keyboardType="email-address"
-                value={ownerRecoveryEmail}
-                onChangeText={setOwnerRecoveryEmail}
-              />
-              <TextInput
-                style={styles.input}
-                placeholder="Teléfono de recuperación"
-                placeholderTextColor="#94a3b8"
-                keyboardType="phone-pad"
-                value={ownerRecoveryPhone}
-                onChangeText={setOwnerRecoveryPhone}
-              />
-              <Pressable style={[styles.secondaryButton, { marginTop: 8, backgroundColor: '#dbeafe' }]} onPress={handleRecoveryRequest}>
-                <Text style={styles.secondaryButtonText}>Generar código de recuperación</Text>
-              </Pressable>
-              {ownerRecoveryCode ? (
-                <Text style={[styles.emptyText, { textAlign: 'left', marginTop: 8, color: '#0f766e' }]}>
-                  Código temporal: {ownerRecoveryCode}
-                </Text>
-              ) : null}
-              <Text style={[styles.modalSubtitle, { color: '#64748b', marginTop: 8 }]}>En una versión con backend real, este código se enviaría por email o SMS.</Text>
-            </View>
+            <Pressable
+              style={[styles.secondaryButton, { marginTop: 12, backgroundColor: '#eff6ff', borderColor: '#bfdbfe' }]}
+              onPress={() => setRecoverySectionVisible((visible) => !visible)}
+            >
+              <Text style={styles.secondaryButtonText}>{recoverySectionVisible ? 'Ocultar recuperación de acceso' : 'Recuperación de acceso'}</Text>
+            </Pressable>
+
+            {recoverySectionVisible ? (
+              <View style={{ marginTop: 8, padding: 10, borderRadius: 8, backgroundColor: '#eff6ff', borderWidth: 1, borderColor: '#bfdbfe' }}>
+                <Text style={[styles.modalSubtitle, { color: '#475569' }]}>Añade un email o teléfono para recuperar el PIN si lo olvidas.</Text>
+                <TextInput
+                  style={styles.input}
+                  placeholder="Email de recuperación"
+                  placeholderTextColor="#94a3b8"
+                  keyboardType="email-address"
+                  value={ownerRecoveryEmail}
+                  onChangeText={setOwnerRecoveryEmail}
+                />
+                <TextInput
+                  style={styles.input}
+                  placeholder="Teléfono de recuperación"
+                  placeholderTextColor="#94a3b8"
+                  keyboardType="phone-pad"
+                  value={ownerRecoveryPhone}
+                  onChangeText={setOwnerRecoveryPhone}
+                />
+                <Pressable style={[styles.secondaryButton, { marginTop: 8, backgroundColor: '#dbeafe' }]} onPress={handleRecoveryRequest}>
+                  <Text style={styles.secondaryButtonText}>Guardar datos de recuperación</Text>
+                </Pressable>
+                {ownerRecoveryCode ? (
+                  <Text style={[styles.emptyText, { textAlign: 'left', marginTop: 8, color: '#0f766e' }]}>Código temporal: {ownerRecoveryCode}</Text>
+                ) : null}
+              </View>
+            ) : null}
 
             <Pressable style={[styles.secondaryButton, { marginTop: 14 }]} onPress={() => setUserPermissionsModalVisible(false)}>
               <Text style={styles.secondaryButtonText}>Cerrar</Text>
