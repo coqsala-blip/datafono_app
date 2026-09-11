@@ -13,12 +13,27 @@
         }
       ],
       "expo-mail-composer",
-      "expo-secure-store"
+      "expo-secure-store",
+      [
+        "@stripe/stripe-terminal-react-native",
+        {
+          "appDelegate": true,
+          "tapToPayCheck": true,
+          "locationWhenInUsePermission": "TPV necesita tu ubicación para aceptar pagos con Tap to Pay.",
+          "bluetoothPeripheralPermission": "TPV necesita Bluetooth para conectar lectores de pago compatibles.",
+          "bluetoothAlwaysUsagePermission": "TPV necesita Bluetooth para mantener lectores de pago compatibles.",
+          "localNetworkUsagePermission": "TPV necesita la red local para conectar lectores de pago compatibles."
+        }
+      ]
     ],
     "android": {
       "permissions": [
         "android.permission.CAMERA",
-        "android.permission.RECORD_AUDIO"
+        "android.permission.RECORD_AUDIO",
+        "android.permission.NFC",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.BLUETOOTH_SCAN",
+        "android.permission.BLUETOOTH_CONNECT"
       ],
       "package": "com.hichfla.tpvapp"
     },

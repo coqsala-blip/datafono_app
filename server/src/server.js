@@ -145,6 +145,51 @@ app.get('/api/billing/status', requireAuth, async (req, res) => {
   }
 });
 
+app.post('/api/terminal/connection-token', requireAuth, async (req, res) => {
+  try {
+    const token = await stripe.terminal.connectionTokens.create({
+      metadata: { supabase_user_id: req.user.id },
+    });
+    return res.json({ ok: true, secret: token.secret });
+  } catch (error) {
+    console.error('Error creando token de conexión Terminal:', error.message);
+    return res.status(502).json({ ok: false, error: 'No se pudo iniciar el lector de pagos.' });
+  }
+});
+
+app.post('/api/terminal/payment-intent', requireAuth, async (req, res) => {
+  const amount = Math.round(Number(req.body?.amount) * 100);
+  const transactionId = typeof req.body?.transactionId === 'string' ? req.body.transactionId.trim() : '';
+
+  if (!Number.isInteger(amount) || amount < 50 || amount > 99999999 || !transactionId) {
+    return res.status(400).json({ ok: false, error: 'El importe o identificador de la operación no es válido.' });
+  }
+
+  try {
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount,
+      currency: 'eur',
+      payment_method_types: ['card_present'],
+      capture_method: 'automatic',
+      metadata: {
+        supabase_user_id: req.user.id,
+        transaction_id: transactionId,
+      },
+    }, {
+      idempotencyKey: `terminal-${req.user.id}-${transactionId}`,
+    });
+
+    return res.status(201).json({
+      ok: true,
+      paymentIntentId: paymentIntent.id,
+      clientSecret: paymentIntent.client_secret,
+    });
+  } catch (error) {
+    console.error('Error creando PaymentIntent Terminal:', error.message);
+    return res.status(502).json({ ok: false, error: 'No se pudo preparar el cobro.' });
+  }
+});
+
 app.post('/api/billing/checkout', requireAuth, async (req, res) => {
   const additionalUsers = Math.max(0, Math.min(50, Math.floor(Number(req.body?.additionalUsers) || 0)));
   const basePriceId = process.env.STRIPE_BASE_PRICE_ID;
