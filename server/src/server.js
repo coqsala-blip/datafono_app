@@ -85,10 +85,16 @@ app.post('/api/monei/callback', express.raw({ type: 'application/json' }), (req,
   }
 
   if (!verifyMoneiSignature(rawBody, signature)) {
-    return res.status(401).json({ ok: false, error: 'Firma MONEI no válida.' });
+    console.warn('Callback MONEI recibido con firma no verificable; se ignora el contenido.');
+    return res.status(200).json({ received: true });
   }
 
-  const payment = JSON.parse(rawBody);
+  let payment;
+  try {
+    payment = JSON.parse(rawBody);
+  } catch {
+    return res.status(200).json({ received: true });
+  }
   console.log('MONEI callback recibido:', payment.id, payment.status);
   return res.status(200).json({ received: true });
 });
