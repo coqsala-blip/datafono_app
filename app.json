@@ -11,7 +11,7 @@
         {
           "cameraPermission": "Permite a $(PRODUCT_NAME) usar la cámara para escanear códigos."
         }
-      ]
+      ],
       "expo-mail-composer",
       "expo-secure-store",
       [
@@ -21,7 +21,7 @@
             "minSdkVersion": 26
           }
         }
-      ],
+      ]
     ],
     "android": {
       "permissions": [
