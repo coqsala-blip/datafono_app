@@ -1,5 +1,4 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { requestNeededAndroidPermissions, useStripeTerminal } from '@stripe/stripe-terminal-react-native';
 import { Camera, CameraView } from 'expo-camera';
 import * as FileSystemLegacy from 'expo-file-system/legacy';
 import * as ImagePicker from 'expo-image-picker';
@@ -46,8 +45,6 @@ type PendingInvoice = { client: Client; items: InvoiceItem[]; ivaRate: number; t
 
 const configuredDocumentApiUrl = process.env.EXPO_PUBLIC_DOCUMENT_API_URL?.replace(/\/$/, '');
 const DOCUMENT_API_URL_CANDIDATES = configuredDocumentApiUrl ? [configuredDocumentApiUrl] : [];
-const terminalLocationId = process.env.EXPO_PUBLIC_STRIPE_TERMINAL_LOCATION_ID;
-const terminalSimulationEnabled = process.env.EXPO_PUBLIC_STRIPE_TERMINAL_SIMULATED === 'true';
 
 const fetchWithTimeout = async (url: string, options: RequestInit = {}, timeoutMs = 1500) => {
   const controller = new AbortController();
@@ -258,32 +255,7 @@ export default function TpvScreen() {
   const [subscriptionAdditionalUsers, setSubscriptionAdditionalUsers] = useState('0');
   const [subscriptionError, setSubscriptionError] = useState('');
   const [checkoutLoading, setCheckoutLoading] = useState(false);
-  const [connectLoading, setConnectLoading] = useState(false);
-  const [connectStatus, setConnectStatus] = useState<{ connected: boolean; chargesEnabled: boolean; payoutsEnabled: boolean; detailsSubmitted?: boolean }>({
-    connected: false,
-    chargesEnabled: false,
-    payoutsEnabled: false,
-  });
-  const [connectError, setConnectError] = useState('');
-  const [terminalLoading, setTerminalLoading] = useState(false);
   const [terminalError, setTerminalError] = useState('');
-  const [terminalReady, setTerminalReady] = useState(false);
-
-  const {
-    initialize,
-    easyConnect,
-    setSimulatedCard,
-    connectedReader,
-    processPaymentIntent,
-    retrievePaymentIntent,
-  } = useStripeTerminal({
-    onDidRequestReaderInput: (options) => {
-      Alert.alert('Acerca la tarjeta', options.join(' / '));
-    },
-    onDidRequestReaderDisplayMessage: (message) => {
-      Alert.alert('Stripe Terminal', message);
-    },
-  });
 
   // Estados para envío al gestor por rango de fechas (Global)
   const [managerModalVisible, setManagerModalVisible] = useState(false);
@@ -448,39 +420,6 @@ export default function TpvScreen() {
   }, [accessToken]);
 
   useEffect(() => {
-    if (!accessToken || !configuredDocumentApiUrl) return;
-
-    (async () => {
-      try {
-        const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/connect/status`, {
-          headers: { Authorization: `Bearer ${accessToken}` },
-        }, 10000);
-        const result = await response.json() as { connected?: boolean; chargesEnabled?: boolean; payoutsEnabled?: boolean; detailsSubmitted?: boolean };
-        if (response.ok) {
-          setConnectStatus({
-            connected: Boolean(result.connected),
-            chargesEnabled: Boolean(result.chargesEnabled),
-            payoutsEnabled: Boolean(result.payoutsEnabled),
-            detailsSubmitted: Boolean(result.detailsSubmitted),
-          });
-        }
-      } catch {
-        setConnectError('No se pudo consultar la cuenta de cobros.');
-      }
-    })();
-  }, [accessToken]);
-
-  useEffect(() => {
-    if (!accessToken) return;
-
-    void initialize().then(({ error }) => {
-      if (error) {
-        setTerminalError(error.message || 'No se pudo inicializar Stripe Terminal.');
-      }
-    });
-  }, [accessToken, initialize]);
-
-  useEffect(() => {
     (async () => {
       const storedToken = await SecureStore.getItemAsync(AUTH_TOKEN_KEY);
       if (!storedToken) {
@@ -586,103 +525,12 @@ export default function TpvScreen() {
       setHasActiveSubscription(Boolean(statusResult.active));
       setSubscriptionStatus(statusResult.status || 'missing');
       if (!statusResult.active) {
-        setSubscriptionError('El pago todavía no aparece activo. Cierra la página de Stripe y vuelve a comprobarlo en unos segundos.');
+        setSubscriptionError('El pago todavía no aparece activo. Cierra la página de MONEI y vuelve a comprobarlo en unos segundos.');
       }
     } catch {
-      setSubscriptionError('No se pudo completar la conexión con Stripe.');
+      setSubscriptionError('No se pudo completar la conexión con MONEI.');
     } finally {
       setCheckoutLoading(false);
-    }
-  };
-
-  const startConnectOnboarding = async () => {
-    if (!accessToken || !configuredDocumentApiUrl) return;
-    setConnectLoading(true);
-    setConnectError('');
-
-    try {
-      const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/connect/onboarding`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${accessToken}` },
-      }, 15000);
-      const result = await response.json() as { onboardingUrl?: string; error?: string };
-      if (!response.ok || !result.onboardingUrl) {
-        throw new Error(result.error || 'No se pudo abrir la configuración de cobros.');
-      }
-
-      await WebBrowser.openBrowserAsync(result.onboardingUrl);
-      const statusResponse = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/connect/status`, {
-        headers: { Authorization: `Bearer ${accessToken}` },
-      }, 10000);
-      const statusResult = await statusResponse.json() as { connected?: boolean; chargesEnabled?: boolean; payoutsEnabled?: boolean; detailsSubmitted?: boolean };
-      if (statusResponse.ok) {
-        setConnectStatus({
-          connected: Boolean(statusResult.connected),
-          chargesEnabled: Boolean(statusResult.chargesEnabled),
-          payoutsEnabled: Boolean(statusResult.payoutsEnabled),
-          detailsSubmitted: Boolean(statusResult.detailsSubmitted),
-        });
-      }
-    } catch (error) {
-      setConnectError(error instanceof Error ? error.message : 'No se pudo configurar la cuenta de cobros.');
-    } finally {
-      setConnectLoading(false);
-    }
-  };
-
-  const connectTapToPay = async () => {
-    if (!terminalLocationId) {
-      setTerminalError('Falta configurar la ubicación de Stripe Terminal.');
-      return false;
-    }
-
-    if (connectedReader) {
-      setTerminalReady(true);
-      return true;
-    }
-
-    setTerminalLoading(true);
-    setTerminalError('');
-    try {
-      const permissionResult = await requestNeededAndroidPermissions({
-        accessFineLocation: {
-          title: 'Permiso de ubicación',
-          message: 'Stripe Terminal necesita tu ubicación antes de iniciar el lector.',
-          buttonPositive: 'Permitir',
-        },
-      });
-      if (permissionResult.error) {
-        setTerminalError('Debes conceder el permiso de ubicación antes de iniciar el lector.');
-        return false;
-      }
-
-      const { reader, error } = await easyConnect({
-        discoveryMethod: 'tapToPay',
-        simulated: terminalSimulationEnabled,
-        locationId: terminalLocationId,
-        autoReconnectOnUnexpectedDisconnect: true,
-        merchantDisplayName: issuer.name,
-      });
-      if (error || !reader) {
-        setTerminalError(error?.message || 'Este móvil no se puede conectar a Tap to Pay.');
-        return false;
-      }
-
-      if (terminalSimulationEnabled) {
-        const simulatedCardResult = await setSimulatedCard('4242424242424242');
-        if (simulatedCardResult.error) {
-          setTerminalError(simulatedCardResult.error.message || 'No se pudo preparar la tarjeta simulada.');
-          return false;
-        }
-      }
-
-      setTerminalReady(true);
-      return true;
-    } catch (error) {
-      setTerminalError(error instanceof Error ? error.message : 'No se pudo conectar Tap to Pay.');
-      return false;
-    } finally {
-      setTerminalLoading(false);
     }
   };
 
@@ -1188,59 +1036,8 @@ export default function TpvScreen() {
     setNfcModalVisible(true);
   };
 
-  const completePayment = async () => {
-    if (!accessToken || !configuredDocumentApiUrl) {
-      Alert.alert('Sesión requerida', 'Inicia sesión para poder cobrar.');
-      return;
-    }
-
-    const paymentAmount = pendingInvoice ? pendingInvoice.total : amount;
-    const transactionId = `terminal-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    setTerminalLoading(true);
-    setTerminalError('');
-
-    try {
-      const connected = await connectTapToPay();
-      if (!connected) return;
-
-      const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/terminal/payment-intent`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${accessToken}`,
-        },
-        body: JSON.stringify({ amount: paymentAmount, transactionId }),
-      }, 15000);
-      const result = await response.json() as { clientSecret?: string; error?: string };
-      if (!response.ok || !result.clientSecret) {
-        throw new Error(result.error || 'No se pudo preparar el cobro en Stripe.');
-      }
-
-      const retrieved = await retrievePaymentIntent(result.clientSecret);
-      if (retrieved.error || !retrieved.paymentIntent) {
-        throw new Error(retrieved.error?.message || 'No se pudo recuperar el cobro preparado.');
-      }
-
-      const processed = await processPaymentIntent({ paymentIntent: retrieved.paymentIntent });
-      if (processed.error || !processed.paymentIntent) {
-        throw new Error(processed.error?.message || 'El cobro no se pudo completar.');
-      }
-
-      setNfcModalVisible(false);
-      if (pendingInvoice) {
-        createTransaction('COBRO', pendingInvoice.docType, 'Tarjeta Contactless / NFC', paymentAmount, pendingInvoice.client, pendingInvoice.items, pendingInvoice.ivaRate);
-        setPendingInvoice(null);
-        setClient({ name: '', nif: '', address: '' });
-        setInvoiceItems([{ id: '1', description: '', price: '' }]);
-        setInvoiceIvaInput('21');
-      } else {
-        createTransaction('COBRO', pendingDocumentType, 'Tarjeta Contactless / NFC');
-      }
-    } catch (error) {
-      setTerminalError(error instanceof Error ? error.message : 'El cobro no se pudo completar.');
-    } finally {
-      setTerminalLoading(false);
-    }
+  const completePayment = () => {
+    setTerminalError('MONEI Pay para tarjeta física requiere el SDK oficial de MONEI Pay. No se ha activado ningún cobro físico provisional.');
   };
 
   const completePaymentQr = async () => {
@@ -3019,15 +2816,8 @@ export default function TpvScreen() {
               <TextInput style={styles.input} placeholder="Dirección del negocio" placeholderTextColor="#94a3b8" value={issuer.address} onChangeText={(t) => setIssuer(i => ({ ...i, address: t }))} />
               <TextInput style={styles.input} placeholder="Correo electrónico del gestor" placeholderTextColor="#94a3b8" keyboardType="email-address" value={issuer.managerEmail || ''} onChangeText={(t) => setIssuer(i => ({ ...i, managerEmail: t }))} />
 
-              <Text style={[styles.cardTitle, { marginTop: 10 }]}>💳 CUENTA PARA RECIBIR PAGOS</Text>
-              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>Stripe verificará los datos legales y bancarios del negocio mediante un formulario seguro.</Text>
-              <Pressable style={[styles.primaryButton, { marginTop: 10 }]} onPress={startConnectOnboarding} disabled={connectLoading}>
-                <Text style={styles.primaryButtonText}>{connectLoading ? 'Abriendo Stripe...' : connectStatus.payoutsEnabled ? 'Cuenta de cobros verificada' : 'Configurar cuenta de cobros'}</Text>
-              </Pressable>
-              <Text style={[styles.emptyText, { textAlign: 'left', marginTop: 6, color: connectStatus.payoutsEnabled ? '#166534' : '#b45309' }]}>
-                {connectStatus.payoutsEnabled ? 'Stripe puede recibir pagos y enviar fondos a tu cuenta bancaria.' : connectStatus.connected ? 'La configuración está pendiente de verificación.' : 'Aún no has configurado la cuenta de cobros.'}
-              </Text>
-              {connectError ? <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 6 }}>{connectError}</Text> : null}
+              <Text style={[styles.cardTitle, { marginTop: 10 }]}>💳 COBROS CON MONEI</Text>
+              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>Las tarjetas online y Bizum se gestionan mediante MONEI. Configura la cuenta y la clave API secreta en el backend de Render.</Text>
               <TextInput
                 style={styles.input}
                 placeholder="Usuarios adicionales (+2 €/mes cada uno)"
@@ -3125,9 +2915,9 @@ export default function TpvScreen() {
             {terminalError ? <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 10, textAlign: 'center' }}>{terminalError}</Text> : null}
 
             <View style={{ gap: 10, marginTop: 15 }}>
-              <Pressable style={[styles.primaryButton, { backgroundColor: '#16a34a' }]} onPress={completePayment} disabled={terminalLoading}>
+              <Pressable style={[styles.primaryButton, { backgroundColor: '#64748b' }]} onPress={completePayment}>
                 <Text style={styles.primaryButtonText}>
-                  {terminalLoading ? 'Preparando Tap to Pay...' : '💳 1. Cobrar con Tarjeta / NFC (Tap to Pay)'}
+                  💳 1. Tarjeta física / NFC con MONEI Pay
                 </Text>
               </Pressable>
               

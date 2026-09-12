@@ -19,7 +19,6 @@ npm run dev
 - `POST /api/companies`
 - `POST /api/subscriptions/create`
 - `POST /api/companies/:companyId/users`
-- `POST /api/stripe/webhook`
 - `POST /api/monei/payment`
 - `GET /api/monei/payment/:paymentId`
 - `POST /api/monei/callback`
@@ -37,6 +36,8 @@ total_con_iva = total_neto * 1.21
 ```
 
 > Si quieres, luego puedes conectar este backend con la app Expo y con una base de datos real.
+
+Las suscripciones todavía requieren conectar el endpoint de suscripciones de MONEI; no se utiliza Stripe.
 
 ### Despliegue en Render
 

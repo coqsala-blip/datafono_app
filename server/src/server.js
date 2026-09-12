@@ -3,7 +3,6 @@ const express = require('express');
 const crypto = require('crypto');
 const QRCode = require('qrcode');
 const { createClient } = require('@supabase/supabase-js');
-const stripe = require('./config/stripe');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -20,26 +19,6 @@ try {
 }
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
-
-const stripeV2Request = async (path, method, body) => {
-  const response = await fetch(`https://api.stripe.com${path}`, {
-    method,
-    headers: {
-      Authorization: `Bearer ${process.env.STRIPE_SECRET_KEY}`,
-      'Content-Type': 'application/json',
-      'Stripe-Version': '2026-08-26.dahlia',
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const result = await response.json();
-  if (!response.ok) {
-    const error = new Error(result.error?.message || 'Stripe API error');
-    error.code = result.error?.code;
-    error.type = result.error?.type;
-    throw error;
-  }
-  return result;
-};
 
 const moneiRequest = async (path, method, body) => {
   if (!process.env.MONEI_API_KEY) {
@@ -196,189 +175,6 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
   res.json({ ok: true, user: req.user });
 });
 
-const getConnectReturnUrl = () => `${PUBLIC_API_URL}/api/connect/return`;
-
-app.get('/api/connect/status', requireAuth, async (req, res) => {
-  const accountId = req.user.user_metadata?.stripe_connect_account_id;
-  if (!accountId) {
-    return res.json({ ok: true, connected: false, accountId: null, chargesEnabled: false, payoutsEnabled: false });
-  }
-
-  try {
-    const account = await stripe.accounts.retrieve(accountId);
-    return res.json({
-      ok: true,
-      connected: true,
-      accountId: account.id,
-      chargesEnabled: Boolean(account.charges_enabled),
-      payoutsEnabled: Boolean(account.payouts_enabled),
-      detailsSubmitted: Boolean(account.details_submitted),
-      currentlyDue: account.requirements?.currently_due || [],
-    });
-  } catch (error) {
-    console.error('Error consultando cuenta Connect:', error.message);
-    return res.status(502).json({ ok: false, error: 'No se pudo consultar la cuenta de cobros.' });
-  }
-});
-
-app.post('/api/connect/onboarding', requireAuth, async (req, res) => {
-  let accountId = req.user.user_metadata?.stripe_connect_account_id;
-  let onboardingStage = accountId ? 'account_link' : 'account_create';
-
-  try {
-    if (!accountId) {
-      const account = await stripeV2Request('/v2/core/accounts', 'POST', {
-        contact_email: req.user.email,
-        display_name: req.user.user_metadata?.company_name || req.user.user_metadata?.full_name || 'Comercio TPV',
-        identity: {
-          country: 'ES',
-          entity_type: 'company',
-        },
-        dashboard: 'express',
-        configuration: {
-          merchant: {
-            capabilities: {
-              card_payments: { requested: true },
-            },
-          },
-        },
-        defaults: {
-          responsibilities: {
-            fees_collector: 'application',
-            losses_collector: 'application',
-          },
-        },
-        metadata: { supabase_user_id: req.user.id },
-        include: ['configuration.merchant', 'identity', 'defaults'],
-      });
-      accountId = account.id;
-      onboardingStage = 'metadata_save';
-
-      const { error: metadataError } = await supabase.auth.admin.updateUserById(req.user.id, {
-        user_metadata: {
-          ...req.user.user_metadata,
-          stripe_connect_account_id: accountId,
-        },
-      });
-      if (metadataError) {
-        console.error('Cuenta Connect creada, pero no se pudo guardar la asociación en Supabase:', metadataError.message);
-      }
-    }
-
-    onboardingStage = 'account_link';
-    const accountLink = await stripe.accountLinks.create({
-      account: accountId,
-      refresh_url: getConnectReturnUrl(),
-      return_url: getConnectReturnUrl(),
-      type: 'account_onboarding',
-    });
-
-    return res.status(201).json({ ok: true, accountId, onboardingUrl: accountLink.url });
-  } catch (error) {
-    console.error('Error creando onboarding Connect:', {
-      message: error.message,
-      code: error.code,
-      type: error.type,
-      accountId,
-      onboardingStage,
-      userId: req.user.id,
-    });
-    return res.status(502).json({
-      ok: false,
-      error: `Stripe no pudo iniciar la configuración (${onboardingStage}). ${error.message || 'Revisa el estado de tu cuenta de plataforma.'}`,
-    });
-  }
-});
-
-app.get('/api/connect/return', (req, res) => {
-  res.type('html').send('<h1>Configuración recibida</h1><p>Puedes volver a la aplicación para comprobar el estado de tu cuenta de cobros.</p>');
-});
-
-const activeSubscriptionStatuses = new Set(['active', 'trialing']);
-
-app.get('/api/billing/status', requireAuth, async (req, res) => {
-  const customerId = req.user.user_metadata?.stripe_customer_id;
-  if (!customerId) {
-    return res.json({ ok: true, active: false, status: 'missing' });
-  }
-
-  try {
-    const subscriptions = await stripe.subscriptions.list({
-      customer: customerId,
-      status: 'all',
-      limit: 10,
-    });
-    const subscription = subscriptions.data
-      .sort((left, right) => right.created - left.created)[0];
-
-    return res.json({
-      ok: true,
-      active: Boolean(subscription && activeSubscriptionStatuses.has(subscription.status)),
-      status: subscription?.status || 'missing',
-      subscriptionId: subscription?.id || null,
-      currentPeriodEnd: subscription?.current_period_end || null,
-    });
-  } catch (error) {
-    console.error('Error consultando suscripción:', error.message);
-    return res.status(502).json({ ok: false, error: 'No se pudo consultar la suscripción.' });
-  }
-});
-
-app.post('/api/terminal/connection-token', requireAuth, async (req, res) => {
-  try {
-    const token = await stripe.terminal.connectionTokens.create();
-    return res.json({ ok: true, secret: token.secret });
-  } catch (error) {
-    console.error('Error creando token de conexión Terminal:', {
-      message: error.message,
-      code: error.code,
-      type: error.type,
-    });
-    return res.status(502).json({ ok: false, error: `Stripe no pudo crear el token de conexión. ${error.message}` });
-  }
-});
-
-app.post('/api/terminal/payment-intent', requireAuth, async (req, res) => {
-  const rawAmount = req.body?.amount;
-  const amountNumber = typeof rawAmount === 'string'
-    ? Number(rawAmount.replace(',', '.'))
-    : Number(rawAmount);
-  const amount = Math.round(amountNumber * 100);
-  const transactionId = typeof req.body?.transactionId === 'string' ? req.body.transactionId.trim() : '';
-
-  if (!Number.isFinite(amountNumber) || !Number.isInteger(amount) || amount < 50 || amount > 99999999) {
-    return res.status(400).json({ ok: false, error: `Importe no válido: ${String(rawAmount)}. Usa al menos 0,50 €.` });
-  }
-
-  if (!transactionId) {
-    return res.status(400).json({ ok: false, error: 'Falta el identificador de la operación.' });
-  }
-
-  try {
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount,
-      currency: 'eur',
-      payment_method_types: ['card_present'],
-      capture_method: 'automatic',
-      metadata: {
-        supabase_user_id: req.user.id,
-        transaction_id: transactionId,
-      },
-    }, {
-      idempotencyKey: `terminal-${req.user.id}-${transactionId}`,
-    });
-
-    return res.status(201).json({
-      ok: true,
-      paymentIntentId: paymentIntent.id,
-      clientSecret: paymentIntent.client_secret,
-    });
-  } catch (error) {
-    console.error('Error creando PaymentIntent Terminal:', error.message);
-    return res.status(502).json({ ok: false, error: 'No se pudo preparar el cobro.' });
-  }
-});
-
 app.post('/api/monei/payment', requireAuth, async (req, res) => {
   const amountNumber = typeof req.body?.amount === 'string'
     ? Number(req.body.amount.replace(',', '.'))
@@ -434,65 +230,10 @@ app.get('/monei/cancel', (req, res) => {
 });
 
 app.post('/api/billing/checkout', requireAuth, async (req, res) => {
-  const additionalUsers = Math.max(0, Math.min(50, Math.floor(Number(req.body?.additionalUsers) || 0)));
-  const basePriceId = process.env.STRIPE_BASE_PRICE_ID;
-  const extraPriceId = process.env.STRIPE_EXTRA_PRICE_ID;
-
-  if (!basePriceId || !extraPriceId || basePriceId.includes('REEMPLAZAR') || extraPriceId.includes('REEMPLAZAR')) {
-    return res.status(503).json({ ok: false, error: 'La facturación todavía no está configurada en Stripe.' });
-  }
-
-  try {
-    const customerId = req.user.user_metadata?.stripe_customer_id || (
-      await stripe.customers.create({
-        email: req.user.email,
-        name: req.user.user_metadata?.full_name || undefined,
-        metadata: { supabase_user_id: req.user.id },
-      })
-    ).id;
-
-    await supabase.auth.admin.updateUserById(req.user.id, {
-      user_metadata: {
-        ...req.user.user_metadata,
-        stripe_customer_id: customerId,
-      },
-    });
-
-    const lineItems = [{ price: basePriceId, quantity: 1 }];
-    if (additionalUsers > 0) {
-      lineItems.push({ price: extraPriceId, quantity: additionalUsers });
-    }
-
-    const session = await stripe.checkout.sessions.create({
-      mode: 'subscription',
-      customer: customerId,
-      line_items: lineItems,
-      success_url: `${PUBLIC_API_URL}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${PUBLIC_API_URL}/billing/cancelled`,
-      subscription_data: {
-        metadata: {
-          supabase_user_id: req.user.id,
-          additional_users: String(additionalUsers),
-        },
-      },
-      metadata: {
-        supabase_user_id: req.user.id,
-        additional_users: String(additionalUsers),
-      },
-    });
-
-    const netMonthly = 9 + (additionalUsers * 2.5);
-    const totalMonthlyWithVat = Number((netMonthly * 1.21).toFixed(2));
-
-    return res.status(201).json({
-      ok: true,
-      checkoutUrl: session.url,
-      totalMonthly: totalMonthlyWithVat,
-    });
-  } catch (error) {
-    console.error('Error creando checkout de suscripción:', error.message);
-    return res.status(502).json({ ok: false, error: 'No se pudo iniciar el pago de la suscripción.' });
-  }
+  return res.status(503).json({
+    ok: false,
+    error: 'Las suscripciones de MONEI todavía no están configuradas.',
+  });
 });
 
 app.get('/billing/success', (req, res) => {
@@ -623,92 +364,11 @@ app.get('/api/documents/:token', async (req, res) => {
 });
 
 app.post('/api/companies', async (req, res) => {
-  try {
-    const {
-      name,
-      nif,
-      address,
-      email,
-      bankName,
-      iban,
-      accountHolder,
-      country,
-      additionalUsers = 0,
-    } = req.body;
-
-    const customer = await stripe.customers.create({
-      email,
-      name,
-      metadata: {
-        company_name: name,
-        nif,
-        country,
-      },
-    });
-
-    const baseAmount = 9;
-    const extraAmount = Math.max(0, Number(additionalUsers)) * 2.5;
-    const totalMonthly = Number(((baseAmount + extraAmount) * 1.21).toFixed(2));
-
-    const subscription = await stripe.subscriptions.create({
-      customer: customer.id,
-      items: [{ price: process.env.STRIPE_BASE_PRICE_ID }],
-      metadata: {
-        company_name: name,
-        company_nif: nif,
-        additional_users: String(additionalUsers),
-        total_monthly: String(totalMonthly),
-      },
-      payment_behavior: 'default_incomplete',
-      expand: ['latest_invoice.payment_intent'],
-    });
-
-    res.status(201).json({
-      ok: true,
-      company: {
-        name,
-        nif,
-        address,
-        email,
-        bankName,
-        iban,
-        accountHolder,
-        country,
-        additionalUsers,
-        totalMonthly,
-      },
-      customerId: customer.id,
-      subscriptionId: subscription.id,
-      subscription,
-    });
-  } catch (error) {
-    console.error('Error creating company:', error);
-    res.status(500).json({ ok: false, error: error.message });
-  }
+  res.status(503).json({ ok: false, error: 'El alta de suscripciones MONEI todavía no está configurada.' });
 });
 
 app.post('/api/subscriptions/create', async (req, res) => {
-  try {
-    const { customerId, additionalUsers = 0 } = req.body;
-
-    const totalMonthly = Number(((9 + (Math.max(0, Number(additionalUsers)) * 2.5)) * 1.21).toFixed(2));
-
-    const subscription = await stripe.subscriptions.create({
-      customer: customerId,
-      items: [{ price: process.env.STRIPE_BASE_PRICE_ID }],
-      metadata: {
-        additional_users: String(additionalUsers),
-        total_monthly: String(totalMonthly),
-      },
-      payment_behavior: 'default_incomplete',
-      expand: ['latest_invoice.payment_intent'],
-    });
-
-    res.json({ ok: true, subscription, totalMonthly });
-  } catch (error) {
-    console.error('Error creating subscription:', error);
-    res.status(500).json({ ok: false, error: error.message });
-  }
+  res.status(503).json({ ok: false, error: 'Las suscripciones MONEI todavía no están configuradas.' });
 });
 
 app.post('/api/companies/:companyId/users', async (req, res) => {
@@ -721,35 +381,6 @@ app.post('/api/companies/:companyId/users', async (req, res) => {
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
   }
-});
-
-app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  const sig = req.headers['stripe-signature'];
-
-  let event;
-
-  try {
-    event = stripe.webhooks.constructEvent(
-      req.body,
-      sig,
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
-  } catch (err) {
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-
-  switch (event.type) {
-    case 'customer.subscription.created':
-    case 'customer.subscription.updated':
-    case 'invoice.paid':
-    case 'invoice.payment_failed':
-      console.log('Stripe event handled:', event.type);
-      break;
-    default:
-      console.log(`Unhandled event type: ${event.type}`);
-  }
-
-  res.json({ received: true });
 });
 
 app.listen(PORT, () => {
