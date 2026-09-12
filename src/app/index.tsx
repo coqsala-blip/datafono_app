@@ -653,6 +653,20 @@ export default function TpvScreen() {
     return subscriptionBasePrice + (additionalUsers * subscriptionAdditionalUserPrice);
   }, [issuer.additionalUsers]);
 
+  const requireSubscription = (feature: string) => {
+    if (hasActiveSubscription) return true;
+
+    Alert.alert(
+      'Suscripción necesaria',
+      `Activa la suscripción para ${feature}. Puedes seguir explorando la aplicación antes de contratarla.`,
+      [
+        { text: 'Ahora no', style: 'cancel' },
+        { text: 'Activar suscripción', onPress: () => void startSubscriptionCheckout() },
+      ],
+    );
+    return false;
+  };
+
   const totalExpensesAmount = useMemo(() => expenses.reduce((acc, exp) => acc + exp.amount, 0), [expenses]);
 
   const chartData = useMemo(() => {
@@ -982,6 +996,7 @@ export default function TpvScreen() {
   }, [amount, ivaPercentage, issuer]);
 
   const startPayment = (documentType: DocumentType) => {
+    if (!requireSubscription('realizar cobros')) return;
     if (documentType === 'FACTURA COMPLETA' || documentType === 'FACTURA SIMPLIFICADA') {
       setPendingDocumentType(documentType);
       setClientModalVisible(true);
@@ -1141,6 +1156,7 @@ export default function TpvScreen() {
   };
 
   const saveExpense = () => {
+    if (!requireSubscription('guardar gastos')) return;
     const cleanProvider = expenseProvider.trim();
     const parsedAmount = parseFloat(expenseAmountInput.replace(',', '.'));
 
@@ -1240,6 +1256,7 @@ export default function TpvScreen() {
   };
 
   const sendPresupuestoByEmail = async () => {
+    if (!requireSubscription('enviar presupuestos o facturas')) return;
     const validClient = Object.fromEntries(Object.entries(presupuestoClient).map(([key, value]) => [key, value.trim()])) as Client;
     if (!validClient.name || !validClient.nif || !validClient.address) {
       Alert.alert('Datos incompletos', 'Indica nombre, NIF/CIF y dirección fiscal del cliente.');
@@ -1558,6 +1575,7 @@ export default function TpvScreen() {
   };
 
   const requestPrincipalRole = () => {
+    if (!requireSubscription('cambiar de usuario')) return;
     if (userRole === 'principal') return;
     if (!ownerPin) {
       Alert.alert('PIN no configurado', 'El usuario principal debe configurar primero su PIN.');
@@ -1964,6 +1982,7 @@ export default function TpvScreen() {
   };
 
   const sendByEmail = async (transaction: Transaction) => {
+    if (!requireSubscription('enviar documentos por correo')) return;
     try {
       const isAvailable = await MailComposer.isAvailableAsync();
       if (!isAvailable) {
@@ -1987,6 +2006,7 @@ export default function TpvScreen() {
   };
 
   const sendManagerReportByEmail = async () => {
+    if (!requireSubscription('enviar informes al gestor')) return;
     if (!startDateInput.trim() || !endDateInput.trim()) {
       Alert.alert('Fechas requeridas', 'Introduce la fecha de inicio y de fin (formato YYYY-MM-DD o DD/MM/YYYY).');
       return;
@@ -2122,6 +2142,7 @@ export default function TpvScreen() {
   };
 
   const sendCombinedReportByEmail = async () => {
+    if (!requireSubscription('enviar informes consolidados')) return;
     if (!transactionStartDateInput.trim() || !transactionEndDateInput.trim()) {
       Alert.alert('Fechas requeridas', 'Introduce la fecha de inicio y de fin (formato YYYY-MM-DD).');
       return;
@@ -2256,6 +2277,7 @@ export default function TpvScreen() {
 
   // NUEVA FUNCIÓN: Generar y enviar informe específico desde la pestaña Gastos/Facturación
   const sendExpenseSpecificReport = async () => {
+    if (!requireSubscription('enviar informes de gastos')) return;
     if (!expenseStartDateInput.trim() || !expenseEndDateInput.trim()) {
       Alert.alert('Fechas requeridas', 'Introduce la fecha de inicio y de fin (formato DD/MM/YYYY).');
       return;
@@ -2393,62 +2415,6 @@ export default function TpvScreen() {
     );
   }
 
-  if (subscriptionLoading) {
-    return (
-      <SafeAreaView style={styles.safeArea}>
-        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24 }}>
-          <Text style={styles.modalTitle}>Comprobando suscripción...</Text>
-        </View>
-      </SafeAreaView>
-    );
-  }
-
-  if (!hasActiveSubscription) {
-    const additionalUsers = Math.max(0, Math.min(50, Number(subscriptionAdditionalUsers) || 0));
-    const monthlyNet = subscriptionBasePrice + (additionalUsers * subscriptionAdditionalUserPrice);
-    const monthlyIva = monthlyNet * 0.21;
-    const monthlyTotal = monthlyNet + monthlyIva;
-
-    return (
-      <SafeAreaView style={styles.safeArea}>
-        <ScrollView contentContainerStyle={{ flexGrow: 1, justifyContent: 'center', padding: 24 }}>
-          <View style={[styles.card, { padding: 20 }]}>
-            <Text style={styles.modalTitle}>ACTIVA TU SUSCRIPCIÓN</Text>
-            <Text style={[styles.modalSubtitle, { marginBottom: 14 }]}>Para usar el TPV, presupuestos, facturas y gastos necesitas una suscripción activa.</Text>
-            <View style={{ padding: 12, backgroundColor: '#f8fafc', borderRadius: 8, borderWidth: 1, borderColor: '#cbd5e1' }}>
-              <Text style={styles.modalSubtitle}>Usuario principal</Text>
-              <Text style={[styles.headerTitle, { marginTop: 4 }]}>9,00 € / mes + 21% IVA ({formatCurrency(9 * 1.21)})</Text>
-              <Text style={[styles.modalSubtitle, { marginTop: 4 }]}>Cada usuario adicional (empleado): 2,50 € / mes + 21% IVA ({formatCurrency(2.5 * 1.21)})</Text>
-            </View>
-            <Text style={[styles.modalSubtitle, { marginTop: 16 }]}>Usuarios adicionales (empleados)</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="0"
-              placeholderTextColor="#94a3b8"
-              keyboardType="number-pad"
-              value={subscriptionAdditionalUsers}
-              onChangeText={(value) => setSubscriptionAdditionalUsers(value.replace(/[^0-9]/g, ''))}
-            />
-            <Text style={[styles.modalSubtitle, { fontWeight: 'bold', color: '#0f172a', marginTop: 8 }]}>
-              Base: {formatCurrency(monthlyNet)} + IVA (21%): {formatCurrency(monthlyIva)}
-            </Text>
-            <Text style={[styles.modalSubtitle, { fontWeight: 'bold', color: '#16a34a', marginTop: 4 }]}>
-              Total mensual con IVA: {formatCurrency(monthlyTotal)}
-            </Text>
-            {subscriptionStatus !== 'missing' ? <Text style={[styles.modalSubtitle, { marginTop: 6 }]}>Estado actual: {subscriptionStatus}</Text> : null}
-            {subscriptionError ? <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 10 }}>{subscriptionError}</Text> : null}
-            <Pressable style={[styles.primaryButton, { marginTop: 16 }]} onPress={startSubscriptionCheckout} disabled={checkoutLoading}>
-              <Text style={styles.primaryButtonText}>{checkoutLoading ? 'Abriendo pago...' : 'Pagar y activar suscripción'}</Text>
-            </Pressable>
-            <Pressable style={[styles.secondaryButton, { marginTop: 8 }]} onPress={signOut}>
-              <Text style={styles.secondaryButtonText}>Cerrar sesión</Text>
-            </Pressable>
-          </View>
-        </ScrollView>
-      </SafeAreaView>
-    );
-  }
-
   return (
     <SafeAreaView style={styles.safeArea}>
       <View style={styles.header}>
@@ -2456,6 +2422,11 @@ export default function TpvScreen() {
           <View style={{ flex: 1 }}>
             <Text style={styles.headerTitle}>TPV & GESTIÓN DE NEGOCIO</Text>
             <Text style={styles.headerSubtitle}>{issuer.name}</Text>
+            {!hasActiveSubscription ? (
+              <Pressable onPress={() => void startSubscriptionCheckout()}>
+                <Text style={{ color: '#b45309', fontSize: 11, marginTop: 4 }}>Suscripción no activa · activar cuando necesites cobrar o enviar</Text>
+              </Pressable>
+            ) : null}
           </View>
           <Pressable
             style={{ marginLeft: 10, paddingVertical: 8, paddingHorizontal: 10, borderRadius: 6, backgroundColor: userRole === 'principal' ? '#dcfce7' : '#dbeafe' }}
@@ -2486,7 +2457,7 @@ export default function TpvScreen() {
             <Pressable style={[styles.tabButton, activeTab === 'stats' && styles.tabButtonActive]} onPress={() => setActiveTab('stats')}>
               <Text style={[styles.tabText, activeTab === 'stats' && styles.tabTextActive]}>Informes</Text>
             </Pressable>
-            <Pressable style={[styles.tabButton, activeTab === 'config' && styles.tabButtonActive]} onPress={() => setActiveTab('config')}>
+            <Pressable style={[styles.tabButton, activeTab === 'config' && styles.tabButtonActive]} onPress={() => { if (requireSubscription('abrir Configuración')) setActiveTab('config'); }}>
               <Text style={[styles.tabText, activeTab === 'config' && styles.tabTextActive]}>Config</Text>
             </Pressable>
           </>
@@ -3242,7 +3213,7 @@ export default function TpvScreen() {
                   <Pressable style={[styles.secondaryButton, { flex: 1, backgroundColor: '#dcfce7' }]} onPress={requestPrincipalRole}>
                     <Text style={styles.secondaryButtonText}>Principal</Text>
                   </Pressable>
-                  <Pressable style={[styles.secondaryButton, { flex: 1, marginLeft: 8, backgroundColor: userRole === 'empleado' ? '#dbeafe' : '#f1f5f9' }]} onPress={() => setUserRole('empleado')}>
+                  <Pressable style={[styles.secondaryButton, { flex: 1, marginLeft: 8, backgroundColor: userRole === 'empleado' ? '#dbeafe' : '#f1f5f9' }]} onPress={() => { if (requireSubscription('activar usuarios empleados')) setUserRole('empleado'); }}>
                     <Text style={styles.secondaryButtonText}>Empleado</Text>
                   </Pressable>
                 </View>
