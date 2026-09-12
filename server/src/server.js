@@ -96,27 +96,6 @@ app.get('/api/monei/callback', (req, res) => {
   res.status(200).json({ ok: true, service: 'MONEI callback' });
 });
 
-app.get('/api/billing/status', requireAuth, (req, res) => {
-  const status = req.user.user_metadata?.monei_subscription_status || 'missing';
-  const activeStatuses = new Set([
-    'ACTIVE',
-    'TRIALING',
-    'SUCCEEDED',
-    'active',
-    'trialing',
-    'succeeded',
-    'subscription.activated',
-    'subscription.updated',
-  ]);
-  return res.json({
-    ok: true,
-    provider: 'monei',
-    active: activeStatuses.has(status),
-    status,
-    subscriptionId: req.user.user_metadata?.monei_subscription_id || null,
-  });
-});
-
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -153,6 +132,27 @@ const requireAuth = async (req, res, next) => {
   req.user = data.user;
   return next();
 };
+
+app.get('/api/billing/status', requireAuth, (req, res) => {
+  const status = req.user.user_metadata?.monei_subscription_status || 'missing';
+  const activeStatuses = new Set([
+    'ACTIVE',
+    'TRIALING',
+    'SUCCEEDED',
+    'active',
+    'trialing',
+    'succeeded',
+    'subscription.activated',
+    'subscription.updated',
+  ]);
+  return res.json({
+    ok: true,
+    provider: 'monei',
+    active: activeStatuses.has(status),
+    status,
+    subscriptionId: req.user.user_metadata?.monei_subscription_id || null,
+  });
+});
 
 app.post('/api/auth/register', async (req, res) => {
   const { email, password, fullName, companyName } = req.body || {};
