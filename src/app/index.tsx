@@ -542,18 +542,16 @@ export default function TpvScreen() {
     setTerminalLoading(true);
     setTerminalError('');
     try {
-      if (!terminalSimulationEnabled) {
-        const permissionResult = await requestNeededAndroidPermissions({
-          accessFineLocation: {
-            title: 'Permiso de ubicación',
-            message: 'Stripe Terminal necesita tu ubicación para aceptar pagos con Tap to Pay.',
-            buttonPositive: 'Permitir',
-          },
-        });
-        if (permissionResult.error) {
-          setTerminalError('Debes conceder el permiso de ubicación para usar Tap to Pay.');
-          return false;
-        }
+      const permissionResult = await requestNeededAndroidPermissions({
+        accessFineLocation: {
+          title: 'Permiso de ubicación',
+          message: 'Stripe Terminal necesita tu ubicación antes de iniciar el lector.',
+          buttonPositive: 'Permitir',
+        },
+      });
+      if (permissionResult.error) {
+        setTerminalError('Debes conceder el permiso de ubicación antes de iniciar el lector.');
+        return false;
       }
 
       const { reader, error } = await easyConnect({
