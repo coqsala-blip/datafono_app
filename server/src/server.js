@@ -74,12 +74,47 @@ app.post('/api/monei/callback', express.raw({ type: 'application/json' }), (req,
   } catch {
     return res.status(200).json({ received: true });
   }
-  console.log('MONEI callback recibido:', payment.id, payment.status);
+  const resource = payment.object || payment;
+  const status = resource.status || payment.type || 'UNKNOWN';
+  console.log('MONEI callback recibido:', resource.id, status);
+  const subscriptionId = resource.subscriptionId || resource.subscription?.id || resource.id;
+  const userId = resource.metadata?.supabase_user_id || resource.metadata?.user_id;
+  if (userId && subscriptionId) {
+    void supabase.auth.admin.updateUserById(userId, {
+      user_metadata: {
+        subscription_provider: 'monei',
+        monei_subscription_id: subscriptionId,
+        monei_subscription_status: status,
+        monei_subscription_updated_at: new Date().toISOString(),
+      },
+    }).catch((error) => console.error('Error guardando estado de suscripción MONEI:', error.message));
+  }
   return res.status(200).json({ received: true });
 });
 
 app.get('/api/monei/callback', (req, res) => {
   res.status(200).json({ ok: true, service: 'MONEI callback' });
+});
+
+app.get('/api/billing/status', requireAuth, (req, res) => {
+  const status = req.user.user_metadata?.monei_subscription_status || 'missing';
+  const activeStatuses = new Set([
+    'ACTIVE',
+    'TRIALING',
+    'SUCCEEDED',
+    'active',
+    'trialing',
+    'succeeded',
+    'subscription.activated',
+    'subscription.updated',
+  ]);
+  return res.json({
+    ok: true,
+    provider: 'monei',
+    active: activeStatuses.has(status),
+    status,
+    subscriptionId: req.user.user_metadata?.monei_subscription_id || null,
+  });
 });
 
 app.use(express.json());
@@ -230,10 +265,54 @@ app.get('/monei/cancel', (req, res) => {
 });
 
 app.post('/api/billing/checkout', requireAuth, async (req, res) => {
-  return res.status(503).json({
-    ok: false,
-    error: 'Las suscripciones de MONEI todavía no están configuradas.',
-  });
+  const additionalUsers = Math.max(0, Math.min(50, Math.floor(Number(req.body?.additionalUsers) || 0)));
+  const amount = 1089 + (additionalUsers * 303);
+  const orderId = `subscription-${req.user.id}-${Date.now()}`;
+
+  try {
+    const subscription = await moneiRequest('/subscriptions', 'POST', {
+      amount,
+      currency: 'EUR',
+      interval: 'MONTH',
+      intervalCount: 1,
+      orderId,
+      description: `TPV Gestor - suscripción - ${additionalUsers} empleados`,
+      customer: {
+        email: req.user.email,
+      },
+      metadata: {
+        supabase_user_id: req.user.id,
+        additional_users: String(additionalUsers),
+        total_monthly_cents: String(amount),
+      },
+      callbackUrl: `${PUBLIC_API_URL}/api/monei/callback`,
+      completeUrl: `${PUBLIC_API_URL}/billing/success?orderId=${encodeURIComponent(orderId)}`,
+      cancelUrl: `${PUBLIC_API_URL}/billing/cancelled?orderId=${encodeURIComponent(orderId)}`,
+    });
+
+    const subscriptionId = subscription.id || subscription.subscriptionId;
+    await supabase.auth.admin.updateUserById(req.user.id, {
+      user_metadata: {
+        ...req.user.user_metadata,
+        subscription_provider: 'monei',
+        monei_subscription_id: subscriptionId || null,
+        monei_subscription_status: subscription.status || 'PENDING',
+        monei_subscription_additional_users: String(additionalUsers),
+        monei_subscription_amount_cents: String(amount),
+      },
+    });
+
+    return res.status(201).json({
+      ok: true,
+      subscriptionId,
+      checkoutUrl: subscription.nextAction?.redirectUrl || subscription.redirectUrl || subscription.checkoutUrl,
+      amount,
+      additionalUsers,
+    });
+  } catch (error) {
+    console.error('Error creando suscripción MONEI:', error.message);
+    return res.status(502).json({ ok: false, error: 'No se pudo iniciar la suscripción MONEI.' });
+  }
 });
 
 app.get('/billing/success', (req, res) => {

@@ -21,6 +21,8 @@ npm run dev
 - `POST /api/companies/:companyId/users`
 - `POST /api/monei/payment`
 - `GET /api/monei/payment/:paymentId`
+- `POST /api/billing/checkout`
+- `GET /api/billing/status`
 - `POST /api/monei/callback`
 
 ### Plan actual
