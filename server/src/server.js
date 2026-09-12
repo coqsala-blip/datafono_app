@@ -73,8 +73,13 @@ const verifyMoneiSignature = (rawBody, signature) => {
 
 app.set('trust proxy', 1);
 app.post('/api/monei/callback', express.raw({ type: 'application/json' }), (req, res) => {
-  const rawBody = req.body.toString('utf8');
+  const rawBody = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : '';
   const signature = req.headers['monei-signature'];
+
+  if (!rawBody.trim() || rawBody.trim() === '{}') {
+    return res.status(200).json({ received: true });
+  }
+
   if (!verifyMoneiSignature(rawBody, signature)) {
     return res.status(401).json({ ok: false, error: 'Firma MONEI no válida.' });
   }
@@ -82,6 +87,10 @@ app.post('/api/monei/callback', express.raw({ type: 'application/json' }), (req,
   const payment = JSON.parse(rawBody);
   console.log('MONEI callback recibido:', payment.id, payment.status);
   return res.status(200).json({ received: true });
+});
+
+app.get('/api/monei/callback', (req, res) => {
+  res.status(200).json({ ok: true, service: 'MONEI callback' });
 });
 
 app.use(express.json());
