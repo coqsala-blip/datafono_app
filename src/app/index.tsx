@@ -46,6 +46,7 @@ type PendingInvoice = { client: Client; items: InvoiceItem[]; ivaRate: number; t
 const configuredDocumentApiUrl = process.env.EXPO_PUBLIC_DOCUMENT_API_URL?.replace(/\/$/, '');
 const DOCUMENT_API_URL_CANDIDATES = configuredDocumentApiUrl ? [configuredDocumentApiUrl] : [];
 const terminalLocationId = process.env.EXPO_PUBLIC_STRIPE_TERMINAL_LOCATION_ID;
+const terminalSimulationEnabled = process.env.EXPO_PUBLIC_STRIPE_TERMINAL_SIMULATED === 'true';
 
 const fetchWithTimeout = async (url: string, options: RequestInit = {}, timeoutMs = 1500) => {
   const controller = new AbortController();
@@ -173,6 +174,7 @@ export default function TpvScreen() {
   const {
     initialize,
     easyConnect,
+    setSimulatedCard,
     connectedReader,
     processPaymentIntent,
     retrievePaymentIntent,
@@ -540,20 +542,23 @@ export default function TpvScreen() {
     setTerminalLoading(true);
     setTerminalError('');
     try {
-      const permissionResult = await requestNeededAndroidPermissions({
-        accessFineLocation: {
-          title: 'Permiso de ubicación',
-          message: 'Stripe Terminal necesita tu ubicación para aceptar pagos con Tap to Pay.',
-          buttonPositive: 'Permitir',
-        },
-      });
-      if (permissionResult.error) {
-        setTerminalError('Debes conceder el permiso de ubicación para usar Tap to Pay.');
-        return false;
+      if (!terminalSimulationEnabled) {
+        const permissionResult = await requestNeededAndroidPermissions({
+          accessFineLocation: {
+            title: 'Permiso de ubicación',
+            message: 'Stripe Terminal necesita tu ubicación para aceptar pagos con Tap to Pay.',
+            buttonPositive: 'Permitir',
+          },
+        });
+        if (permissionResult.error) {
+          setTerminalError('Debes conceder el permiso de ubicación para usar Tap to Pay.');
+          return false;
+        }
       }
 
       const { reader, error } = await easyConnect({
         discoveryMethod: 'tapToPay',
+        simulated: terminalSimulationEnabled,
         locationId: terminalLocationId,
         autoReconnectOnUnexpectedDisconnect: true,
         merchantDisplayName: issuer.name,
@@ -561,6 +566,14 @@ export default function TpvScreen() {
       if (error || !reader) {
         setTerminalError(error?.message || 'Este móvil no se puede conectar a Tap to Pay.');
         return false;
+      }
+
+      if (terminalSimulationEnabled) {
+        const simulatedCardResult = await setSimulatedCard('4242424242424242');
+        if (simulatedCardResult.error) {
+          setTerminalError(simulatedCardResult.error.message || 'No se pudo preparar la tarjeta simulada.');
+          return false;
+        }
       }
 
       setTerminalReady(true);
@@ -2764,7 +2777,7 @@ export default function TpvScreen() {
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
             <Text style={styles.modalTitle}>💳 COBRO CON TARJETA / CONTACTLESS</Text>
-            <Text style={styles.modalSubtitle}>Acerca la tarjeta o el móvil al Redmi Note 14 Pro+ para cobrar {formatCurrency(pendingInvoice ? pendingInvoice.total : amount)}.</Text>
+            <Text style={styles.modalSubtitle}>{terminalSimulationEnabled ? 'Lector simulado de Stripe listo para probar el cobro de' : 'Acerca la tarjeta o el móvil a un dispositivo compatible para cobrar'} {formatCurrency(pendingInvoice ? pendingInvoice.total : amount)}.</Text>
             {terminalError ? <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 10 }}>{terminalError}</Text> : null}
             <Pressable style={[styles.primaryButton, { backgroundColor: '#16a34a', marginTop: 15 }]} onPress={completePayment} disabled={terminalLoading}>
               <Text style={styles.primaryButtonText}>{terminalLoading ? 'Preparando Tap to Pay...' : terminalReady ? 'Acercar tarjeta para cobrar' : 'Activar Tap to Pay y cobrar'}</Text>
