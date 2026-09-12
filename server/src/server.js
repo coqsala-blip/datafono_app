@@ -286,11 +286,18 @@ app.post('/api/billing/checkout', requireAuth, async (req, res) => {
         total_monthly_cents: String(amount),
       },
       callbackUrl: `${PUBLIC_API_URL}/api/monei/callback`,
-      completeUrl: `${PUBLIC_API_URL}/billing/success?orderId=${encodeURIComponent(orderId)}`,
-      cancelUrl: `${PUBLIC_API_URL}/billing/cancelled?orderId=${encodeURIComponent(orderId)}`,
+      paymentCallbackUrl: `${PUBLIC_API_URL}/api/monei/callback`,
     });
 
     const subscriptionId = subscription.id || subscription.subscriptionId;
+    if (!subscriptionId) {
+      throw new Error('MONEI no devolvió el identificador de la suscripción.');
+    }
+
+    const activation = await moneiRequest(`/subscriptions/${encodeURIComponent(subscriptionId)}/activate`, 'POST', {
+      completeUrl: `${PUBLIC_API_URL}/billing/success?orderId=${encodeURIComponent(orderId)}`,
+    });
+
     await supabase.auth.admin.updateUserById(req.user.id, {
       user_metadata: {
         ...req.user.user_metadata,
@@ -302,7 +309,7 @@ app.post('/api/billing/checkout', requireAuth, async (req, res) => {
       },
     });
 
-    const checkoutUrl = subscription.nextAction?.redirectUrl || subscription.redirectUrl || subscription.checkoutUrl || subscription.url;
+    const checkoutUrl = activation.nextAction?.redirectUrl || activation.redirectUrl || activation.checkoutUrl || activation.url;
     return res.status(201).json({
       ok: true,
       subscriptionId,
