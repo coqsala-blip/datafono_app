@@ -497,7 +497,10 @@ export default function TpvScreen() {
   };
 
   const startSubscriptionCheckout = async () => {
-    if (!accessToken || !configuredDocumentApiUrl) return;
+    if (!accessToken || !configuredDocumentApiUrl) {
+      Alert.alert('Sesión requerida', 'Vuelve a iniciar sesión para activar la suscripción.');
+      return;
+    }
     setCheckoutLoading(true);
     setSubscriptionError('');
     const additionalUsers = Math.max(0, Math.min(50, Number(subscriptionAdditionalUsers) || 0));
@@ -511,13 +514,16 @@ export default function TpvScreen() {
         },
         body: JSON.stringify({ additionalUsers }),
       }, 15000);
-      const result = await response.json() as { checkoutUrl?: string; error?: string };
-      if (!response.ok || !result.checkoutUrl) {
-        setSubscriptionError(result.error || 'No se pudo iniciar el pago.');
+      const result = await response.json() as { checkoutUrl?: string; redirectUrl?: string; url?: string; error?: string };
+      const checkoutUrl = result.checkoutUrl || result.redirectUrl || result.url;
+      if (!response.ok || !checkoutUrl) {
+        const errorMessage = result.error || `MONEI no devolvió una URL de pago (HTTP ${response.status}).`;
+        setSubscriptionError(errorMessage);
+        Alert.alert('No se pudo abrir la suscripción', errorMessage);
         return;
       }
 
-      await WebBrowser.openBrowserAsync(result.checkoutUrl);
+      await WebBrowser.openBrowserAsync(checkoutUrl);
       const statusResponse = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/billing/status`, {
         headers: { Authorization: `Bearer ${accessToken}` },
       }, 10000);
@@ -527,8 +533,10 @@ export default function TpvScreen() {
       if (!statusResult.active) {
         setSubscriptionError('El pago todavía no aparece activo. Cierra la página de MONEI y vuelve a comprobarlo en unos segundos.');
       }
-    } catch {
-      setSubscriptionError('No se pudo completar la conexión con MONEI.');
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'No se pudo completar la conexión con MONEI.';
+      setSubscriptionError(errorMessage);
+      Alert.alert('Error de suscripción MONEI', errorMessage);
     } finally {
       setCheckoutLoading(false);
     }
@@ -1777,24 +1785,8 @@ export default function TpvScreen() {
     }
   };
 
-  const getComplianceQrContent = (transaction: Transaction): string | null => {
-    const regime = transaction.complianceRegime || transaction.issuer?.complianceRegime || 'verifactu';
-    const fec = new Date(transaction.createdAt);
-    const fecFormatted = `${String(fec.getDate()).padStart(2, '0')}-${String(fec.getMonth() + 1).padStart(2, '0')}-${fec.getFullYear()}`;
-
-    if (regime === 'ticketbai' && transaction.tbaiId) {
-      return `https://tbai.eus/qr/?id=${encodeURIComponent(transaction.tbaiId)}&s=${encodeURIComponent(transaction.ticketCode)}&i=${transaction.amount.toFixed(2)}`;
-    }
-
-    if (transaction.hash) {
-      return `https://www1.agenciatributaria.gob.es/wlpl/invo-dgiv/v1/fe/qr?nif=${encodeURIComponent(transaction.issuer.nif)}&num=${encodeURIComponent(transaction.ticketCode)}&fec=${fecFormatted}&imp=${transaction.amount.toFixed(2)}&hash=${transaction.hash.slice(0, 16)}`;
-    }
-
-    return null;
-  };
-
   const getTransactionQrContent = (transaction: Transaction): string | null => {
-    return transaction.publicUrl || transaction.ticketCode || null;
+    return transaction.ticketCode || null;
   };
 
   const getTransactionQrUrl = (transaction: Transaction, size = 180): string | null => {
@@ -1805,10 +1797,6 @@ export default function TpvScreen() {
 
   const generatePdfFileUri = async (transaction: Transaction): Promise<string> => {
     const qrApiUrl = getTransactionQrUrl(transaction, 140);
-    const complianceQrContent = getComplianceQrContent(transaction);
-    const complianceQrApiUrl = complianceQrContent
-      ? `https://api.qrserver.com/v1/create-qr-code/?size=140x140&data=${encodeURIComponent(complianceQrContent)}`
-      : null;
 
     let logoHtml = '';
     if (transaction.issuer.logoUri) {
@@ -1885,7 +1873,6 @@ export default function TpvScreen() {
         </div>
         ${transaction.tbaiId ? `<div style="font-weight: bold; margin-top: 2px;">ID TBAI: ${transaction.tbaiId}</div>` : ''}
         ${transaction.hash ? `<div style="font-size: ${isA4 ? '8px' : '7px'}; color: #64748b; margin-top: 2px; word-break: break-all;">Huella SHA-256: ${transaction.hash.slice(0, 16)}... | Hash previo: ${transaction.previousHash?.slice(0, 12) || 'Inicio'}...</div>` : ''}
-        ${complianceQrApiUrl ? `<div style="margin-top: 6px;"><img src="${complianceQrApiUrl}" style="width: 100px; height: 100px;" /><div style="font-size: 7px; color: #64748b;">QR fiscal de consulta</div></div>` : ''}
       </div>
     `;
 

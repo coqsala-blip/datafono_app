@@ -302,16 +302,18 @@ app.post('/api/billing/checkout', requireAuth, async (req, res) => {
       },
     });
 
+    const checkoutUrl = subscription.nextAction?.redirectUrl || subscription.redirectUrl || subscription.checkoutUrl || subscription.url;
     return res.status(201).json({
       ok: true,
       subscriptionId,
-      checkoutUrl: subscription.nextAction?.redirectUrl || subscription.redirectUrl || subscription.checkoutUrl,
+      checkoutUrl,
+      redirectUrl: checkoutUrl,
       amount,
       additionalUsers,
     });
   } catch (error) {
     console.error('Error creando suscripción MONEI:', error.message);
-    return res.status(502).json({ ok: false, error: 'No se pudo iniciar la suscripción MONEI.' });
+    return res.status(502).json({ ok: false, error: `MONEI: ${error.message}` });
   }
 });
 
