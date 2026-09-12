@@ -389,7 +389,7 @@ app.get('/billing/cancelled', (req, res) => {
 });
 
 app.post('/api/documents', async (req, res) => {
-  const { id, ticketCode, documentType, amount, originalAmount, relatedTicketCode, refundHistory, isRefunded, createdAt, issuer, client, items, subtotal, iva, ivaRateApplied, type } = req.body;
+  const { id, ticketCode, documentType, amount, originalAmount, relatedTicketCode, refundHistory, isRefunded, createdAt, issuer, client, items, subtotal, iva, ivaRateApplied, type, hash, previousHash, tbaiId, complianceRegime } = req.body;
 
   if (!id || !ticketCode || !documentType || !Number.isFinite(Number(amount))) {
     return res.status(400).json({ ok: false, error: 'Faltan datos obligatorios del documento.' });
@@ -413,6 +413,10 @@ app.post('/api/documents', async (req, res) => {
     iva,
     ivaRateApplied,
     type,
+    hash,
+    previousHash,
+    tbaiId,
+    complianceRegime: complianceRegime || issuer?.complianceRegime || 'verifactu',
   };
 
   const { error } = await supabase.from('documents').insert({
@@ -472,12 +476,23 @@ app.get('/documents/:token', async (req, res) => {
     ? '<div class="section"><strong>COMPRA/DEVOLUCIONES</strong><br>Importe original: ' + formatMoney(document.originalAmount) + ' €<br>Total devuelto: -' + formatMoney(totalRefunded) + ' €<br>' + document.refundHistory.map((refund) => 'Devolución: -' + formatMoney(refund.amount) + ' € (' + escapeHtml(refund.date) + ')').join('<br>') + '<br><strong>Saldo restante: ' + formatMoney(document.amount) + ' €</strong></div>'
     : '';
 
+  const regime = document.complianceRegime || document.issuer?.complianceRegime || 'verifactu';
+  const isTicketBai = regime === 'ticketbai';
+  const complianceHtml = `
+    <div class="section" style="text-align:center;font-size:11px;color:#334155;">
+      <strong>${isTicketBai ? 'TICKETBAI - TBAI' : 'VERI*FACTU - AEAT'}</strong><br/>
+      ${isTicketBai ? 'Factura / Ticket registrado digitalmente en TicketBAI' : 'Factura emitida por sistema de facturación verificable (VERI*FACTU)'}<br/>
+      ${document.tbaiId ? `<strong>ID TBAI: ${escapeHtml(document.tbaiId)}</strong><br/>` : ''}
+      ${document.hash ? `<span class="muted">Huella SHA-256: ${escapeHtml(document.hash.slice(0, 20))}...</span>` : ''}
+    </div>
+  `;
+
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.type('html').send(`<!doctype html>
 <html lang="es">
   <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${escapeHtml(document.documentType)} ${escapeHtml(document.ticketCode)}</title>
   <style>body{font-family:'Courier New',monospace;background:#fff;color:#000;margin:0;padding:20px;display:flex;justify-content:center}.document{width:100%;max-width:420px;padding:18px;box-sizing:border-box}.logo{text-align:center;margin-bottom:10px}.logo img{width:85px;height:85px;object-fit:contain}.center{text-align:center}.title{font-size:18px;font-weight:bold;margin-bottom:5px}.subtitle{font-size:12px;margin-bottom:4px;color:#334155}.divider{border-top:1px dashed #000;margin:14px 0}.section{margin-top:12px;border-top:1px dashed #000;padding-top:10px}.row{display:flex;justify-content:space-between;font-size:13px;margin:7px 0}.total{display:flex;justify-content:space-between;font-size:17px;font-weight:bold;margin-top:10px;border-top:1px dashed #000;padding-top:8px}.qr{text-align:center;margin-top:18px;border-top:1px dashed #000;padding-top:14px}.qr img{width:180px;height:180px}.muted{color:#64748b;font-size:11px}</style></head>
-  <body><main class="document">${logoHtml}<div class="center title">${escapeHtml(document.issuer?.name || '')}</div><div class="center subtitle">NIF: ${escapeHtml(document.issuer?.nif || '')}</div><div class="center subtitle">${escapeHtml(document.issuer?.address || '')}</div><div class="divider"></div><div class="center title">${escapeHtml(document.documentType)}</div><div class="subtitle">Ref: <strong>${escapeHtml(document.ticketCode)}</strong></div><div class="subtitle">Fecha: ${escapeHtml(document.createdAt || '')}</div>${document.client ? `<div class="section"><strong>DATOS FISCALES DEL CLIENTE:</strong><br>${escapeHtml(document.client.name)}<br>NIF/CIF: ${escapeHtml(document.client.nif)}<br>${escapeHtml(document.client.address)}</div>` : ''}${itemsHtml ? `<div class="section"><strong>PRODUCTOS / SERVICIOS:</strong><ul>${itemsHtml}</ul></div>` : ''}${refundHistoryHtml}<div class="divider"></div><div class="row"><span>Base imponible actual</span><span>${formatMoney(document.subtotal)} €</span></div><div class="row"><span>IVA (${escapeHtml(document.ivaRateApplied)}%)</span><span>${formatMoney(document.iva)} €</span></div><div class="total"><span>TOTAL ORIGINAL</span><span>${formatMoney(document.originalAmount)} €</span></div><div class="row"><span>Saldo tras devoluciones</span><span>${formatMoney(document.amount)} €</span></div><div class="qr"><img src="${qrDataUrl}" alt="QR del ticket"><div>${escapeHtml(document.ticketCode)}</div><p class="muted">Escanea este QR para consultar este ticket.</p></div></main></body></html>`);
+  <body><main class="document">${logoHtml}<div class="center title">${escapeHtml(document.issuer?.name || '')}</div><div class="center subtitle">NIF: ${escapeHtml(document.issuer?.nif || '')}</div><div class="center subtitle">${escapeHtml(document.issuer?.address || '')}</div><div class="divider"></div><div class="center title">${escapeHtml(document.documentType)}</div><div class="subtitle">Ref: <strong>${escapeHtml(document.ticketCode)}</strong></div><div class="subtitle">Fecha: ${escapeHtml(document.createdAt || '')}</div>${document.client ? `<div class="section"><strong>DATOS FISCALES DEL CLIENTE:</strong><br>${escapeHtml(document.client.name)}<br>NIF/CIF: ${escapeHtml(document.client.nif)}<br>${escapeHtml(document.client.address)}</div>` : ''}${itemsHtml ? `<div class="section"><strong>PRODUCTOS / SERVICIOS:</strong><ul>${itemsHtml}</ul></div>` : ''}${refundHistoryHtml}<div class="divider"></div><div class="row"><span>Base imponible actual</span><span>${formatMoney(document.subtotal)} €</span></div><div class="row"><span>IVA (${escapeHtml(document.ivaRateApplied)}%)</span><span>${formatMoney(document.iva)} €</span></div><div class="total"><span>TOTAL ORIGINAL</span><span>${formatMoney(document.originalAmount)} €</span></div><div class="row"><span>Saldo tras devoluciones</span><span>${formatMoney(document.amount)} €</span></div>${complianceHtml}<div class="qr"><img src="${qrDataUrl}" alt="QR del ticket"><div>${escapeHtml(document.ticketCode)}</div><p class="muted">Escanea este QR para consultar este ticket.</p></div></main></body></html>`);
 });
 
 app.get('/api/documents/:token', async (req, res) => {
