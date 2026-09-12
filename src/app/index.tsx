@@ -90,6 +90,10 @@ interface Transaction {
   publicUrl?: string;
 }
 
+interface CashInvoiceDraft extends Transaction {
+  documentType: 'FACTURA';
+}
+
 const initialIssuer: Issuer = {
   name: 'COMERCIO LOCAL AUTÓNOMO S.L.',
   nif: 'B98765432',
@@ -104,6 +108,7 @@ const initialIssuer: Issuer = {
 };
 
 const STORAGE_KEY_TRANSACTIONS = '@tpv_transactions_v1';
+const STORAGE_KEY_CASH_INVOICE_DRAFTS = '@tpv_cash_invoice_drafts_v1';
 const STORAGE_KEY_EXPENSES = '@tpv_expenses_v1';
 const STORAGE_KEY_ISSUER = '@tpv_issuer_v1';
 const STORAGE_KEY_OWNER_PIN = '@tpv_owner_pin_v1';
@@ -120,6 +125,7 @@ const formatDate = (isoDate: string) =>
 export default function TpvScreen() {
   const [digits, setDigits] = useState('0');
   const [transactions, setTransactions] = useState<Transaction[]>([]);
+  const [cashInvoiceDrafts, setCashInvoiceDrafts] = useState<CashInvoiceDraft[]>([]);
   const [transactionHistory, setTransactionHistory] = useState<Transaction[]>([]);
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [issuer, setIssuer] = useState<Issuer>(initialIssuer);
@@ -250,6 +256,7 @@ export default function TpvScreen() {
       try {
         const [
           storedTransactions,
+          storedCashInvoiceDrafts,
           storedExpenses,
           storedIssuer,
           storedOwnerPin,
@@ -257,6 +264,7 @@ export default function TpvScreen() {
           storedRecoveryPhone,
         ] = await AsyncStorage.multiGet([
           STORAGE_KEY_TRANSACTIONS,
+          STORAGE_KEY_CASH_INVOICE_DRAFTS,
           STORAGE_KEY_EXPENSES,
           STORAGE_KEY_ISSUER,
           STORAGE_KEY_OWNER_PIN,
@@ -307,6 +315,7 @@ export default function TpvScreen() {
             ));
           }));
         }
+        if (storedCashInvoiceDrafts) setCashInvoiceDrafts(JSON.parse(storedCashInvoiceDrafts) as CashInvoiceDraft[]);
         if (storedExpenses) setExpenses(JSON.parse(storedExpenses));
         if (storedIssuer) setIssuer(JSON.parse(storedIssuer));
         if (storedOwnerPin) setOwnerPin(storedOwnerPin);
@@ -592,6 +601,13 @@ export default function TpvScreen() {
       console.error('Error al guardar transacciones:', error)
     );
   }, [transactions, isLoaded]);
+
+  useEffect(() => {
+    if (!isLoaded) return;
+    AsyncStorage.setItem(STORAGE_KEY_CASH_INVOICE_DRAFTS, JSON.stringify(cashInvoiceDrafts)).catch((error) =>
+      console.error('Error al guardar facturas pendientes de cobro:', error)
+    );
+  }, [cashInvoiceDrafts, isLoaded]);
 
   // GUARDAR GASTOS AUTOMÁTICAMENTE
   useEffect(() => {
@@ -1312,6 +1328,10 @@ export default function TpvScreen() {
         refundHistory: [],
       };
 
+      if (presupuestoDocumentType === 'FACTURA') {
+        setCashInvoiceDrafts((current) => [tempPresupuestoTransaction as CashInvoiceDraft, ...current]);
+      }
+
       const pdfUri = await generatePdfFileUri(tempPresupuestoTransaction);
 
       await MailComposer.composeAsync({
@@ -1325,6 +1345,36 @@ export default function TpvScreen() {
     } catch {
       Alert.alert('Error', 'No se pudo generar o enviar el presupuesto por correo.');
     }
+  };
+
+  const markCashInvoiceAsPaid = async (draft: CashInvoiceDraft) => {
+    const paidTransaction: Transaction = {
+      ...draft,
+      method: 'Efectivo',
+      publicUrl: undefined,
+    };
+
+    setCashInvoiceDrafts((current) => current.filter((item) => item.id !== draft.id));
+    setTransactions((current) => [paidTransaction, ...current]);
+    setSelectedTicket(paidTransaction);
+
+    const publishedTransaction = await registerTransactionDocument(paidTransaction);
+    setTransactions((current) => current.map((item) =>
+      item.id === publishedTransaction.id ? publishedTransaction : item
+    ));
+    setSelectedTicket(publishedTransaction);
+    Alert.alert('Factura cobrada', 'La factura se ha guardado junto con el resto de cobros del TPV.');
+  };
+
+  const deleteCashInvoiceDraft = (draft: CashInvoiceDraft) => {
+    Alert.alert(
+      'Eliminar factura pendiente',
+      `¿Quieres eliminar la factura ${draft.ticketCode}? No se marcará como cobrada.`,
+      [
+        { text: 'Cancelar', style: 'cancel' },
+        { text: 'Eliminar', style: 'destructive', onPress: () => setCashInvoiceDrafts((current) => current.filter((item) => item.id !== draft.id)) },
+      ],
+    );
   };
 
   const saveLogoToStorage = async (tempUri: string): Promise<string> => {
@@ -2587,6 +2637,32 @@ export default function TpvScreen() {
                 <Text style={styles.primaryButtonText}>Enviar {presupuestoDocumentType === 'FACTURA' ? 'Factura' : 'Presupuesto'} por Email</Text>
               </Pressable>
             </View>
+
+            {cashInvoiceDrafts.length > 0 && (
+              <View style={styles.card}>
+                <Text style={styles.cardTitle}>🧾 FACTURAS EN EFECTIVO PENDIENTES ({cashInvoiceDrafts.length})</Text>
+                <Text style={[styles.modalSubtitle, { textAlign: 'left', marginBottom: 10 }]}>Estas facturas aún no están cobradas y no aparecen en el historial del TPV.</Text>
+                {cashInvoiceDrafts.map((draft) => (
+                  <View key={draft.id} style={[styles.listItem, { flexDirection: 'column', alignItems: 'stretch' }]}>
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <View>
+                        <Text style={styles.listItemTitle}>{draft.ticketCode}</Text>
+                        <Text style={styles.listItemSubtitle}>{draft.client?.name || 'Cliente'} · {formatDate(draft.createdAt)}</Text>
+                      </View>
+                      <Text style={styles.listItemAmount}>{formatCurrency(draft.amount)}</Text>
+                    </View>
+                    <View style={[styles.rowButtons, { marginTop: 8 }]}>
+                      <Pressable style={[styles.primaryButton, { flex: 1, marginTop: 0, backgroundColor: '#16a34a' }]} onPress={() => void markCashInvoiceAsPaid(draft)}>
+                        <Text style={styles.primaryButtonText}>Marcar cobrada</Text>
+                      </Pressable>
+                      <Pressable style={[styles.secondaryButton, { flex: 1, marginLeft: 8, marginTop: 0, backgroundColor: '#fee2e2' }]} onPress={() => deleteCashInvoiceDraft(draft)}>
+                        <Text style={[styles.secondaryButtonText, { color: '#dc2626' }]}>Eliminar</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+                ))}
+              </View>
+            )}
           </ScrollView>
         )}
 
