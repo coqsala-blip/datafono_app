@@ -273,7 +273,7 @@ app.post('/api/billing/checkout', requireAuth, async (req, res) => {
     const subscription = await moneiRequest('/subscriptions', 'POST', {
       amount,
       currency: 'EUR',
-      interval: 'MONTH',
+      interval: 'month',
       intervalCount: 1,
       orderId,
       description: `TPV Gestor - suscripción - ${additionalUsers} empleados`,
