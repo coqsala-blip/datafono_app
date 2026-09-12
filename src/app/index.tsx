@@ -1243,26 +1243,67 @@ export default function TpvScreen() {
     }
   };
 
-  const completePaymentQr = () => {
-    setNfcModalVisible(false);
-    const paymentAmount = pendingInvoice ? pendingInvoice.total : amount;
+  const completePaymentQr = async () => {
+    if (!accessToken || !configuredDocumentApiUrl) {
+      Alert.alert('Sesión requerida', 'Inicia sesión para poder cobrar con MONEI.');
+      return;
+    }
 
-    if (pendingInvoice) {
-      createTransaction(
-        'COBRO',
-        pendingInvoice.docType,
-        'Código QR / Bizum',
-        paymentAmount,
-        pendingInvoice.client,
-        pendingInvoice.items,
-        pendingInvoice.ivaRate,
-      );
-      setPendingInvoice(null);
-      setClient({ name: '', nif: '', address: '' });
-      setInvoiceItems([{ id: '1', description: '', price: '' }]);
-      setInvoiceIvaInput('21');
-    } else {
-      createTransaction('COBRO', pendingDocumentType, 'Código QR / Bizum');
+    const paymentAmount = pendingInvoice ? pendingInvoice.total : amount;
+    const orderId = `monei-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    try {
+      const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/monei/payment`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify({ amount: paymentAmount, orderId }),
+      }, 15000);
+      const result = await response.json() as { paymentId?: string; redirectUrl?: string; error?: string };
+      if (!response.ok || !result.paymentId || !result.redirectUrl) {
+        throw new Error(result.error || 'MONEI no devolvió una página de pago.');
+      }
+
+      setNfcModalVisible(false);
+      await WebBrowser.openBrowserAsync(result.redirectUrl);
+
+      let status = 'PENDING';
+      for (let attempt = 0; attempt < 45 && status === 'PENDING'; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        const statusResponse = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/monei/payment/${encodeURIComponent(result.paymentId)}`, {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        }, 10000);
+        const statusResult = await statusResponse.json() as { payment?: { status?: string }; status?: string; error?: string };
+        if (!statusResponse.ok) throw new Error(statusResult.error || 'No se pudo confirmar el pago MONEI.');
+        status = statusResult.status || statusResult.payment?.status || 'PENDING';
+      }
+
+      if (status !== 'SUCCEEDED') {
+        Alert.alert('Pago no confirmado', `MONEI ha devuelto el estado ${status}. No se ha creado el ticket.`);
+        return;
+      }
+
+      if (pendingInvoice) {
+        createTransaction(
+          'COBRO',
+          pendingInvoice.docType,
+          'MONEI - QR / Bizum',
+          paymentAmount,
+          pendingInvoice.client,
+          pendingInvoice.items,
+          pendingInvoice.ivaRate,
+        );
+        setPendingInvoice(null);
+        setClient({ name: '', nif: '', address: '' });
+        setInvoiceItems([{ id: '1', description: '', price: '' }]);
+        setInvoiceIvaInput('21');
+      } else {
+        createTransaction('COBRO', pendingDocumentType, 'MONEI - QR / Bizum');
+      }
+    } catch (error) {
+      Alert.alert('Error de pago MONEI', error instanceof Error ? error.message : 'No se pudo completar el cobro.');
     }
   };
 
@@ -1921,7 +1962,7 @@ export default function TpvScreen() {
     }
   };
 
-  const getTransactionQrContent = (transaction: Transaction): string | null => {
+  const getComplianceQrContent = (transaction: Transaction): string | null => {
     const regime = transaction.complianceRegime || transaction.issuer?.complianceRegime || 'verifactu';
     const fec = new Date(transaction.createdAt);
     const fecFormatted = `${String(fec.getDate()).padStart(2, '0')}-${String(fec.getMonth() + 1).padStart(2, '0')}-${fec.getFullYear()}`;
@@ -1934,7 +1975,11 @@ export default function TpvScreen() {
       return `https://www1.agenciatributaria.gob.es/wlpl/invo-dgiv/v1/fe/qr?nif=${encodeURIComponent(transaction.issuer.nif)}&num=${encodeURIComponent(transaction.ticketCode)}&fec=${fecFormatted}&imp=${transaction.amount.toFixed(2)}&hash=${transaction.hash.slice(0, 16)}`;
     }
 
-    return transaction.publicUrl || null;
+    return null;
+  };
+
+  const getTransactionQrContent = (transaction: Transaction): string | null => {
+    return transaction.publicUrl || transaction.ticketCode || null;
   };
 
   const getTransactionQrUrl = (transaction: Transaction, size = 180): string | null => {
@@ -1945,6 +1990,10 @@ export default function TpvScreen() {
 
   const generatePdfFileUri = async (transaction: Transaction): Promise<string> => {
     const qrApiUrl = getTransactionQrUrl(transaction, 140);
+    const complianceQrContent = getComplianceQrContent(transaction);
+    const complianceQrApiUrl = complianceQrContent
+      ? `https://api.qrserver.com/v1/create-qr-code/?size=140x140&data=${encodeURIComponent(complianceQrContent)}`
+      : null;
 
     let logoHtml = '';
     if (transaction.issuer.logoUri) {
@@ -2021,6 +2070,7 @@ export default function TpvScreen() {
         </div>
         ${transaction.tbaiId ? `<div style="font-weight: bold; margin-top: 2px;">ID TBAI: ${transaction.tbaiId}</div>` : ''}
         ${transaction.hash ? `<div style="font-size: ${isA4 ? '8px' : '7px'}; color: #64748b; margin-top: 2px; word-break: break-all;">Huella SHA-256: ${transaction.hash.slice(0, 16)}... | Hash previo: ${transaction.previousHash?.slice(0, 12) || 'Inicio'}...</div>` : ''}
+        ${complianceQrApiUrl ? `<div style="margin-top: 6px;"><img src="${complianceQrApiUrl}" style="width: 100px; height: 100px;" /><div style="font-size: 7px; color: #64748b;">QR fiscal de consulta</div></div>` : ''}
       </div>
     `;
 
@@ -3082,7 +3132,7 @@ export default function TpvScreen() {
               </Pressable>
               
               <Pressable style={[styles.primaryButton, { backgroundColor: '#0284c7' }]} onPress={completePaymentQr}>
-                <Text style={styles.primaryButtonText}>📲 2. Cobrar con Código QR / Bizum</Text>
+                <Text style={styles.primaryButtonText}>📲 2. Cobrar con MONEI QR / Bizum</Text>
               </Pressable>
             </View>
 

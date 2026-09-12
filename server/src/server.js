@@ -41,7 +41,49 @@ const stripeV2Request = async (path, method, body) => {
   return result;
 };
 
+const moneiRequest = async (path, method, body) => {
+  if (!process.env.MONEI_API_KEY) {
+    throw new Error('MONEI_API_KEY no está configurada en el backend.');
+  }
+
+  const response = await fetch(`https://api.monei.com/v1${path}`, {
+    method,
+    headers: {
+      Authorization: process.env.MONEI_API_KEY,
+      'Content-Type': 'application/json',
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const result = await response.json();
+  if (!response.ok) {
+    throw new Error(result.message || result.error?.message || 'MONEI API error');
+  }
+  return result;
+};
+
+const verifyMoneiSignature = (rawBody, signature) => {
+  if (!process.env.MONEI_API_KEY || typeof signature !== 'string') return false;
+  const values = Object.fromEntries(signature.split(',').map((part) => part.split('=')));
+  if (!values.t || !values.v1) return false;
+  const signedPayload = `${values.t}.${rawBody}`;
+  const expected = crypto.createHmac('sha256', process.env.MONEI_API_KEY).update(signedPayload).digest('hex');
+  if (expected.length !== values.v1.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(values.v1));
+};
+
 app.set('trust proxy', 1);
+app.post('/api/monei/callback', express.raw({ type: 'application/json' }), (req, res) => {
+  const rawBody = req.body.toString('utf8');
+  const signature = req.headers['monei-signature'];
+  if (!verifyMoneiSignature(rawBody, signature)) {
+    return res.status(401).json({ ok: false, error: 'Firma MONEI no válida.' });
+  }
+
+  const payment = JSON.parse(rawBody);
+  console.log('MONEI callback recibido:', payment.id, payment.status);
+  return res.status(200).json({ received: true });
+});
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -316,6 +358,60 @@ app.post('/api/terminal/payment-intent', requireAuth, async (req, res) => {
     console.error('Error creando PaymentIntent Terminal:', error.message);
     return res.status(502).json({ ok: false, error: 'No se pudo preparar el cobro.' });
   }
+});
+
+app.post('/api/monei/payment', requireAuth, async (req, res) => {
+  const amountNumber = typeof req.body?.amount === 'string'
+    ? Number(req.body.amount.replace(',', '.'))
+    : Number(req.body?.amount);
+  const amount = Math.round(amountNumber * 100);
+  const orderId = typeof req.body?.orderId === 'string' ? req.body.orderId.trim() : '';
+
+  if (!Number.isFinite(amountNumber) || !Number.isInteger(amount) || amount < 50 || amount > 99999999) {
+    return res.status(400).json({ ok: false, error: 'Importe no válido. Usa al menos 0,50 €.' });
+  }
+  if (!orderId) {
+    return res.status(400).json({ ok: false, error: 'Falta el identificador de la operación.' });
+  }
+
+  try {
+    const payment = await moneiRequest('/payments', 'POST', {
+      amount,
+      currency: 'EUR',
+      orderId,
+      description: `TPV - ${orderId}`,
+      callbackUrl: `${PUBLIC_API_URL}/api/monei/callback`,
+      completeUrl: `${PUBLIC_API_URL}/monei/complete?orderId=${encodeURIComponent(orderId)}`,
+      cancelUrl: `${PUBLIC_API_URL}/monei/cancel?orderId=${encodeURIComponent(orderId)}`,
+    });
+
+    return res.status(201).json({
+      ok: true,
+      paymentId: payment.id,
+      redirectUrl: payment.nextAction?.redirectUrl,
+    });
+  } catch (error) {
+    console.error('Error creando pago MONEI:', error.message);
+    return res.status(502).json({ ok: false, error: 'No se pudo iniciar el cobro con MONEI.' });
+  }
+});
+
+app.get('/api/monei/payment/:paymentId', requireAuth, async (req, res) => {
+  try {
+    const payment = await moneiRequest(`/payments/${encodeURIComponent(req.params.paymentId)}`, 'GET');
+    return res.json({ ok: true, paymentId: payment.id, status: payment.status });
+  } catch (error) {
+    console.error('Error consultando pago MONEI:', error.message);
+    return res.status(502).json({ ok: false, error: 'No se pudo consultar el estado del pago MONEI.' });
+  }
+});
+
+app.get('/monei/complete', (req, res) => {
+  res.type('html').send('<h1>Pago recibido</h1><p>Puedes volver a la aplicación. El estado definitivo se confirma con MONEI.</p>');
+});
+
+app.get('/monei/cancel', (req, res) => {
+  res.type('html').send('<h1>Pago cancelado</h1><p>Puedes volver a la aplicación e intentarlo de nuevo.</p>');
 });
 
 app.post('/api/billing/checkout', requireAuth, async (req, res) => {

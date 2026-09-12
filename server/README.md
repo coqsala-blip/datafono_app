@@ -20,6 +20,9 @@ npm run dev
 - `POST /api/subscriptions/create`
 - `POST /api/companies/:companyId/users`
 - `POST /api/stripe/webhook`
+- `POST /api/monei/payment`
+- `GET /api/monei/payment/:paymentId`
+- `POST /api/monei/callback`
 
 ### Plan actual
 
@@ -43,5 +46,7 @@ El archivo `render.yaml` de la raíz configura este backend como un Web Service 
 2. Introduce en el panel las variables marcadas como secretas en `render.yaml`.
 3. Cuando Render asigne la URL del servicio, configura `PUBLIC_API_URL` con esa URL completa usando `https://`.
 4. Comprueba que `https://TU-SERVICIO.onrender.com/health` responde con `ok: true`.
+5. Añade `MONEI_API_KEY` en Render con la clave de prueba o producción correspondiente.
+6. Configura en MONEI el callback `https://TU-SERVICIO.onrender.com/api/monei/callback` si usas webhooks de cuenta.
 
 No subas el archivo `server/.env` ni copies sus secretos al repositorio.

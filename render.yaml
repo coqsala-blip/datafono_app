@@ -24,3 +24,5 @@ services:
         sync: false
       - key: STRIPE_EXTRA_PRICE_ID
         sync: false
+      - key: MONEI_API_KEY
+        sync: false
