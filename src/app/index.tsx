@@ -1129,18 +1129,41 @@ export default function TpvScreen() {
 
       setNfcModalVisible(false);
       if (pendingInvoice) {
-        createTransaction('COBRO', pendingInvoice.docType, 'Tarjeta Contactless', paymentAmount, pendingInvoice.client, pendingInvoice.items, pendingInvoice.ivaRate);
+        createTransaction('COBRO', pendingInvoice.docType, 'Tarjeta Contactless / NFC', paymentAmount, pendingInvoice.client, pendingInvoice.items, pendingInvoice.ivaRate);
         setPendingInvoice(null);
         setClient({ name: '', nif: '', address: '' });
         setInvoiceItems([{ id: '1', description: '', price: '' }]);
         setInvoiceIvaInput('21');
       } else {
-        createTransaction('COBRO', pendingDocumentType, 'Tarjeta Contactless');
+        createTransaction('COBRO', pendingDocumentType, 'Tarjeta Contactless / NFC');
       }
     } catch (error) {
       setTerminalError(error instanceof Error ? error.message : 'El cobro no se pudo completar.');
     } finally {
       setTerminalLoading(false);
+    }
+  };
+
+  const completePaymentQr = () => {
+    setNfcModalVisible(false);
+    const paymentAmount = pendingInvoice ? pendingInvoice.total : amount;
+
+    if (pendingInvoice) {
+      createTransaction(
+        'COBRO',
+        pendingInvoice.docType,
+        'Código QR / Bizum',
+        paymentAmount,
+        pendingInvoice.client,
+        pendingInvoice.items,
+        pendingInvoice.ivaRate,
+      );
+      setPendingInvoice(null);
+      setClient({ name: '', nif: '', address: '' });
+      setInvoiceItems([{ id: '1', description: '', price: '' }]);
+      setInvoiceIvaInput('21');
+    } else {
+      createTransaction('COBRO', pendingDocumentType, 'Código QR / Bizum');
     }
   };
 
@@ -2869,17 +2892,28 @@ export default function TpvScreen() {
         </View>
       </Modal>
 
-      {/* MODAL: SIMULADOR DE COBRO NFC / TARJETA */}
+      {/* MODAL: SELECCIÓN DE MÉTODO DE COBRO (NFC / QR) */}
       <Modal visible={nfcModalVisible} animationType="fade" transparent={true}>
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
-            <Text style={styles.modalTitle}>💳 COBRO CON TARJETA / CONTACTLESS</Text>
-            <Text style={styles.modalSubtitle}>{terminalSimulationEnabled ? 'Lector simulado de Stripe listo para probar el cobro de' : 'Acerca la tarjeta o el móvil a un dispositivo compatible para cobrar'} {formatCurrency(pendingInvoice ? pendingInvoice.total : amount)}.</Text>
-            {terminalError ? <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 10 }}>{terminalError}</Text> : null}
-            <Pressable style={[styles.primaryButton, { backgroundColor: '#16a34a', marginTop: 15 }]} onPress={completePayment} disabled={terminalLoading}>
-              <Text style={styles.primaryButtonText}>{terminalLoading ? 'Preparando Tap to Pay...' : terminalReady ? 'Acercar tarjeta para cobrar' : 'Activar Tap to Pay y cobrar'}</Text>
-            </Pressable>
-            <Pressable style={[styles.secondaryButton, { marginTop: 10 }]} onPress={cancelPayment}>
+            <Text style={styles.modalTitle}>💳 SELECCIONA EL MÉTODO DE COBRO</Text>
+            <Text style={styles.modalSubtitle}>Importe total a cobrar: {formatCurrency(pendingInvoice ? pendingInvoice.total : amount)}</Text>
+            
+            {terminalError ? <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 10, textAlign: 'center' }}>{terminalError}</Text> : null}
+
+            <View style={{ gap: 10, marginTop: 15 }}>
+              <Pressable style={[styles.primaryButton, { backgroundColor: '#16a34a' }]} onPress={completePayment} disabled={terminalLoading}>
+                <Text style={styles.primaryButtonText}>
+                  {terminalLoading ? 'Preparando Tap to Pay...' : '💳 1. Cobrar con Tarjeta / NFC (Tap to Pay)'}
+                </Text>
+              </Pressable>
+              
+              <Pressable style={[styles.primaryButton, { backgroundColor: '#0284c7' }]} onPress={completePaymentQr}>
+                <Text style={styles.primaryButtonText}>📲 2. Cobrar con Código QR / Bizum</Text>
+              </Pressable>
+            </View>
+
+            <Pressable style={[styles.secondaryButton, { marginTop: 12 }]} onPress={cancelPayment}>
               <Text style={styles.secondaryButtonText}>Cancelar</Text>
             </Pressable>
           </View>
