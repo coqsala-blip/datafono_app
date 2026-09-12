@@ -22,7 +22,7 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-type DocumentType = 'TICKET DE VENTA' | 'FACTURA SIMPLIFICADA' | 'FACTURA COMPLETA' | 'TICKET DE DEVOLUCIÓN' | 'COMPRA/DEVOLUCIONES' | 'PRESUPUESTO';
+type DocumentType = 'TICKET DE VENTA' | 'FACTURA SIMPLIFICADA' | 'FACTURA COMPLETA' | 'TICKET DE DEVOLUCIÓN' | 'COMPRA/DEVOLUCIONES' | 'PRESUPUESTO' | 'FACTURA';
 type TransactionType = 'COBRO' | 'DEVOLUCIÓN';
 type Tab = 'gastos_facturacion' | 'tpv' | 'presupuesto' | 'stats' | 'config';
 type UserRole = 'principal' | 'empleado';
@@ -227,6 +227,7 @@ export default function TpvScreen() {
   const [presupuestoItems, setPresupuestoItems] = useState<InvoiceItem[]>([{ id: '1', description: '', price: '' }]);
   const [presupuestoIvaInput, setPresupuestoIvaInput] = useState('21');
   const [presupuestoClientEmail, setPresupuestoClientEmail] = useState('');
+  const [presupuestoDocumentType, setPresupuestoDocumentType] = useState<'PRESUPUESTO' | 'FACTURA'>('PRESUPUESTO');
 
   // Estados específicos para Gastos
   const [expenseProvider, setExpenseProvider] = useState('');
@@ -1269,7 +1270,7 @@ export default function TpvScreen() {
       return;
     }
     if (!presupuestoClientEmail.trim()) {
-      Alert.alert('Correo requerido', 'Introduce el correo electrónico del cliente para enviarle el presupuesto.');
+      Alert.alert('Correo requerido', `Introduce el correo electrónico del cliente para enviarle la ${presupuestoDocumentType === 'FACTURA' ? 'factura' : 'presupuesto'}.`);
       return;
     }
 
@@ -1295,15 +1296,15 @@ export default function TpvScreen() {
 
       const tempPresupuestoTransaction: Transaction = {
         id: `pres-${Date.now()}`,
-        ticketCode: `PRES-${Date.now().toString().slice(-6)}`,
+        ticketCode: `${presupuestoDocumentType === 'FACTURA' ? 'FAC' : 'PRES'}-${Date.now().toString().slice(-6)}`,
         type: 'COBRO',
-        documentType: 'PRESUPUESTO',
+        documentType: presupuestoDocumentType,
         amount: totalWithIva,
         subtotal: subtotal,
         iva: totalWithIva - subtotal,
         ivaRateApplied: parsedIva,
         createdAt: new Date().toISOString(),
-        method: 'Presupuesto',
+        method: presupuestoDocumentType === 'FACTURA' ? 'Factura' : 'Presupuesto',
         issuer: { ...issuer },
         client: validClient,
         items: validItems,
@@ -1315,12 +1316,12 @@ export default function TpvScreen() {
 
       await MailComposer.composeAsync({
         recipients: [presupuestoClientEmail.trim()],
-        subject: `Presupuesto de Servicios - Ref: ${tempPresupuestoTransaction.ticketCode} (${issuer.name})`,
-        body: `Estimado/a ${validClient.name},\n\nAdjunto le hacemos llegar el presupuesto solicitado con importe total de ${formatCurrency(totalWithIva)}.\n\nQuedamos a su entera disposición.\n\nAtentamente,\n${issuer.name}`,
+        subject: `${presupuestoDocumentType === 'FACTURA' ? 'Factura' : 'Presupuesto'} de Servicios - Ref: ${tempPresupuestoTransaction.ticketCode} (${issuer.name})`,
+        body: `Estimado/a ${validClient.name},\n\nAdjunto le hacemos llegar la ${presupuestoDocumentType === 'FACTURA' ? 'factura' : 'presupuesto'} solicitada con importe total de ${formatCurrency(totalWithIva)}.\n\nAtentamente,\n${issuer.name}`,
         attachments: [pdfUri],
       });
 
-      Alert.alert('¡Enviado!', 'El presupuesto se ha enviado correctamente por correo.');
+      Alert.alert('¡Enviado!', `La ${presupuestoDocumentType === 'FACTURA' ? 'factura' : 'presupuesto'} se ha enviado correctamente por correo.`);
     } catch {
       Alert.alert('Error', 'No se pudo generar o enviar el presupuesto por correo.');
     }
@@ -2399,7 +2400,7 @@ export default function TpvScreen() {
         {userRole === 'principal' && (
           <>
             <Pressable style={[styles.tabButton, activeTab === 'presupuesto' && styles.tabButtonActive]} onPress={() => setActiveTab('presupuesto')}>
-              <Text style={[styles.tabText, activeTab === 'presupuesto' && styles.tabTextActive]}>Presupuesto</Text>
+              <Text style={[styles.tabText, activeTab === 'presupuesto' && styles.tabTextActive]}>Presupuesto/Factura</Text>
             </Pressable>
             <Pressable style={[styles.tabButton, activeTab === 'stats' && styles.tabButtonActive]} onPress={() => setActiveTab('stats')}>
               <Text style={[styles.tabText, activeTab === 'stats' && styles.tabTextActive]}>Informes</Text>
@@ -2520,7 +2521,22 @@ export default function TpvScreen() {
         {activeTab === 'presupuesto' && (
           <ScrollView contentContainerStyle={styles.scrollContent}>
             <View style={styles.card}>
-              <Text style={styles.cardTitle}>📑 CREAR Y ENVIAR PRESUPUESTO</Text>
+              <Text style={styles.cardTitle}>📑 CREAR Y ENVIAR DOCUMENTO</Text>
+              <View style={styles.rowButtons}>
+                <Pressable
+                  style={[styles.secondaryButton, { flex: 1, backgroundColor: presupuestoDocumentType === 'PRESUPUESTO' ? '#dbeafe' : '#f8fafc' }]}
+                  onPress={() => setPresupuestoDocumentType('PRESUPUESTO')}
+                >
+                  <Text style={styles.secondaryButtonText}>Presupuesto</Text>
+                </Pressable>
+                <Pressable
+                  style={[styles.secondaryButton, { flex: 1, marginLeft: 8, backgroundColor: presupuestoDocumentType === 'FACTURA' ? '#dcfce7' : '#f8fafc' }]}
+                  onPress={() => setPresupuestoDocumentType('FACTURA')}
+                >
+                  <Text style={styles.secondaryButtonText}>Factura</Text>
+                </Pressable>
+              </View>
+              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 8 }]}>El documento mantendrá el mismo formato; solo cambiará el título entre presupuesto y factura.</Text>
               <TextInput style={styles.input} placeholder="Nombre del Cliente" placeholderTextColor="#94a3b8" value={presupuestoClient.name} onChangeText={(t) => setPresupuestoClient(c => ({ ...c, name: t }))} />
               <TextInput style={styles.input} placeholder="NIF / CIF del Cliente" placeholderTextColor="#94a3b8" value={presupuestoClient.nif} onChangeText={(t) => setPresupuestoClient(c => ({ ...c, nif: t }))} />
               <TextInput style={styles.input} placeholder="Dirección Fiscal del Cliente" placeholderTextColor="#94a3b8" value={presupuestoClient.address} onChangeText={(t) => setPresupuestoClient(c => ({ ...c, address: t }))} />
@@ -2568,7 +2584,7 @@ export default function TpvScreen() {
               />
 
               <Pressable style={styles.primaryButton} onPress={sendPresupuestoByEmail}>
-                <Text style={styles.primaryButtonText}>Enviar Presupuesto por Email</Text>
+                <Text style={styles.primaryButtonText}>Enviar {presupuestoDocumentType === 'FACTURA' ? 'Factura' : 'Presupuesto'} por Email</Text>
               </Pressable>
             </View>
           </ScrollView>
