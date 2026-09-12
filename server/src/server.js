@@ -80,6 +80,10 @@ app.post('/api/monei/callback', express.raw({ type: 'application/json' }), (req,
     return res.status(200).json({ received: true });
   }
 
+  if (!signature) {
+    return res.status(200).json({ received: true });
+  }
+
   if (!verifyMoneiSignature(rawBody, signature)) {
     return res.status(401).json({ ok: false, error: 'Firma MONEI no válida.' });
   }
