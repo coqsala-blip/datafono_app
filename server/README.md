@@ -23,13 +23,14 @@ npm run dev
 
 ### Plan actual
 
-- Base: 7 € / mes
-- Usuario adicional: 2 € / mes
+- Base usuario principal: 9,00 € / mes + 21% IVA (10,89 €)
+- Usuario adicional (empleado): 2,50 € / mes + 21% IVA (3,03 €)
 
 ### Fórmula
 
 ```text
-total = 7 + ((usuarios_totales - 1) * 2)
+total_neto = 9 + (usuarios_adicionales * 2.5)
+total_con_iva = total_neto * 1.21
 ```
 
 > Si quieres, luego puedes conectar este backend con la app Expo y con una base de datos real.

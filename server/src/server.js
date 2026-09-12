@@ -366,10 +366,13 @@ app.post('/api/billing/checkout', requireAuth, async (req, res) => {
       },
     });
 
+    const netMonthly = 9 + (additionalUsers * 2.5);
+    const totalMonthlyWithVat = Number((netMonthly * 1.21).toFixed(2));
+
     return res.status(201).json({
       ok: true,
       checkoutUrl: session.url,
-      totalMonthly: 7 + (additionalUsers * 2),
+      totalMonthly: totalMonthlyWithVat,
     });
   } catch (error) {
     console.error('Error creando checkout de suscripción:', error.message);
@@ -513,9 +516,9 @@ app.post('/api/companies', async (req, res) => {
       },
     });
 
-    const baseAmount = 7;
-    const extraAmount = Math.max(0, Number(additionalUsers)) * 2;
-    const totalMonthly = baseAmount + extraAmount;
+    const baseAmount = 9;
+    const extraAmount = Math.max(0, Number(additionalUsers)) * 2.5;
+    const totalMonthly = Number(((baseAmount + extraAmount) * 1.21).toFixed(2));
 
     const subscription = await stripe.subscriptions.create({
       customer: customer.id,
@@ -558,7 +561,7 @@ app.post('/api/subscriptions/create', async (req, res) => {
   try {
     const { customerId, additionalUsers = 0 } = req.body;
 
-    const totalMonthly = 7 + (Math.max(0, Number(additionalUsers)) * 2);
+    const totalMonthly = Number(((9 + (Math.max(0, Number(additionalUsers)) * 2.5)) * 1.21).toFixed(2));
 
     const subscription = await stripe.subscriptions.create({
       customer: customerId,

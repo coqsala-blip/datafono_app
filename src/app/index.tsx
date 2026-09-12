@@ -706,8 +706,8 @@ export default function TpvScreen() {
     { charges: 0, refunds: 0 },
   ), [transactions]);
 
-  const subscriptionBasePrice = 7;
-  const subscriptionAdditionalUserPrice = 2;
+  const subscriptionBasePrice = 9;
+  const subscriptionAdditionalUserPrice = 2.5;
   const currentSubscriptionTotal = useMemo(() => {
     const additionalUsers = Math.max(0, Number(issuer.additionalUsers || 0));
     return subscriptionBasePrice + (additionalUsers * subscriptionAdditionalUserPrice);
@@ -2381,7 +2381,9 @@ export default function TpvScreen() {
 
   if (!hasActiveSubscription) {
     const additionalUsers = Math.max(0, Math.min(50, Number(subscriptionAdditionalUsers) || 0));
-    const monthlyTotal = subscriptionBasePrice + (additionalUsers * subscriptionAdditionalUserPrice);
+    const monthlyNet = subscriptionBasePrice + (additionalUsers * subscriptionAdditionalUserPrice);
+    const monthlyIva = monthlyNet * 0.21;
+    const monthlyTotal = monthlyNet + monthlyIva;
 
     return (
       <SafeAreaView style={styles.safeArea}>
@@ -2390,11 +2392,11 @@ export default function TpvScreen() {
             <Text style={styles.modalTitle}>ACTIVA TU SUSCRIPCIÓN</Text>
             <Text style={[styles.modalSubtitle, { marginBottom: 14 }]}>Para usar el TPV, presupuestos, facturas y gastos necesitas una suscripción activa.</Text>
             <View style={{ padding: 12, backgroundColor: '#f8fafc', borderRadius: 8, borderWidth: 1, borderColor: '#cbd5e1' }}>
-              <Text style={styles.modalSubtitle}>Plan principal</Text>
-              <Text style={[styles.headerTitle, { marginTop: 4 }]}>7,00 € / mes</Text>
-              <Text style={[styles.modalSubtitle, { marginTop: 4 }]}>Cada usuario adicional: 2,00 € / mes</Text>
+              <Text style={styles.modalSubtitle}>Usuario principal</Text>
+              <Text style={[styles.headerTitle, { marginTop: 4 }]}>9,00 € / mes + 21% IVA ({formatCurrency(9 * 1.21)})</Text>
+              <Text style={[styles.modalSubtitle, { marginTop: 4 }]}>Cada usuario adicional (empleado): 2,50 € / mes + 21% IVA ({formatCurrency(2.5 * 1.21)})</Text>
             </View>
-            <Text style={[styles.modalSubtitle, { marginTop: 16 }]}>Usuarios adicionales</Text>
+            <Text style={[styles.modalSubtitle, { marginTop: 16 }]}>Usuarios adicionales (empleados)</Text>
             <TextInput
               style={styles.input}
               placeholder="0"
@@ -2403,7 +2405,12 @@ export default function TpvScreen() {
               value={subscriptionAdditionalUsers}
               onChangeText={(value) => setSubscriptionAdditionalUsers(value.replace(/[^0-9]/g, ''))}
             />
-            <Text style={[styles.modalSubtitle, { fontWeight: 'bold', color: '#0f172a', marginTop: 8 }]}>Total mensual: {formatCurrency(monthlyTotal)}</Text>
+            <Text style={[styles.modalSubtitle, { fontWeight: 'bold', color: '#0f172a', marginTop: 8 }]}>
+              Base: {formatCurrency(monthlyNet)} + IVA (21%): {formatCurrency(monthlyIva)}
+            </Text>
+            <Text style={[styles.modalSubtitle, { fontWeight: 'bold', color: '#16a34a', marginTop: 4 }]}>
+              Total mensual con IVA: {formatCurrency(monthlyTotal)}
+            </Text>
             {subscriptionStatus !== 'missing' ? <Text style={[styles.modalSubtitle, { marginTop: 6 }]}>Estado actual: {subscriptionStatus}</Text> : null}
             {subscriptionError ? <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 10 }}>{subscriptionError}</Text> : null}
             <Pressable style={[styles.primaryButton, { marginTop: 16 }]} onPress={startSubscriptionCheckout} disabled={checkoutLoading}>
@@ -2764,16 +2771,16 @@ export default function TpvScreen() {
               <Text style={styles.cardTitle}>📦 PLAN TPV & GESTOR</Text>
               <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 6 }]}>La aplicación te ayuda a organizar la información de tu negocio y prepararla para revisión profesional. No sustituye a un asesor fiscal ni a una gestoría.</Text>
               <View style={styles.statRow}>
-                <Text style={styles.statLabel}>Suscripción base:</Text>
-                <Text style={[styles.statValue, { color: '#0f172a', fontWeight: 'bold' }]}>{formatCurrency(subscriptionBasePrice)}</Text>
+                <Text style={styles.statLabel}>Usuario principal (base):</Text>
+                <Text style={[styles.statValue, { color: '#0f172a', fontWeight: 'bold' }]}>9,00 € + 21% IVA ({formatCurrency(9 * 1.21)})</Text>
               </View>
               <View style={styles.statRow}>
-                <Text style={styles.statLabel}>Usuario adicional:</Text>
-                <Text style={[styles.statValue, { color: '#0f172a' }]}>{formatCurrency(subscriptionAdditionalUserPrice)}</Text>
+                <Text style={styles.statLabel}>Usuario adicional (empleado):</Text>
+                <Text style={[styles.statValue, { color: '#0f172a' }]}>2,50 € + 21% IVA ({formatCurrency(2.5 * 1.21)})</Text>
               </View>
               <View style={[styles.statRow, { borderTopWidth: 1, borderColor: '#cbd5e1', paddingTop: 8, marginTop: 4 }]}>
-                <Text style={[styles.statLabel, { fontWeight: 'bold' }]}>Total mensual:</Text>
-                <Text style={[styles.statValue, { color: '#16a34a', fontWeight: 'bold' }]}>{formatCurrency(currentSubscriptionTotal)}</Text>
+                <Text style={[styles.statLabel, { fontWeight: 'bold' }]}>Total mensual con IVA:</Text>
+                <Text style={[styles.statValue, { color: '#16a34a', fontWeight: 'bold' }]}>{formatCurrency(currentSubscriptionTotal * 1.21)}</Text>
               </View>
             </View>
 
