@@ -1786,7 +1786,7 @@ export default function TpvScreen() {
   };
 
   const getTransactionQrContent = (transaction: Transaction): string | null => {
-    return transaction.ticketCode || null;
+    return transaction.publicUrl || transaction.ticketCode || null;
   };
 
   const getTransactionQrUrl = (transaction: Transaction, size = 180): string | null => {
