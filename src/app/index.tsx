@@ -38,7 +38,6 @@ type Issuer = {
   bankName?: string;
   country?: string;
   additionalUsers?: number;
-  complianceRegime?: 'verifactu' | 'ticketbai';
 };
 type InvoiceItem = { id: string; description: string; price: string };
 type PendingInvoice = { client: Client; items: InvoiceItem[]; ivaRate: number; total: number; docType: DocumentType };
@@ -86,10 +85,6 @@ interface Transaction {
   isRefunded?: boolean;
   refundHistory?: { amount: number; date: string }[];
   publicUrl?: string;
-  hash?: string;
-  previousHash?: string;
-  tbaiId?: string;
-  complianceRegime?: 'verifactu' | 'ticketbai';
 }
 
 interface CashInvoiceDraft extends Transaction {
@@ -107,7 +102,6 @@ const initialIssuer: Issuer = {
   bankName: 'Banco Santander',
   country: 'ES',
   additionalUsers: 0,
-  complianceRegime: 'verifactu',
 };
 
 function sha256Hex(ascii: string): string {
@@ -171,29 +165,6 @@ function sha256Hex(ascii: string): string {
     }
   }
   return result;
-}
-
-function computeComplianceData(
-  ticketCode: string,
-  createdAt: string,
-  documentType: DocumentType,
-  amount: number,
-  issuer: Issuer,
-  existingTransactions: Transaction[]
-): { hash: string; previousHash: string; tbaiId?: string; complianceRegime: 'verifactu' | 'ticketbai' } {
-  const regime = issuer.complianceRegime || 'verifactu';
-  const lastTx = existingTransactions.find((t) => t.hash);
-  const prevHash = lastTx?.hash || '0000000000000000000000000000000000000000000000000000000000000000';
-  const dataToHash = `${issuer.nif}|${ticketCode}|${createdAt}|${documentType}|${amount.toFixed(2)}|${prevHash}`;
-  const hash = sha256Hex(dataToHash);
-
-  let tbaiId: string | undefined;
-  if (regime === 'ticketbai') {
-    const cleanDate = createdAt.replace(/[^0-9]/g, '').slice(2, 8);
-    tbaiId = `TBAI-${issuer.nif}-${cleanDate}-${hash.slice(0, 13).toUpperCase()}`;
-  }
-
-  return { hash, previousHash: prevHash, tbaiId, complianceRegime: regime };
 }
 
 const STORAGE_KEY_TRANSACTIONS = '@tpv_transactions_v1';
@@ -611,12 +582,16 @@ export default function TpvScreen() {
   }, [ownerRecoveryPhone, isLoaded]);
 
   useEffect(() => {
-    if (!isLoaded || !issuer.logoUri || transactions.length === 0) return;
-    void Promise.all(transactions.map(async (transaction) => {
+    if (!isLoaded || transactions.length === 0) return;
+    const transactionsNeedingPublication = transactions.filter((transaction) =>
+      !transaction.publicUrl || (issuer.logoUri && transaction.issuer.logoUri !== issuer.logoUri)
+    );
+    if (transactionsNeedingPublication.length === 0) return;
+
+    void Promise.all(transactionsNeedingPublication.map(async (transaction) => {
       const publishedTransaction = await registerTransactionDocument({
         ...transaction,
-        issuer: { ...transaction.issuer, logoUri: issuer.logoUri },
-        publicUrl: undefined,
+        issuer: issuer.logoUri ? { ...transaction.issuer, logoUri: issuer.logoUri } : transaction.issuer,
       });
       setTransactions((current) => current.map((item) =>
         item.id === publishedTransaction.id ? publishedTransaction : item
@@ -988,8 +963,6 @@ export default function TpvScreen() {
     const subtotal = finalAmount / taxMultiplier;
     
     const ticketCode = `${prefix}-${Date.now().toString().slice(-6)}-${randomSuffix}`;
-    const compliance = computeComplianceData(ticketCode, createdAt, documentType, finalAmount, issuer, transactions);
-
     const transaction: Transaction = {
       id,
       ticketCode,
@@ -1007,10 +980,6 @@ export default function TpvScreen() {
       items: customItems,
       isRefunded: false,
       refundHistory: [],
-      hash: compliance.hash,
-      previousHash: compliance.previousHash,
-      tbaiId: compliance.tbaiId,
-      complianceRegime: compliance.complianceRegime,
     };
 
     setTransactions((current) => [transaction, ...current]);
@@ -1340,8 +1309,6 @@ export default function TpvScreen() {
 
       const ticketCode = `${presupuestoDocumentType === 'FACTURA' ? 'FAC' : 'PRES'}-${Date.now().toString().slice(-6)}`;
       const createdAt = new Date().toISOString();
-      const compliance = computeComplianceData(ticketCode, createdAt, presupuestoDocumentType, totalWithIva, issuer, transactions);
-
       const tempPresupuestoTransaction: Transaction = {
         id: `pres-${Date.now()}`,
         ticketCode,
@@ -1358,10 +1325,6 @@ export default function TpvScreen() {
         items: validItems,
         isRefunded: false,
         refundHistory: [],
-        hash: compliance.hash,
-        previousHash: compliance.previousHash,
-        tbaiId: compliance.tbaiId,
-        complianceRegime: compliance.complianceRegime,
       };
 
       const publishedDocument = await registerTransactionDocument(tempPresupuestoTransaction);
@@ -1387,17 +1350,11 @@ export default function TpvScreen() {
 
   const markCashInvoiceAsPaid = async (draft: CashInvoiceDraft) => {
     const createdAt = new Date().toISOString();
-    const compliance = computeComplianceData(draft.ticketCode, createdAt, draft.documentType, draft.amount, issuer, transactions);
-
     const paidTransaction: Transaction = {
       ...draft,
       createdAt,
       method: 'Efectivo',
       publicUrl: undefined,
-      hash: compliance.hash,
-      previousHash: compliance.previousHash,
-      tbaiId: compliance.tbaiId,
-      complianceRegime: compliance.complianceRegime,
     };
 
     setCashInvoiceDrafts((current) => current.filter((item) => item.id !== draft.id));
@@ -1582,8 +1539,6 @@ export default function TpvScreen() {
     const isFullyDepleted = newRemainingAmount <= 0.005;
     const updatedSubtotal = newRemainingAmount / (1 + (targetTicket.ivaRateApplied / 100));
     const refundDate = new Date().toISOString();
-    const compliance = computeComplianceData(targetTicket.ticketCode, refundDate, 'COMPRA/DEVOLUCIONES', newRemainingAmount, issuer, transactions);
-
     const updatedTicket: Transaction = {
       ...targetTicket,
       documentType: 'COMPRA/DEVOLUCIONES',
@@ -1597,10 +1552,6 @@ export default function TpvScreen() {
         { amount: refundVal, date: refundDate },
       ],
       publicUrl: undefined,
-      hash: compliance.hash,
-      previousHash: compliance.previousHash,
-      tbaiId: compliance.tbaiId,
-      complianceRegime: compliance.complianceRegime,
     };
 
     const publishedTicket = await registerTransactionDocument(updatedTicket);
@@ -1909,20 +1860,6 @@ export default function TpvScreen() {
       ? 'width: 100%; max-width: 600px; background: #fff; padding: 20px; border: 1px solid #cbd5e1;'
       : 'width: 280px; background: #fff; padding: 12px; font-size: 11px;';
 
-    const regime = transaction.complianceRegime || transaction.issuer?.complianceRegime || 'verifactu';
-    const isTicketBai = regime === 'ticketbai';
-
-    const complianceHtml = `
-      <div style="margin-top: 12px; border-top: 1px dashed #000; padding-top: 8px; text-align: center; font-size: ${isA4 ? '10px' : '8px'}; color: #334155;">
-        <div style="font-weight: bold;">${isTicketBai ? 'TICKETBAI - TBAI' : 'VERI*FACTU - AEAT'}</div>
-        <div style="margin-top: 2px;">
-          ${isTicketBai ? 'Factura / Ticket registrado digitalmente en TicketBAI' : 'Factura emitida por sistema de facturación verificable (VERI*FACTU)'}
-        </div>
-        ${transaction.tbaiId ? `<div style="font-weight: bold; margin-top: 2px;">ID TBAI: ${transaction.tbaiId}</div>` : ''}
-        ${transaction.hash ? `<div style="font-size: ${isA4 ? '8px' : '7px'}; color: #64748b; margin-top: 2px; word-break: break-all;">Huella SHA-256: ${transaction.hash.slice(0, 16)}... | Hash previo: ${transaction.previousHash?.slice(0, 12) || 'Inicio'}...</div>` : ''}
-      </div>
-    `;
-
     const htmlContent = `
       <!DOCTYPE html>
       <html>
@@ -1973,7 +1910,6 @@ export default function TpvScreen() {
               <span>${transaction.refundHistory && transaction.refundHistory.length > 0 ? 'SALDO RESTANTE' : 'TOTAL'}</span>
               <span>${formatCurrency(transaction.amount)}</span>
             </div>
-            ${complianceHtml}
             ${qrSectionHtml}
           </div>
         </body>
@@ -2837,25 +2773,6 @@ export default function TpvScreen() {
                 onChangeText={(t) => setIssuer(i => ({ ...i, additionalUsers: Number(t.replace(/[^0-9]/g, '')) || 0 }))}
               />
 
-              <Text style={[styles.cardTitle, { marginTop: 15 }]}>🛡️ NORMATIVA FACTURACIÓN Y QR (VERI*FACTU / TICKETBAI)</Text>
-              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>
-                Selecciona la normativa aplicable a tus tickets y facturas (generación de QR oficiales y encadenamiento de huellas SHA-256):
-              </Text>
-              <View style={styles.rowButtons}>
-                <Pressable
-                  style={[styles.secondaryButton, { flex: 1, backgroundColor: (issuer.complianceRegime || 'verifactu') === 'verifactu' ? '#dbeafe' : '#f8fafc' }]}
-                  onPress={() => setIssuer(i => ({ ...i, complianceRegime: 'verifactu' }))}
-                >
-                  <Text style={styles.secondaryButtonText}>🇪🇸 Veri*factu (AEAT)</Text>
-                </Pressable>
-                <Pressable
-                  style={[styles.secondaryButton, { flex: 1, marginLeft: 8, backgroundColor: issuer.complianceRegime === 'ticketbai' ? '#dcfce7' : '#f8fafc' }]}
-                  onPress={() => setIssuer(i => ({ ...i, complianceRegime: 'ticketbai' }))}
-                >
-                  <Text style={styles.secondaryButtonText}>🇪🇸 TicketBAI (País Vasco)</Text>
-                </Pressable>
-              </View>
-
               <Text style={[styles.cardTitle, { marginTop: 15 }]}>🎨 LOGOTIPO DE LA EMPRESA</Text>
               {issuer.logoUri && (
                 <View style={styles.previewContainer}>
@@ -3087,32 +3004,6 @@ export default function TpvScreen() {
                     )}
                     <Text style={[styles.modalSubtitle, { textAlign: 'center' }]}>Código: {selectedTicket.ticketCode}</Text>
                     <Text style={[styles.modalSubtitle, { textAlign: 'center', color: '#64748b' }]}>Al escanear el QR se abrirá el ticket completo. También puedes compartir el PDF por WhatsApp o email.</Text>
-                  </View>
-
-                  <View style={{ marginTop: 12, padding: 10, borderRadius: 6, backgroundColor: '#f8fafc', borderWidth: 1, borderColor: '#cbd5e1' }}>
-                    <Text style={{ fontWeight: 'bold', fontSize: 11, color: '#0f172a', textAlign: 'center' }}>
-                      {(selectedTicket.complianceRegime || selectedTicket.issuer?.complianceRegime) === 'ticketbai' ? '🛡️ REGISTRO TICKETBAI (TBAI)' : '🛡️ SISTEMA VERI*FACTU (AEAT)'}
-                    </Text>
-                    <Text style={{ fontSize: 10, color: '#334155', marginTop: 2, textAlign: 'center' }}>
-                      {(selectedTicket.complianceRegime || selectedTicket.issuer?.complianceRegime) === 'ticketbai'
-                        ? 'Factura / Ticket registrado digitalmente en TicketBAI (País Vasco)'
-                        : 'Factura emitida por sistema de facturación verificable (VERI*FACTU)'}
-                    </Text>
-                    {selectedTicket.tbaiId ? (
-                      <Text style={{ fontSize: 10, fontWeight: 'bold', color: '#166534', marginTop: 4, textAlign: 'center' }}>
-                        ID TBAI: {selectedTicket.tbaiId}
-                      </Text>
-                    ) : null}
-                    {selectedTicket.hash ? (
-                      <Text style={{ fontSize: 9, color: '#64748b', marginTop: 2, textAlign: 'center' }}>
-                        Huella SHA-256: {selectedTicket.hash.slice(0, 16)}...
-                      </Text>
-                    ) : null}
-                    {selectedTicket.previousHash ? (
-                      <Text style={{ fontSize: 9, color: '#64748b', marginTop: 1, textAlign: 'center' }}>
-                        Hash previo: {selectedTicket.previousHash.slice(0, 16)}...
-                      </Text>
-                    ) : null}
                   </View>
 
                   <Pressable style={[styles.primaryButton, { marginTop: 15 }]} onPress={() => generateAndSharePdf(selectedTicket)}>
