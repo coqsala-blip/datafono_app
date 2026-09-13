@@ -235,14 +235,23 @@ app.post('/api/monei/payment', requireAuth, async (req, res) => {
       cancelUrl: `${PUBLIC_API_URL}/monei/cancel?orderId=${encodeURIComponent(orderId)}`,
     });
 
+    const redirectUrl = payment.nextAction?.redirectUrl ||
+      payment.redirectUrl ||
+      payment.checkoutUrl ||
+      payment.url;
+    const qrDataUrl = redirectUrl
+      ? await QRCode.toDataURL(redirectUrl, { width: 420, margin: 2 })
+      : null;
+
     return res.status(201).json({
       ok: true,
       paymentId: payment.id,
-      redirectUrl: payment.nextAction?.redirectUrl,
+      redirectUrl,
+      qrDataUrl,
     });
   } catch (error) {
     console.error('Error creando pago MONEI:', error.message);
-    return res.status(502).json({ ok: false, error: 'No se pudo iniciar el cobro con MONEI.' });
+    return res.status(502).json({ ok: false, error: `MONEI: ${error.message}` });
   }
 });
 

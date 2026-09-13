@@ -7,7 +7,7 @@ import * as Print from 'expo-print';
 import * as SecureStore from 'expo-secure-store';
 import * as Sharing from 'expo-sharing';
 import * as WebBrowser from 'expo-web-browser';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Image,
@@ -211,6 +211,19 @@ const formatCurrency = (amount: number) =>
 const formatDate = (isoDate: string) =>
   new Intl.DateTimeFormat('es-ES', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(isoDate));
 
+type PhysicalPaymentResult = {
+  status: 'unsupported';
+  message: string;
+};
+
+async function processPhysicalPaymentMock(amount: number): Promise<PhysicalPaymentResult> {
+  void amount;
+  return {
+    status: 'unsupported',
+    message: 'MONEI Pay presencial queda pendiente del SDK oficial de MONEI y sus credenciales de prueba.',
+  };
+}
+
 export default function TpvScreen() {
   const [digits, setDigits] = useState('0');
   const [transactions, setTransactions] = useState<Transaction[]>([]);
@@ -256,6 +269,9 @@ export default function TpvScreen() {
   const [subscriptionError, setSubscriptionError] = useState('');
   const [checkoutLoading, setCheckoutLoading] = useState(false);
   const [terminalError, setTerminalError] = useState('');
+  const [paymentQrDataUrl, setPaymentQrDataUrl] = useState<string | null>(null);
+  const [paymentQrStatus, setPaymentQrStatus] = useState('PENDING');
+  const paymentQrCancelledRef = useRef(false);
 
   // Estados para envío al gestor por rango de fechas (Global)
   const [managerModalVisible, setManagerModalVisible] = useState(false);
@@ -1059,8 +1075,12 @@ export default function TpvScreen() {
     setNfcModalVisible(true);
   };
 
-  const completePayment = () => {
-    setTerminalError('MONEI Pay para tarjeta física requiere el SDK oficial de MONEI Pay. No se ha activado ningún cobro físico provisional.');
+  const completePayment = async () => {
+    const paymentAmount = pendingInvoice ? pendingInvoice.total : amount;
+    const result = await processPhysicalPaymentMock(paymentAmount);
+    if (result.status === 'unsupported') {
+      setTerminalError(result.message);
+    }
   };
 
   const completePaymentQr = async () => {
@@ -1071,6 +1091,8 @@ export default function TpvScreen() {
 
     const paymentAmount = pendingInvoice ? pendingInvoice.total : amount;
     const orderId = `monei-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    paymentQrCancelledRef.current = false;
+    setTerminalError('');
 
     try {
       const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/monei/payment`, {
@@ -1081,29 +1103,36 @@ export default function TpvScreen() {
         },
         body: JSON.stringify({ amount: paymentAmount, orderId }),
       }, 15000);
-      const result = await response.json() as { paymentId?: string; redirectUrl?: string; error?: string };
-      if (!response.ok || !result.paymentId || !result.redirectUrl) {
+      const result = await response.json() as { paymentId?: string; redirectUrl?: string; qrDataUrl?: string | null; error?: string };
+      if (!response.ok || !result.paymentId || !result.qrDataUrl) {
         throw new Error(result.error || 'MONEI no devolvió una página de pago.');
       }
 
-      setNfcModalVisible(false);
-      await WebBrowser.openBrowserAsync(result.redirectUrl);
+      setPaymentQrDataUrl(result.qrDataUrl);
+      setPaymentQrStatus('PENDING');
 
       let status = 'PENDING';
-      for (let attempt = 0; attempt < 45 && status === 'PENDING'; attempt += 1) {
+      for (let attempt = 0; attempt < 45 && status === 'PENDING' && !paymentQrCancelledRef.current; attempt += 1) {
         await new Promise((resolve) => setTimeout(resolve, 2000));
+        if (paymentQrCancelledRef.current) return;
         const statusResponse = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/monei/payment/${encodeURIComponent(result.paymentId)}`, {
           headers: { Authorization: `Bearer ${accessToken}` },
         }, 10000);
         const statusResult = await statusResponse.json() as { payment?: { status?: string }; status?: string; error?: string };
         if (!statusResponse.ok) throw new Error(statusResult.error || 'No se pudo confirmar el pago MONEI.');
         status = statusResult.status || statusResult.payment?.status || 'PENDING';
+        setPaymentQrStatus(status);
       }
+
+      if (paymentQrCancelledRef.current) return;
 
       if (status !== 'SUCCEEDED') {
         Alert.alert('Pago no confirmado', `MONEI ha devuelto el estado ${status}. No se ha creado el ticket.`);
         return;
       }
+
+      setNfcModalVisible(false);
+      setPaymentQrDataUrl(null);
 
       if (pendingInvoice) {
         createTransaction(
@@ -1123,12 +1152,18 @@ export default function TpvScreen() {
         createTransaction('COBRO', pendingDocumentType, 'MONEI - QR / Bizum');
       }
     } catch (error) {
-      Alert.alert('Error de pago MONEI', error instanceof Error ? error.message : 'No se pudo completar el cobro.');
+      if (!paymentQrCancelledRef.current) {
+        setPaymentQrDataUrl(null);
+        Alert.alert('Error de pago MONEI', error instanceof Error ? error.message : 'No se pudo completar el cobro.');
+      }
     }
   };
 
   const cancelPayment = () => {
+    paymentQrCancelledRef.current = true;
     setNfcModalVisible(false);
+    setPaymentQrDataUrl(null);
+    setPaymentQrStatus('PENDING');
     setPendingInvoice(null);
   };
 
@@ -1321,15 +1356,17 @@ export default function TpvScreen() {
         complianceRegime: compliance.complianceRegime,
       };
 
+      const publishedDocument = await registerTransactionDocument(tempPresupuestoTransaction);
+
       if (presupuestoDocumentType === 'FACTURA') {
-        setCashInvoiceDrafts((current) => [tempPresupuestoTransaction as CashInvoiceDraft, ...current]);
+        setCashInvoiceDrafts((current) => [publishedDocument as CashInvoiceDraft, ...current]);
       }
 
-      const pdfUri = await generatePdfFileUri(tempPresupuestoTransaction);
+      const pdfUri = await generatePdfFileUri(publishedDocument);
 
       await MailComposer.composeAsync({
         recipients: [presupuestoClientEmail.trim()],
-        subject: `${presupuestoDocumentType === 'FACTURA' ? 'Factura' : 'Presupuesto'} de Servicios - Ref: ${tempPresupuestoTransaction.ticketCode} (${issuer.name})`,
+        subject: `${presupuestoDocumentType === 'FACTURA' ? 'Factura' : 'Presupuesto'} de Servicios - Ref: ${publishedDocument.ticketCode} (${issuer.name})`,
         body: `Estimado/a ${validClient.name},\n\nAdjunto le hacemos llegar la ${presupuestoDocumentType === 'FACTURA' ? 'factura' : 'presupuesto'} solicitada con importe total de ${formatCurrency(totalWithIva)}.\n\nAtentamente,\n${issuer.name}`,
         attachments: [pdfUri],
       });
@@ -1786,7 +1823,7 @@ export default function TpvScreen() {
   };
 
   const getTransactionQrContent = (transaction: Transaction): string | null => {
-    return transaction.publicUrl || transaction.ticketCode || null;
+    return transaction.publicUrl || null;
   };
 
   const getTransactionQrUrl = (transaction: Transaction, size = 180): string | null => {
@@ -1857,7 +1894,9 @@ export default function TpvScreen() {
       `
       : '';
 
-    const isA4 = transaction.documentType === 'FACTURA COMPLETA';
+    const isA4 = transaction.documentType === 'FACTURA COMPLETA' ||
+      transaction.documentType === 'FACTURA' ||
+      transaction.documentType === 'PRESUPUESTO';
     const containerStyle = isA4
       ? 'width: 100%; max-width: 600px; background: #fff; padding: 20px; border: 1px solid #cbd5e1;'
       : 'width: 280px; background: #fff; padding: 12px; font-size: 11px;';
@@ -2427,7 +2466,12 @@ export default function TpvScreen() {
       </View>
 
       {/* PESTAÑAS DE NAVEGACIÓN */}
-      <View style={styles.tabContainer}>
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        contentContainerStyle={styles.tabContent}
+        style={styles.tabContainer}
+      >
         {userRole === 'principal' && (
           <Pressable style={[styles.tabButton, activeTab === 'gastos_facturacion' && styles.tabButtonActive]} onPress={() => setActiveTab('gastos_facturacion')}>
             <Text style={[styles.tabText, activeTab === 'gastos_facturacion' && styles.tabTextActive]}>Gastos/Facturas</Text>
@@ -2449,7 +2493,7 @@ export default function TpvScreen() {
             </Pressable>
           </>
         )}
-      </View>
+      </ScrollView>
 
       <View style={styles.content}>
         {/* PESTAÑA: GASTOS Y FACTURACIÓN */}
@@ -2866,26 +2910,39 @@ export default function TpvScreen() {
       {/* MODAL: SELECCIÓN DE MÉTODO DE COBRO (NFC / QR) */}
       <Modal visible={nfcModalVisible} animationType="fade" transparent={true}>
         <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
-            <Text style={styles.modalTitle}>💳 SELECCIONA EL MÉTODO DE COBRO</Text>
+          <View style={[styles.modalContent, paymentQrDataUrl ? { alignItems: 'center' } : null]}>
+            <Text style={styles.modalTitle}>{paymentQrDataUrl ? '📲 ESCANEA PARA PAGAR' : '💳 SELECCIONA EL MÉTODO DE COBRO'}</Text>
             <Text style={styles.modalSubtitle}>Importe total a cobrar: {formatCurrency(pendingInvoice ? pendingInvoice.total : amount)}</Text>
-            
+
+            {paymentQrDataUrl ? (
+              <>
+                <Text style={[styles.modalSubtitle, { marginBottom: 8 }]}>El cliente debe escanear este QR con su móvil para abrir el pago MONEI.</Text>
+                <Image
+                  source={{ uri: paymentQrDataUrl }}
+                  style={{ width: 260, height: 260, marginVertical: 8 }}
+                />
+                <Text style={[styles.modalSubtitle, { color: paymentQrStatus === 'PENDING' ? '#b45309' : '#166534', fontWeight: 'bold' }]}>Estado: {paymentQrStatus}</Text>
+              </>
+            ) : null}
+
             {terminalError ? <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 10, textAlign: 'center' }}>{terminalError}</Text> : null}
 
-            <View style={{ gap: 10, marginTop: 15 }}>
-              <Pressable style={[styles.primaryButton, { backgroundColor: '#64748b' }]} onPress={completePayment}>
-                <Text style={styles.primaryButtonText}>
-                  💳 1. Tarjeta física / NFC con MONEI Pay
-                </Text>
-              </Pressable>
-              
-              <Pressable style={[styles.primaryButton, { backgroundColor: '#0284c7' }]} onPress={completePaymentQr}>
-                <Text style={styles.primaryButtonText}>📲 2. Cobrar con MONEI QR / Bizum</Text>
-              </Pressable>
-            </View>
+            {!paymentQrDataUrl ? (
+              <View style={{ gap: 10, marginTop: 15 }}>
+                <Pressable style={[styles.primaryButton, { backgroundColor: '#64748b' }]} onPress={completePayment}>
+                  <Text style={styles.primaryButtonText}>
+                    💳 1. Tarjeta física / NFC con MONEI Pay
+                  </Text>
+                </Pressable>
+
+                <Pressable style={[styles.primaryButton, { backgroundColor: '#0284c7' }]} onPress={completePaymentQr}>
+                  <Text style={styles.primaryButtonText}>📲 2. Cobrar con MONEI QR / Bizum</Text>
+                </Pressable>
+              </View>
+            ) : null}
 
             <Pressable style={[styles.secondaryButton, { marginTop: 12 }]} onPress={cancelPayment}>
-              <Text style={styles.secondaryButtonText}>Cancelar</Text>
+              <Text style={styles.secondaryButtonText}>{paymentQrDataUrl ? 'Cancelar pago' : 'Cancelar'}</Text>
             </Pressable>
           </View>
         </View>
@@ -3480,11 +3537,12 @@ const styles = StyleSheet.create({
   header: { paddingHorizontal: 16, paddingVertical: 12, backgroundColor: '#ffffff', borderBottomWidth: 1, borderColor: '#cbd5e1' },
   headerTitle: { fontSize: 16, fontWeight: 'bold', color: '#0f172a' },
   headerSubtitle: { fontSize: 12, color: '#64748b' },
-  tabContainer: { flexDirection: 'row', backgroundColor: '#ffffff', borderBottomWidth: 1, borderColor: '#cbd5e1' },
-  tabButton: { flex: 1, paddingVertical: 10, alignItems: 'center' },
-  tabButtonActive: { borderBottomWidth: 2, borderColor: '#0f172a' },
-  tabText: { fontSize: 11, color: '#64748b' },
-  tabTextActive: { fontSize: 11, fontWeight: 'bold', color: '#0f172a' },
+  tabContainer: { flexGrow: 0, backgroundColor: '#ffffff', borderBottomWidth: 1, borderColor: '#cbd5e1' },
+  tabContent: { flexDirection: 'row', gap: 8, paddingHorizontal: 12, paddingVertical: 8 },
+  tabButton: { minWidth: 108, paddingHorizontal: 12, paddingVertical: 9, borderRadius: 8, alignItems: 'center', backgroundColor: '#f8fafc', borderWidth: 1, borderColor: '#e2e8f0' },
+  tabButtonActive: { backgroundColor: '#0f172a', borderColor: '#0f172a' },
+  tabText: { fontSize: 11, fontWeight: '600', color: '#64748b' },
+  tabTextActive: { fontSize: 11, fontWeight: 'bold', color: '#ffffff' },
   content: { flex: 1 },
   scrollContent: { padding: 16 },
   card: { backgroundColor: '#ffffff', borderRadius: 8, padding: 16, marginBottom: 16, borderWidth: 1, borderColor: '#cbd5e1' },
