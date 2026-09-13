@@ -383,7 +383,7 @@ app.post('/api/documents', async (req, res) => {
 
   if (error) {
     console.error('Error guardando documento en Supabase:', error.message);
-    return res.status(500).json({ ok: false, error: 'No se pudo guardar el documento.' });
+    return res.status(500).json({ ok: false, error: `Supabase: ${error.message}` });
   }
 
   res.status(201).json({

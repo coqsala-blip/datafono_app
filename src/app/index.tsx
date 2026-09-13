@@ -917,7 +917,14 @@ export default function TpvScreen() {
           }, 10000);
 
           if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
+            let errorMessage = `HTTP ${response.status}`;
+            try {
+              const errorResult = await response.json() as { error?: string };
+              errorMessage = errorResult.error || errorMessage;
+            } catch {
+              // Mantener el error HTTP si el backend no devuelve JSON.
+            }
+            throw new Error(errorMessage);
           }
 
           const result = await response.json() as { publicUrl?: string };
@@ -949,6 +956,7 @@ export default function TpvScreen() {
       return await Promise.any(attempts);
     } catch (error) {
       console.warn('No se pudo publicar el documento con ninguna URL disponible; se mantiene sin QR.', error);
+      setTerminalError(error instanceof Error ? `No se pudo publicar el documento: ${error.message}` : 'No se pudo publicar el documento.');
       return transaction;
     }
   }
