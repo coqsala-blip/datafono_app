@@ -27,6 +27,7 @@ type DocumentType = 'TICKET DE VENTA' | 'FACTURA SIMPLIFICADA' | 'FACTURA COMPLE
 type TransactionType = 'COBRO' | 'DEVOLUCIÓN';
 type Tab = 'gastos_facturacion' | 'tpv' | 'presupuesto' | 'stats' | 'config';
 type UserRole = 'principal' | 'empleado';
+type AuthenticatedUser = { app_metadata?: { role?: unknown } };
 
 type Client = { name: string; nif: string; address: string };
 type Issuer = {
@@ -180,6 +181,9 @@ const STORAGE_KEY_OWNER_RECOVERY_EMAIL = '@tpv_owner_recovery_email_v1';
 const STORAGE_KEY_OWNER_RECOVERY_PHONE = '@tpv_owner_recovery_phone_v1';
 const AUTH_TOKEN_KEY = 'tpv_access_token';
 
+const roleFromUser = (user?: AuthenticatedUser): UserRole =>
+  user?.app_metadata?.role === 'empleado' ? 'empleado' : 'principal';
+
 const formatCurrency = (amount: number) =>
   new Intl.NumberFormat('es-ES', { style: 'currency', currency: 'EUR' }).format(amount);
 
@@ -205,7 +209,6 @@ export default function TpvScreen() {
   const [ownerPinChangeConfirm, setOwnerPinChangeConfirm] = useState('');
   const [ownerRecoveryCode, setOwnerRecoveryCode] = useState('');
   const [pinModalVisible, setPinModalVisible] = useState(false);
-  const [roleSwitchPinModalVisible, setRoleSwitchPinModalVisible] = useState(false);
   const [recoverySectionVisible, setRecoverySectionVisible] = useState(false);
   const [userPermissionsModalVisible, setUserPermissionsModalVisible] = useState(false);
   const [pendingRefund, setPendingRefund] = useState<{ ticket: Transaction; amount: number } | null>(null);
@@ -223,6 +226,9 @@ export default function TpvScreen() {
   const [authPassword, setAuthPassword] = useState('');
   const [authFullName, setAuthFullName] = useState('');
   const [authCompanyName, setAuthCompanyName] = useState('');
+  const [authRegistrationRole, setAuthRegistrationRole] = useState<UserRole>('principal');
+  const [authEmployeeAccessCode, setAuthEmployeeAccessCode] = useState('');
+  const [employeeAccessCode, setEmployeeAccessCode] = useState('');
   const [authError, setAuthError] = useState('');
   const [subscriptionLoading, setSubscriptionLoading] = useState(false);
   const [hasActiveSubscription, setHasActiveSubscription] = useState(false);
@@ -433,6 +439,8 @@ export default function TpvScreen() {
           headers: { Authorization: `Bearer ${storedToken}` },
         }, 5000);
         if (response.ok) {
+          const result = await response.json() as { user?: AuthenticatedUser };
+          setUserRole(roleFromUser(result.user));
           setAccessToken(storedToken);
         } else {
           await SecureStore.deleteItemAsync(AUTH_TOKEN_KEY);
@@ -457,14 +465,16 @@ export default function TpvScreen() {
       const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/auth/${authMode}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      body: JSON.stringify({
           email,
           password: authPassword,
           fullName: authFullName,
           companyName: authCompanyName,
+          role: authRegistrationRole,
+          employeeAccessCode: authEmployeeAccessCode,
         }),
       }, 10000);
-      const result = await response.json() as { error?: string; session?: { access_token?: string }; requiresEmailConfirmation?: boolean };
+      const result = await response.json() as { error?: string; user?: AuthenticatedUser; session?: { access_token?: string }; requiresEmailConfirmation?: boolean };
 
       if (!response.ok) {
         setAuthError(result.error || 'No se pudo completar la operación.');
@@ -484,6 +494,7 @@ export default function TpvScreen() {
       }
 
       await SecureStore.setItemAsync(AUTH_TOKEN_KEY, token);
+      setUserRole(roleFromUser(result.user));
       setAccessToken(token);
       setAuthPassword('');
     } catch {
@@ -494,7 +505,28 @@ export default function TpvScreen() {
   const signOut = async () => {
     await SecureStore.deleteItemAsync(AUTH_TOKEN_KEY);
     setAccessToken(null);
+    setUserRole('principal');
     setAuthPassword('');
+  };
+
+  const saveEmployeeAccessCode = async () => {
+    if (!accessToken || !configuredDocumentApiUrl) return;
+    try {
+      const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/auth/employee-access-code`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify({ accessCode: employeeAccessCode }),
+      }, 10000);
+      const result = await response.json() as { error?: string };
+      if (!response.ok) throw new Error(result.error || 'No se pudo guardar el código.');
+      setEmployeeAccessCode('');
+      Alert.alert('Código de empleado guardado', 'Compártelo solo con los empleados que deban acceder al TPV.');
+    } catch (error) {
+      Alert.alert('No se pudo guardar el código', error instanceof Error ? error.message : 'Inténtalo de nuevo.');
+    }
   };
 
   const startSubscriptionCheckout = async () => {
@@ -1658,28 +1690,6 @@ export default function TpvScreen() {
     if (refund) void applyRefundToTicket(refund.ticket, refund.amount, true);
   };
 
-  const requestPrincipalRole = () => {
-    if (!requireSubscription('cambiar de usuario')) return;
-    if (userRole === 'principal') return;
-    if (!ownerPin) {
-      Alert.alert('PIN no configurado', 'El usuario principal debe configurar primero su PIN.');
-      return;
-    }
-    setOwnerPinInput('');
-    setRoleSwitchPinModalVisible(true);
-  };
-
-  const confirmPrincipalRole = () => {
-    if (ownerPinInput !== ownerPin) {
-      Alert.alert('PIN incorrecto', 'El PIN del jefe no es válido.');
-      setOwnerPinInput('');
-      return;
-    }
-    setRoleSwitchPinModalVisible(false);
-    setOwnerPinInput('');
-    setUserRole('principal');
-  };
-
   const handleSetupOwnerPin = () => {
     const trimmedNew = ownerPinSetupNew.trim();
     const trimmedConfirm = ownerPinSetupConfirm.trim();
@@ -2447,7 +2457,22 @@ export default function TpvScreen() {
             {authMode === 'register' ? (
               <>
                 <TextInput style={styles.input} placeholder="Nombre completo" placeholderTextColor="#94a3b8" value={authFullName} onChangeText={setAuthFullName} />
-                <TextInput style={styles.input} placeholder="Nombre de la empresa" placeholderTextColor="#94a3b8" value={authCompanyName} onChangeText={setAuthCompanyName} />
+                <View style={styles.rowButtons}>
+                  <Pressable style={[styles.secondaryButton, { flex: 1, backgroundColor: authRegistrationRole === 'principal' ? '#dcfce7' : '#f1f5f9' }]} onPress={() => setAuthRegistrationRole('principal')}>
+                    <Text style={styles.secondaryButtonText}>Soy principal</Text>
+                  </Pressable>
+                  <Pressable style={[styles.secondaryButton, { flex: 1, marginLeft: 8, backgroundColor: authRegistrationRole === 'empleado' ? '#dbeafe' : '#f1f5f9' }]} onPress={() => setAuthRegistrationRole('empleado')}>
+                    <Text style={styles.secondaryButtonText}>Soy empleado</Text>
+                  </Pressable>
+                </View>
+                {authRegistrationRole === 'principal' ? (
+                  <TextInput style={styles.input} placeholder="Nombre de la empresa" placeholderTextColor="#94a3b8" value={authCompanyName} onChangeText={setAuthCompanyName} />
+                ) : (
+                  <>
+                    <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 10 }]}>Introduce el código que te ha dado el usuario principal. Tu cuenta solo tendrá acceso al TPV.</Text>
+                    <TextInput style={styles.input} placeholder="Código de empleado" placeholderTextColor="#94a3b8" autoCapitalize="characters" secureTextEntry value={authEmployeeAccessCode} onChangeText={setAuthEmployeeAccessCode} />
+                  </>
+                )}
               </>
             ) : null}
             <TextInput style={styles.input} placeholder="Email" placeholderTextColor="#94a3b8" keyboardType="email-address" autoCapitalize="none" value={authEmail} onChangeText={setAuthEmail} />
@@ -2480,7 +2505,7 @@ export default function TpvScreen() {
           </View>
           <Pressable
             style={{ marginLeft: 10, paddingVertical: 8, paddingHorizontal: 10, borderRadius: 6, backgroundColor: userRole === 'principal' ? '#dcfce7' : '#dbeafe' }}
-            onPress={() => setUserPermissionsModalVisible(true)}
+            onPress={() => { if (userRole === 'principal') setUserPermissionsModalVisible(true); }}
           >
             <Text style={{ fontSize: 11, fontWeight: 'bold', color: '#0f172a' }}>
               {userRole === 'principal' ? 'Principal' : 'Empleado'}
@@ -2852,6 +2877,19 @@ export default function TpvScreen() {
                 value={String(issuer.additionalUsers || 0)}
                 onChangeText={(t) => setIssuer(i => ({ ...i, additionalUsers: Number(t.replace(/[^0-9]/g, '')) || 0 }))}
               />
+              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 8 }]}>Después de añadir plazas de empleado, crea un código distinto del PIN. Cada empleado lo usará una sola vez al registrarse en su móvil.</Text>
+              <TextInput
+                style={styles.input}
+                placeholder="Código para empleados (mínimo 8 caracteres)"
+                placeholderTextColor="#94a3b8"
+                autoCapitalize="characters"
+                secureTextEntry
+                value={employeeAccessCode}
+                onChangeText={setEmployeeAccessCode}
+              />
+              <Pressable style={[styles.secondaryButton, { marginTop: 2 }]} onPress={() => void saveEmployeeAccessCode()}>
+                <Text style={styles.secondaryButtonText}>Guardar código de empleado</Text>
+              </Pressable>
 
               <Text style={[styles.cardTitle, { marginTop: 15 }]}>🎨 LOGOTIPO DE LA EMPRESA</Text>
               {issuer.logoUri && (
@@ -3190,32 +3228,6 @@ export default function TpvScreen() {
         </View>
       </Modal>
 
-      <Modal visible={roleSwitchPinModalVisible} animationType="fade" transparent={true}>
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
-            <Text style={styles.modalTitle}>🔐 ACCESO PRINCIPAL</Text>
-            <Text style={styles.modalSubtitle}>Introduce el PIN del jefe para volver al perfil principal.</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="PIN del jefe"
-              placeholderTextColor="#94a3b8"
-              keyboardType="number-pad"
-              secureTextEntry
-              maxLength={6}
-              value={ownerPinInput}
-              onChangeText={(value) => setOwnerPinInput(value.replace(/[^0-9]/g, ''))}
-              autoFocus
-            />
-            <Pressable style={[styles.primaryButton, { marginTop: 10 }]} onPress={confirmPrincipalRole}>
-              <Text style={styles.primaryButtonText}>Entrar como principal</Text>
-            </Pressable>
-            <Pressable style={[styles.secondaryButton, { marginTop: 8 }]} onPress={() => { setRoleSwitchPinModalVisible(false); setOwnerPinInput(''); }}>
-              <Text style={styles.secondaryButtonText}>Cancelar</Text>
-            </Pressable>
-          </View>
-        </View>
-      </Modal>
-
       {/* MODAL: USUARIOS Y PERMISOS */}
       <Modal visible={userPermissionsModalVisible} animationType="fade" transparent={true}>
         <View style={styles.modalOverlay}>
@@ -3223,19 +3235,7 @@ export default function TpvScreen() {
             <Text style={styles.modalTitle}>👥 USUARIOS Y PERMISOS</Text>
             <Text style={styles.modalSubtitle}>Ajusta el perfil activo y la seguridad del usuario principal.</Text>
 
-            {ownerPin ? (
-              <>
-                <View style={styles.rowButtons}>
-                  <Pressable style={[styles.secondaryButton, { flex: 1, backgroundColor: '#dcfce7' }]} onPress={requestPrincipalRole}>
-                    <Text style={styles.secondaryButtonText}>Principal</Text>
-                  </Pressable>
-                  <Pressable style={[styles.secondaryButton, { flex: 1, marginLeft: 8, backgroundColor: userRole === 'empleado' ? '#dbeafe' : '#f1f5f9' }]} onPress={() => { if (requireSubscription('activar usuarios empleados')) setUserRole('empleado'); }}>
-                    <Text style={styles.secondaryButtonText}>Empleado</Text>
-                  </Pressable>
-                </View>
-                <Text style={[styles.emptyText, { textAlign: 'left', marginTop: 10, color: '#166534' }]}>PIN principal configurado y activo.</Text>
-              </>
-            ) : null}
+            {ownerPin ? <Text style={[styles.emptyText, { textAlign: 'left', marginTop: 10, color: '#166534' }]}>PIN principal configurado y activo. Los empleados se crean desde Configuración con un código de acceso.</Text> : null}
 
             {!ownerPin ? (
               <View style={{ marginTop: 12 }}>

@@ -49,6 +49,42 @@ const updateUserMetadata = async (userId, metadata) => {
   });
 };
 
+const updateUserAppMetadata = async (userId, metadata) => {
+  const { data } = await supabase.auth.admin.getUserById(userId);
+  const currentMetadata = data?.user?.app_metadata || {};
+  return supabase.auth.admin.updateUserById(userId, {
+    app_metadata: {
+      ...currentMetadata,
+      ...metadata,
+    },
+  });
+};
+
+const hashEmployeeAccessCode = (code, salt) => crypto.scryptSync(code, salt, 64).toString('hex');
+
+const isPrincipal = (user) => user.app_metadata?.role !== 'empleado';
+
+const findPrincipalByEmployeeAccessCode = async (accessCode) => {
+  let page = 1;
+  while (true) {
+    const { data, error } = await supabase.auth.admin.listUsers({ page, perPage: 1000 });
+    if (error) throw error;
+
+    const users = data?.users || [];
+    for (const user of users) {
+      const metadata = user.app_metadata || {};
+      if (metadata.role === 'empleado' || !metadata.employee_access_code_salt || !metadata.employee_access_code_hash) continue;
+      const candidateHash = hashEmployeeAccessCode(accessCode, metadata.employee_access_code_salt);
+      if (crypto.timingSafeEqual(Buffer.from(candidateHash, 'hex'), Buffer.from(metadata.employee_access_code_hash, 'hex'))) {
+        return user;
+      }
+    }
+
+    if (users.length < 1000) return null;
+    page += 1;
+  }
+};
+
 const normalizeStripePaymentStatus = (session) => {
   if (session.payment_status === 'paid') return 'SUCCEEDED';
   if (session.status === 'expired') return 'EXPIRED';
@@ -129,15 +165,25 @@ const requireAuth = async (req, res, next) => {
 };
 
 app.get('/api/billing/status', requireAuth, async (req, res) => {
-  let status = req.user.user_metadata?.stripe_subscription_status || 'missing';
-  let subscriptionId = req.user.user_metadata?.stripe_subscription_id || null;
-  const checkoutSessionId = req.user.user_metadata?.stripe_checkout_session_id || null;
+  let accountOwner = req.user;
+  const ownerId = req.user.app_metadata?.company_owner_id;
+  if (ownerId) {
+    const { data, error } = await supabase.auth.admin.getUserById(ownerId);
+    if (error || !data.user) {
+      return res.status(404).json({ ok: false, error: 'No se encontró la cuenta principal asociada.' });
+    }
+    accountOwner = data.user;
+  }
+
+  let status = accountOwner.user_metadata?.stripe_subscription_status || 'missing';
+  let subscriptionId = accountOwner.user_metadata?.stripe_subscription_id || null;
+  const checkoutSessionId = accountOwner.user_metadata?.stripe_checkout_session_id || null;
 
   try {
     if (stripe && subscriptionId) {
       const subscription = await stripe.subscriptions.retrieve(subscriptionId);
       status = subscription.status || status;
-      await updateUserMetadata(req.user.id, {
+      await updateUserMetadata(accountOwner.id, {
         stripe_subscription_status: status,
         stripe_subscription_updated_at: new Date().toISOString(),
       });
@@ -147,7 +193,7 @@ app.get('/api/billing/status', requireAuth, async (req, res) => {
         subscriptionId = typeof session.subscription === 'string' ? session.subscription : session.subscription.id;
         const subscription = await stripe.subscriptions.retrieve(subscriptionId);
         status = subscription.status || status;
-        await updateUserMetadata(req.user.id, {
+        await updateUserMetadata(accountOwner.id, {
           subscription_provider: 'stripe',
           stripe_customer_id: session.customer || null,
           stripe_subscription_id: subscriptionId,
@@ -173,11 +219,29 @@ app.get('/api/billing/status', requireAuth, async (req, res) => {
 });
 
 app.post('/api/auth/register', async (req, res) => {
-  const { email, password, fullName, companyName } = req.body || {};
+  const { email, password, fullName, companyName, role, employeeAccessCode } = req.body || {};
   const normalizedEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+  const requestedRole = role === 'empleado' ? 'empleado' : 'principal';
+  const normalizedAccessCode = typeof employeeAccessCode === 'string' ? employeeAccessCode.trim() : '';
 
   if (!normalizedEmail || typeof password !== 'string' || password.length < 8) {
     return res.status(400).json({ ok: false, error: 'Indica un email válido y una contraseña de al menos 8 caracteres.' });
+  }
+
+  let principal = null;
+  if (requestedRole === 'empleado') {
+    if (normalizedAccessCode.length < 8) {
+      return res.status(400).json({ ok: false, error: 'Introduce el código de acceso que te ha dado el principal.' });
+    }
+    try {
+      principal = await findPrincipalByEmployeeAccessCode(normalizedAccessCode);
+    } catch (error) {
+      console.error('Error buscando el código de empleado:', error.message);
+      return res.status(500).json({ ok: false, error: 'No se pudo validar el código de empleado.' });
+    }
+    if (!principal) {
+      return res.status(400).json({ ok: false, error: 'El código de empleado no es válido.' });
+    }
   }
 
   const { data, error } = await supabase.auth.signUp({
@@ -187,7 +251,7 @@ app.post('/api/auth/register', async (req, res) => {
       data: {
         full_name: typeof fullName === 'string' ? fullName.trim() : '',
         company_name: typeof companyName === 'string' ? companyName.trim() : '',
-        role: 'principal',
+        role: requestedRole,
       },
     },
   });
@@ -196,12 +260,55 @@ app.post('/api/auth/register', async (req, res) => {
     return res.status(400).json({ ok: false, error: error.message });
   }
 
+  if (data.user) {
+    const { data: updatedUser, error: metadataError } = await updateUserAppMetadata(data.user.id, {
+      role: requestedRole,
+      ...(principal ? { company_owner_id: principal.id } : {}),
+    });
+    if (metadataError) {
+      console.error('Error asignando el rol de la cuenta:', metadataError.message);
+      return res.status(500).json({ ok: false, error: 'No se pudo asignar el acceso de la cuenta.' });
+    }
+    data.user = updatedUser.user;
+
+    if (principal) {
+      const { error: codeError } = await updateUserAppMetadata(principal.id, {
+        employee_access_code_salt: null,
+        employee_access_code_hash: null,
+      });
+      if (codeError) console.error('Error invalidando el código de empleado:', codeError.message);
+    }
+  }
+
   return res.status(201).json({
     ok: true,
     user: data.user,
     session: data.session,
     requiresEmailConfirmation: !data.session,
   });
+});
+
+app.post('/api/auth/employee-access-code', requireAuth, async (req, res) => {
+  if (!isPrincipal(req.user)) {
+    return res.status(403).json({ ok: false, error: 'Solo el usuario principal puede crear códigos de empleado.' });
+  }
+
+  const accessCode = typeof req.body?.accessCode === 'string' ? req.body.accessCode.trim() : '';
+  if (accessCode.length < 8) {
+    return res.status(400).json({ ok: false, error: 'El código debe tener al menos 8 caracteres.' });
+  }
+
+  const salt = crypto.randomBytes(16).toString('hex');
+  const { error } = await updateUserAppMetadata(req.user.id, {
+    employee_access_code_salt: salt,
+    employee_access_code_hash: hashEmployeeAccessCode(accessCode, salt),
+  });
+  if (error) {
+    console.error('Error guardando el código de empleado:', error.message);
+    return res.status(500).json({ ok: false, error: 'No se pudo guardar el código de empleado.' });
+  }
+
+  return res.json({ ok: true });
 });
 
 app.post('/api/auth/login', async (req, res) => {
@@ -356,6 +463,9 @@ app.get('/stripe/cancel', (req, res) => {
 });
 
 app.post('/api/billing/checkout', requireAuth, async (req, res) => {
+  if (!isPrincipal(req.user)) {
+    return res.status(403).json({ ok: false, error: 'Solo el usuario principal puede gestionar la suscripción.' });
+  }
   const additionalUsers = Math.max(0, Math.min(50, Math.floor(Number(req.body?.additionalUsers) || 0)));
   const amount = 1089 + (additionalUsers * 303);
   const orderId = `subscription-${req.user.id}-${Date.now()}`;
