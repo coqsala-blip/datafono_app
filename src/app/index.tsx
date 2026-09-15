@@ -1,4 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { requestNeededAndroidPermissions, useStripeTerminal } from '@stripe/stripe-terminal-react-native';
 import { Camera, CameraView } from 'expo-camera';
 import * as FileSystemLegacy from 'expo-file-system/legacy';
 import * as ImagePicker from 'expo-image-picker';
@@ -7,11 +8,12 @@ import * as Print from 'expo-print';
 import * as SecureStore from 'expo-secure-store';
 import * as Sharing from 'expo-sharing';
 import * as WebBrowser from 'expo-web-browser';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Alert,
   Image,
   Modal,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -41,10 +43,11 @@ type Issuer = {
 };
 type InvoiceItem = { id: string; description: string; price: string };
 type PendingInvoice = { client: Client; items: InvoiceItem[]; ivaRate: number; total: number; docType: DocumentType };
-type StripeCheckoutPaymentResult = { paymentId: string; checkoutUrl?: string; redirectUrl?: string; qrDataUrl?: string | null };
+type StripeTerminalPaymentIntentResult = { paymentIntentId?: string; clientSecret?: string; error?: string };
 
 const configuredDocumentApiUrl = process.env.EXPO_PUBLIC_DOCUMENT_API_URL?.replace(/\/$/, '');
 const DOCUMENT_API_URL_CANDIDATES = configuredDocumentApiUrl ? [configuredDocumentApiUrl] : [];
+const STRIPE_TERMINAL_LOCATION_ID = process.env.EXPO_PUBLIC_STRIPE_TERMINAL_LOCATION_ID?.trim();
 
 const fetchWithTimeout = async (url: string, options: RequestInit = {}, timeoutMs = 1500) => {
   const controller = new AbortController();
@@ -228,9 +231,32 @@ export default function TpvScreen() {
   const [subscriptionError, setSubscriptionError] = useState('');
   const [checkoutLoading, setCheckoutLoading] = useState(false);
   const [terminalError, setTerminalError] = useState('');
-  const [paymentQrDataUrl, setPaymentQrDataUrl] = useState<string | null>(null);
-  const [paymentQrStatus, setPaymentQrStatus] = useState('PENDING');
-  const paymentQrCancelledRef = useRef(false);
+  const [terminalMessage, setTerminalMessage] = useState('Listo para cobrar con tarjeta o wallet contactless.');
+
+  const {
+    initialize,
+    isInitialized: isStripeTerminalInitialized,
+    connectedReader,
+    easyConnect,
+    retrievePaymentIntent,
+    collectPaymentMethod,
+    processPaymentIntent,
+  } = useStripeTerminal({
+    onDidRequestReaderInput: (input) => {
+      setTerminalMessage(`Acerca la tarjeta o wallet al móvil (${input.join(' / ')}).`);
+    },
+    onDidRequestReaderDisplayMessage: (message) => {
+      setTerminalMessage(String(message));
+    },
+    onDidChangeConnectionStatus: (status) => {
+      if (status === 'connected') setTerminalMessage('Lector Tap to Pay listo.');
+      if (status === 'connecting') setTerminalMessage('Preparando lector Tap to Pay...');
+      if (status === 'discovering') setTerminalMessage('Buscando compatibilidad Tap to Pay...');
+    },
+    onDidDisconnect: () => {
+      setTerminalMessage('El lector se ha desconectado. Vuelve a iniciar el cobro.');
+    },
+  });
 
   // Estados para envío al gestor por rango de fechas (Global)
   const [managerModalVisible, setManagerModalVisible] = useState(false);
@@ -597,6 +623,38 @@ export default function TpvScreen() {
       setHasPermission(status === 'granted');
     })();
   }, []);
+
+  useEffect(() => {
+    if (!accessToken) return;
+
+    (async () => {
+      try {
+        if (Platform.OS === 'android') {
+          const permissions = await requestNeededAndroidPermissions({
+            accessFineLocation: {
+              title: 'Permiso de ubicación',
+              message: 'Stripe Terminal necesita ubicación para aceptar pagos presenciales.',
+              buttonPositive: 'Aceptar',
+            },
+          });
+          if (permissions.error) {
+            setTerminalError('Stripe Terminal necesita permisos de ubicación y Bluetooth para cobrar con contacto.');
+            return;
+          }
+        }
+
+        const { error } = await initialize();
+        if (error) {
+          setTerminalError(error.message || 'No se pudo iniciar Stripe Terminal.');
+          return;
+        }
+        setTerminalError('');
+        setTerminalMessage('Listo para cobrar con tarjeta o wallet contactless.');
+      } catch (error) {
+        setTerminalError(error instanceof Error ? error.message : 'No se pudo iniciar Stripe Terminal.');
+      }
+    })();
+  }, [accessToken, initialize]);
 
   const currentIvaRate = Number(ivaPercentage) ? Number(ivaPercentage) / 100 : 0.21;
   const amount = Number(digits) / 100;
@@ -1039,12 +1097,12 @@ export default function TpvScreen() {
     setNfcModalVisible(true);
   };
 
-  const createStripeCheckoutPayment = async (paymentAmount: number, orderId: string): Promise<StripeCheckoutPaymentResult> => {
+  const createStripeTerminalPaymentIntent = async (paymentAmount: number, orderId: string): Promise<string> => {
     if (!accessToken || !configuredDocumentApiUrl) {
       throw new Error('Inicia sesión para poder cobrar con Stripe.');
     }
 
-    const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/stripe/payment`, {
+    const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/stripe/payment-intent`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -1052,38 +1110,16 @@ export default function TpvScreen() {
       },
       body: JSON.stringify({ amount: paymentAmount, orderId }),
     }, 15000);
-    const result = await response.json() as { paymentId?: string; checkoutUrl?: string; redirectUrl?: string; qrDataUrl?: string | null; error?: string };
-    if (!response.ok || !result.paymentId) {
-      throw new Error(result.error || 'Stripe no devolvió una sesión de pago.');
+    const result = await response.json() as StripeTerminalPaymentIntentResult;
+    if (!response.ok || !result.clientSecret) {
+      throw new Error(result.error || 'Stripe no devolvió un PaymentIntent para cobro presencial.');
     }
 
-    return {
-      paymentId: result.paymentId,
-      checkoutUrl: result.checkoutUrl,
-      redirectUrl: result.redirectUrl,
-      qrDataUrl: result.qrDataUrl,
-    };
-  };
-
-  const waitForStripePayment = async (paymentId: string) => {
-    let status = 'PENDING';
-    for (let attempt = 0; attempt < 45 && (status === 'PENDING' || status === 'PROCESSING') && !paymentQrCancelledRef.current; attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-      if (paymentQrCancelledRef.current) return status;
-      const statusResponse = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/stripe/payment/${encodeURIComponent(paymentId)}`, {
-        headers: { Authorization: `Bearer ${accessToken}` },
-      }, 10000);
-      const statusResult = await statusResponse.json() as { status?: string; error?: string };
-      if (!statusResponse.ok) throw new Error(statusResult.error || 'No se pudo confirmar el pago Stripe.');
-      status = statusResult.status || 'PENDING';
-      setPaymentQrStatus(status);
-    }
-    return status;
+    return result.clientSecret;
   };
 
   const createTransactionFromConfirmedPayment = (method: string, paymentAmount: number) => {
     setNfcModalVisible(false);
-    setPaymentQrDataUrl(null);
 
     if (pendingInvoice) {
       createTransaction(
@@ -1104,6 +1140,33 @@ export default function TpvScreen() {
     }
   };
 
+  const ensureTapToPayReader = async () => {
+    if (!STRIPE_TERMINAL_LOCATION_ID) {
+      throw new Error('Falta EXPO_PUBLIC_STRIPE_TERMINAL_LOCATION_ID. Añade el ID de ubicación de Stripe Terminal.');
+    }
+
+    if (!isStripeTerminalInitialized) {
+      setTerminalMessage('Inicializando Stripe Terminal...');
+      const { error } = await initialize();
+      if (error) throw new Error(error.message || 'No se pudo iniciar Stripe Terminal.');
+    }
+
+    if (connectedReader) return connectedReader;
+
+    setTerminalMessage('Conectando lector Tap to Pay...');
+    const connectionResult = await easyConnect({
+      discoveryMethod: 'tapToPay',
+      locationId: STRIPE_TERMINAL_LOCATION_ID,
+      merchantDisplayName: issuer.name,
+      autoReconnectOnUnexpectedDisconnect: true,
+    });
+    if (connectionResult.error) {
+      throw new Error(connectionResult.error.message || 'No se pudo conectar Tap to Pay.');
+    }
+
+    return connectionResult.reader;
+  };
+
   const completePayment = async () => {
     if (!accessToken || !configuredDocumentApiUrl) {
       Alert.alert('Sesión requerida', 'Inicia sesión para poder cobrar con Stripe.');
@@ -1111,27 +1174,39 @@ export default function TpvScreen() {
     }
 
     const paymentAmount = pendingInvoice ? pendingInvoice.total : amount;
-    const orderId = `stripe-checkout-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    paymentQrCancelledRef.current = false;
-    setPaymentQrStatus('PENDING');
+    const orderId = `stripe-terminal-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     setIsProcessing(true);
     setTerminalError('');
+    setTerminalMessage('Preparando cobro contactless...');
 
     try {
-      const result = await createStripeCheckoutPayment(paymentAmount, orderId);
-      const checkoutUrl = result.checkoutUrl || result.redirectUrl;
-      if (!checkoutUrl) throw new Error('Stripe no devolvió una URL de Checkout.');
-
-      await WebBrowser.openBrowserAsync(checkoutUrl);
-      const status = await waitForStripePayment(result.paymentId);
-
-      if (paymentQrCancelledRef.current) return;
-      if (status !== 'SUCCEEDED') {
-        Alert.alert('Pago no confirmado', `Stripe ha devuelto el estado ${status}. No se ha creado el ticket.`);
-        return;
+      await ensureTapToPayReader();
+      const clientSecret = await createStripeTerminalPaymentIntent(paymentAmount, orderId);
+      const retrievedResult = await retrievePaymentIntent(clientSecret);
+      if (retrievedResult.error || !retrievedResult.paymentIntent) {
+        throw new Error(retrievedResult.error?.message || 'No se pudo preparar el cobro presencial.');
       }
 
-      createTransactionFromConfirmedPayment('Stripe Checkout - Tarjeta', paymentAmount);
+      setTerminalMessage('Acerca la tarjeta, Google Pay, Apple Pay o Samsung Pay al móvil.');
+      const collectedResult = await collectPaymentMethod({
+        paymentIntent: retrievedResult.paymentIntent,
+        customerCancellation: 'disableIfAvailable',
+      });
+      if (collectedResult.error || !collectedResult.paymentIntent) {
+        throw new Error(collectedResult.error?.message || 'No se pudo leer la tarjeta o wallet.');
+      }
+
+      setTerminalMessage('Procesando pago contactless...');
+      const processedResult = await processPaymentIntent({ paymentIntent: collectedResult.paymentIntent });
+      if (processedResult.error || !processedResult.paymentIntent) {
+        throw new Error(processedResult.error?.message || 'No se pudo confirmar el cobro presencial.');
+      }
+      if (processedResult.paymentIntent.status !== 'succeeded') {
+        throw new Error(`Stripe Terminal devolvió el estado ${processedResult.paymentIntent.status || 'desconocido'}.`);
+      }
+
+      setTerminalMessage('Pago aprobado. Generando ticket...');
+      createTransactionFromConfirmedPayment('Stripe Terminal - Contactless', paymentAmount);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'No se pudo completar el cobro presencial.';
       setTerminalError(message);
@@ -1141,48 +1216,8 @@ export default function TpvScreen() {
     }
   };
 
-  const completePaymentQr = async () => {
-    if (!accessToken || !configuredDocumentApiUrl) {
-      Alert.alert('Sesión requerida', 'Inicia sesión para poder cobrar con Stripe.');
-      return;
-    }
-
-    const paymentAmount = pendingInvoice ? pendingInvoice.total : amount;
-    const orderId = `stripe-qr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    paymentQrCancelledRef.current = false;
-    setTerminalError('');
-
-    try {
-      const result = await createStripeCheckoutPayment(paymentAmount, orderId);
-      if (!result.qrDataUrl) {
-        throw new Error('Stripe no devolvió una página de pago para generar el QR.');
-      }
-
-      setPaymentQrDataUrl(result.qrDataUrl);
-      setPaymentQrStatus('PENDING');
-      const status = await waitForStripePayment(result.paymentId);
-
-      if (paymentQrCancelledRef.current) return;
-
-      if (status !== 'SUCCEEDED') {
-        Alert.alert('Pago no confirmado', `Stripe ha devuelto el estado ${status}. No se ha creado el ticket.`);
-        return;
-      }
-
-      createTransactionFromConfirmedPayment('Stripe Checkout - QR', paymentAmount);
-    } catch (error) {
-      if (!paymentQrCancelledRef.current) {
-        setPaymentQrDataUrl(null);
-        Alert.alert('Error de pago Stripe', error instanceof Error ? error.message : 'No se pudo completar el cobro.');
-      }
-    }
-  };
-
   const cancelPayment = () => {
-    paymentQrCancelledRef.current = true;
     setNfcModalVisible(false);
-    setPaymentQrDataUrl(null);
-    setPaymentQrStatus('PENDING');
     setPendingInvoice(null);
   };
 
@@ -2874,42 +2909,23 @@ export default function TpvScreen() {
         </View>
       </Modal>
 
-      {/* MODAL: SELECCIÓN DE MÉTODO DE COBRO (NFC / QR) */}
+      {/* MODAL: COBRO CONTACTLESS CON STRIPE TERMINAL */}
       <Modal visible={nfcModalVisible} animationType="fade" transparent={true}>
         <View style={styles.modalOverlay}>
-          <View style={[styles.modalContent, paymentQrDataUrl ? { alignItems: 'center' } : null]}>
-            <Text style={styles.modalTitle}>{paymentQrDataUrl ? '📲 ESCANEA PARA PAGAR' : '💳 SELECCIONA EL MÉTODO DE COBRO'}</Text>
+          <View style={styles.modalContent}>
+            <Text style={styles.modalTitle}>💳 COBRO CONTACTLESS</Text>
             <Text style={styles.modalSubtitle}>Importe total a cobrar: {formatCurrency(pendingInvoice ? pendingInvoice.total : amount)}</Text>
-
-            {paymentQrDataUrl ? (
-              <>
-                <Text style={[styles.modalSubtitle, { marginBottom: 8 }]}>El cliente debe escanear este QR con su móvil para abrir el pago Stripe.</Text>
-                <Image
-                  source={{ uri: paymentQrDataUrl }}
-                  style={{ width: 260, height: 260, marginVertical: 8 }}
-                />
-                <Text style={[styles.modalSubtitle, { color: paymentQrStatus === 'PENDING' ? '#b45309' : '#166534', fontWeight: 'bold' }]}>Estado: {paymentQrStatus}</Text>
-              </>
-            ) : null}
+            <Text style={[styles.modalSubtitle, { marginBottom: 8 }]}>Acepta tarjeta física sin contacto y wallets NFC como Google Pay, Apple Pay o Samsung Pay acercándolos a este móvil.</Text>
+            <Text style={[styles.modalSubtitle, { color: terminalError ? '#b91c1c' : '#166534', fontWeight: 'bold' }]}>{terminalMessage}</Text>
 
             {terminalError ? <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 10, textAlign: 'center' }}>{terminalError}</Text> : null}
 
-            {!paymentQrDataUrl ? (
-              <View style={{ gap: 10, marginTop: 15 }}>
-                <Pressable style={[styles.primaryButton, { backgroundColor: '#64748b' }]} onPress={completePayment}>
-                  <Text style={styles.primaryButtonText}>
-                    💳 1. Tarjeta con Stripe Checkout
-                  </Text>
-                </Pressable>
-
-                <Pressable style={[styles.primaryButton, { backgroundColor: '#0284c7' }]} onPress={completePaymentQr}>
-                  <Text style={styles.primaryButtonText}>📲 2. Cobrar con Stripe QR</Text>
-                </Pressable>
-              </View>
-            ) : null}
+            <Pressable style={[styles.primaryButton, { backgroundColor: '#0f766e', marginTop: 15 }]} onPress={completePayment} disabled={isProcessing}>
+              <Text style={styles.primaryButtonText}>{isProcessing ? 'Procesando...' : 'Cobrar acercando tarjeta o móvil'}</Text>
+            </Pressable>
 
             <Pressable style={[styles.secondaryButton, { marginTop: 12 }]} onPress={cancelPayment}>
-              <Text style={styles.secondaryButtonText}>{paymentQrDataUrl ? 'Cancelar pago' : 'Cancelar'}</Text>
+              <Text style={styles.secondaryButtonText}>Cancelar</Text>
             </Pressable>
           </View>
         </View>

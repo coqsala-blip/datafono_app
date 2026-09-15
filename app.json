@@ -15,6 +15,18 @@
       "expo-mail-composer",
       "expo-secure-store",
       [
+        "@stripe/stripe-terminal-react-native",
+        {
+          "bluetoothBackgroundMode": true,
+          "locationWhenInUsePermission": "Stripe Terminal necesita ubicación para aceptar pagos presenciales.",
+          "bluetoothPeripheralPermission": "Stripe Terminal necesita Bluetooth para conectar lectores de tarjeta compatibles.",
+          "bluetoothAlwaysUsagePermission": "Stripe Terminal usa Bluetooth para conectar lectores de tarjeta compatibles.",
+          "localNetworkUsagePermission": "Stripe Terminal usa la red local para conectar lectores compatibles.",
+          "appDelegate": true,
+          "tapToPayCheck": true
+        }
+      ],
+      [
         "expo-build-properties",
         {
           "android": {
