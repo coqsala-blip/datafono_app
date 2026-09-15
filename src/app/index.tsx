@@ -213,7 +213,7 @@ export default function TpvScreen() {
   const [userPermissionsModalVisible, setUserPermissionsModalVisible] = useState(false);
   const [pendingRefund, setPendingRefund] = useState<{ ticket: Transaction; amount: number } | null>(null);
   const [ivaPercentage, setIvaPercentage] = useState('21');
-  const [activeTab, setActiveTab] = useState<Tab>('gastos_facturacion');
+  const [activeTab, setActiveTab] = useState<Tab>('tpv');
   const [isProcessing, setIsProcessing] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedTicket, setSelectedTicket] = useState<Transaction | null>(null);
