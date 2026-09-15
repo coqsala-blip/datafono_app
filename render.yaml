@@ -16,5 +16,11 @@ services:
         sync: false
       - key: SUPABASE_SECRET_KEY
         sync: false
-      - key: MONEI_API_KEY
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_MAIN_SUBSCRIPTION_PRICE_ID
+        sync: false
+      - key: STRIPE_ADDITIONAL_USER_PRICE_ID
         sync: false

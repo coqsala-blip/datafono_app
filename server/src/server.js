@@ -2,12 +2,23 @@ require('dotenv').config();
 const express = require('express');
 const crypto = require('crypto');
 const QRCode = require('qrcode');
+const Stripe = require('stripe');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
 const PUBLIC_API_URL = (process.env.PUBLIC_API_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
 const NODE_ENV = process.env.NODE_ENV || 'development';
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+const STRIPE_MAIN_SUBSCRIPTION_PRICE_ID = process.env.STRIPE_MAIN_SUBSCRIPTION_PRICE_ID;
+const STRIPE_ADDITIONAL_USER_PRICE_ID = process.env.STRIPE_ADDITIONAL_USER_PRICE_ID;
+const stripe = STRIPE_SECRET_KEY ? Stripe(STRIPE_SECRET_KEY) : null;
+const stripeCurrency = 'eur';
+const stripePaymentMethodTypes = (process.env.STRIPE_PAYMENT_METHOD_TYPES || 'card')
+  .split(',')
+  .map((method) => method.trim())
+  .filter(Boolean);
 
 try {
   const publicApiUrl = new URL(PUBLIC_API_URL);
@@ -20,83 +31,67 @@ try {
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
 
-const moneiRequest = async (path, method, body) => {
-  if (!process.env.MONEI_API_KEY) {
-    throw new Error('MONEI_API_KEY no está configurada en el backend.');
+const requireStripe = () => {
+  if (!stripe) {
+    throw new Error('STRIPE_SECRET_KEY no está configurada en el backend.');
   }
-
-  const response = await fetch(`https://api.monei.com/v1${path}`, {
-    method,
-    headers: {
-      Authorization: process.env.MONEI_API_KEY,
-      'Content-Type': 'application/json',
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const result = await response.json();
-  if (!response.ok) {
-    throw new Error(result.message || result.error?.message || 'MONEI API error');
-  }
-  return result;
+  return stripe;
 };
 
-const verifyMoneiSignature = (rawBody, signature) => {
-  if (!process.env.MONEI_API_KEY || typeof signature !== 'string') return false;
-  const values = Object.fromEntries(signature.split(',').map((part) => part.split('=')));
-  if (!values.t || !values.v1) return false;
-  const signedPayload = `${values.t}.${rawBody}`;
-  const expected = crypto.createHmac('sha256', process.env.MONEI_API_KEY).update(signedPayload).digest('hex');
-  if (expected.length !== values.v1.length) return false;
-  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(values.v1));
+const updateUserMetadata = async (userId, metadata) => {
+  const { data } = await supabase.auth.admin.getUserById(userId);
+  const currentMetadata = data?.user?.user_metadata || {};
+  return supabase.auth.admin.updateUserById(userId, {
+    user_metadata: {
+      ...currentMetadata,
+      ...metadata,
+    },
+  });
+};
+
+const normalizeStripePaymentStatus = (session) => {
+  if (session.payment_status === 'paid') return 'SUCCEEDED';
+  if (session.status === 'expired') return 'EXPIRED';
+  if (session.status === 'complete') return 'PROCESSING';
+  return 'PENDING';
 };
 
 app.set('trust proxy', 1);
-app.post('/api/monei/callback', express.raw({ type: 'application/json' }), (req, res) => {
-  const rawBody = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : '';
-  const signature = req.headers['monei-signature'];
-
-  if (!rawBody.trim() || rawBody.trim() === '{}') {
-    return res.status(200).json({ received: true });
-  }
-
-  if (!signature) {
-    return res.status(200).json({ received: true });
-  }
-
-  if (!verifyMoneiSignature(rawBody, signature)) {
-    console.warn('Callback MONEI recibido con firma no verificable; se ignora el contenido.');
-    return res.status(200).json({ received: true });
-  }
-
-  let payment;
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  let event;
   try {
-    payment = JSON.parse(rawBody);
-  } catch {
-    return res.status(200).json({ received: true });
+    const stripeClient = requireStripe();
+    const signature = req.headers['stripe-signature'];
+    event = STRIPE_WEBHOOK_SECRET
+      ? stripeClient.webhooks.constructEvent(req.body, signature, STRIPE_WEBHOOK_SECRET)
+      : JSON.parse(req.body.toString('utf8'));
+  } catch (error) {
+    console.error('Webhook Stripe no válido:', error.message);
+    return res.status(400).json({ ok: false, error: 'Webhook Stripe no válido.' });
   }
-  const resource = payment.object || payment;
-  const status = resource.status || payment.type || 'UNKNOWN';
-  console.log('MONEI callback recibido:', resource.id, status);
-  const subscriptionId = resource.subscriptionId || resource.subscription?.id || resource.id;
-  const userId = resource.metadata?.supabase_user_id || resource.metadata?.user_id;
-  if (userId && subscriptionId) {
-    void supabase.auth.admin.updateUserById(userId, {
-      user_metadata: {
-        subscription_provider: 'monei',
-        monei_subscription_id: subscriptionId,
-        monei_subscription_status: status,
-        monei_subscription_updated_at: new Date().toISOString(),
-      },
-    }).catch((error) => console.error('Error guardando estado de suscripción MONEI:', error.message));
+
+  if (event.type === 'checkout.session.completed' || event.type === 'checkout.session.async_payment_succeeded') {
+    const session = event.data.object;
+    const userId = session.metadata?.supabase_user_id;
+    if (userId && session.mode === 'subscription') {
+      await updateUserMetadata(userId, {
+        subscription_provider: 'stripe',
+        stripe_customer_id: session.customer || null,
+        stripe_subscription_id: session.subscription || null,
+        stripe_subscription_status: 'active',
+        stripe_subscription_updated_at: new Date().toISOString(),
+      }).catch((error) => console.error('Error guardando estado de suscripción Stripe:', error.message));
+    }
   }
+
   return res.status(200).json({ received: true });
 });
 
-app.get('/api/monei/callback', (req, res) => {
-  res.status(200).json({ ok: true, service: 'MONEI callback' });
+app.get('/api/stripe/webhook', (req, res) => {
+  res.status(200).json({ ok: true, service: 'Stripe webhook' });
 });
 
-app.use(express.json());
+app.use(express.json({ limit: '5mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 if (NODE_ENV === 'production') {
@@ -133,24 +128,47 @@ const requireAuth = async (req, res, next) => {
   return next();
 };
 
-app.get('/api/billing/status', requireAuth, (req, res) => {
-  const status = req.user.user_metadata?.monei_subscription_status || 'missing';
-  const activeStatuses = new Set([
-    'ACTIVE',
-    'TRIALING',
-    'SUCCEEDED',
-    'active',
-    'trialing',
-    'succeeded',
-    'subscription.activated',
-    'subscription.updated',
-  ]);
+app.get('/api/billing/status', requireAuth, async (req, res) => {
+  let status = req.user.user_metadata?.stripe_subscription_status || 'missing';
+  let subscriptionId = req.user.user_metadata?.stripe_subscription_id || null;
+  const checkoutSessionId = req.user.user_metadata?.stripe_checkout_session_id || null;
+
+  try {
+    if (stripe && subscriptionId) {
+      const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+      status = subscription.status || status;
+      await updateUserMetadata(req.user.id, {
+        stripe_subscription_status: status,
+        stripe_subscription_updated_at: new Date().toISOString(),
+      });
+    } else if (stripe && checkoutSessionId) {
+      const session = await stripe.checkout.sessions.retrieve(checkoutSessionId);
+      if (session.subscription) {
+        subscriptionId = typeof session.subscription === 'string' ? session.subscription : session.subscription.id;
+        const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+        status = subscription.status || status;
+        await updateUserMetadata(req.user.id, {
+          subscription_provider: 'stripe',
+          stripe_customer_id: session.customer || null,
+          stripe_subscription_id: subscriptionId,
+          stripe_subscription_status: status,
+          stripe_subscription_updated_at: new Date().toISOString(),
+        });
+      } else {
+        status = session.status || status;
+      }
+    }
+  } catch (error) {
+    console.error('Error consultando suscripción Stripe:', error.message);
+  }
+
+  const activeStatuses = new Set(['active', 'trialing']);
   return res.json({
     ok: true,
-    provider: 'monei',
+    provider: 'stripe',
     active: activeStatuses.has(status),
     status,
-    subscriptionId: req.user.user_metadata?.monei_subscription_id || null,
+    subscriptionId,
   });
 });
 
@@ -210,7 +228,46 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
   res.json({ ok: true, user: req.user });
 });
 
-app.post('/api/monei/payment', requireAuth, async (req, res) => {
+app.post('/api/stripe/terminal/connection-token', requireAuth, async (req, res) => {
+  try {
+    const token = await requireStripe().terminal.connectionTokens.create();
+    return res.status(201).json({ ok: true, secret: token.secret });
+  } catch (error) {
+    console.error('Error creando token Stripe Terminal:', error.message);
+    return res.status(502).json({ ok: false, error: `Stripe Terminal: ${error.message}` });
+  }
+});
+
+app.post('/api/stripe/payment-intent', requireAuth, async (req, res) => {
+  const amountNumber = typeof req.body?.amount === 'string'
+    ? Number(req.body.amount.replace(',', '.'))
+    : Number(req.body?.amount);
+  const amount = Math.round(amountNumber * 100);
+  const orderId = typeof req.body?.orderId === 'string' ? req.body.orderId.trim() : '';
+
+  if (!Number.isFinite(amountNumber) || !Number.isInteger(amount) || amount < 50 || amount > 99999999) {
+    return res.status(400).json({ ok: false, error: 'Importe no válido. Usa al menos 0,50 €.' });
+  }
+
+  try {
+    const paymentIntent = await requireStripe().paymentIntents.create({
+      amount,
+      currency: stripeCurrency,
+      payment_method_types: ['card_present'],
+      capture_method: 'automatic',
+      metadata: {
+        supabase_user_id: req.user.id,
+        order_id: orderId,
+      },
+    });
+    return res.status(201).json({ ok: true, paymentIntentId: paymentIntent.id, clientSecret: paymentIntent.client_secret });
+  } catch (error) {
+    console.error('Error creando PaymentIntent Stripe Terminal:', error.message);
+    return res.status(502).json({ ok: false, error: `Stripe Terminal: ${error.message}` });
+  }
+});
+
+app.post('/api/stripe/payment', requireAuth, async (req, res) => {
   const amountNumber = typeof req.body?.amount === 'string'
     ? Number(req.body.amount.replace(',', '.'))
     : Number(req.body?.amount);
@@ -225,51 +282,76 @@ app.post('/api/monei/payment', requireAuth, async (req, res) => {
   }
 
   try {
-    const payment = await moneiRequest('/payments', 'POST', {
-      amount,
-      currency: 'EUR',
-      orderId,
-      description: `TPV - ${orderId}`,
-      callbackUrl: `${PUBLIC_API_URL}/api/monei/callback`,
-      completeUrl: `${PUBLIC_API_URL}/monei/complete?orderId=${encodeURIComponent(orderId)}`,
-      cancelUrl: `${PUBLIC_API_URL}/monei/cancel?orderId=${encodeURIComponent(orderId)}`,
+    const session = await requireStripe().checkout.sessions.create({
+      mode: 'payment',
+      payment_method_types: stripePaymentMethodTypes,
+      line_items: [
+        {
+          quantity: 1,
+          price_data: {
+            currency: stripeCurrency,
+            unit_amount: amount,
+            product_data: {
+              name: `TPV - ${orderId}`,
+            },
+          },
+        },
+      ],
+      metadata: {
+        supabase_user_id: req.user.id,
+        order_id: orderId,
+      },
+      payment_intent_data: {
+        metadata: {
+          supabase_user_id: req.user.id,
+          order_id: orderId,
+        },
+      },
+      success_url: `${PUBLIC_API_URL}/stripe/complete?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${PUBLIC_API_URL}/stripe/cancel?orderId=${encodeURIComponent(orderId)}`,
     });
 
-    const redirectUrl = payment.nextAction?.redirectUrl ||
-      payment.redirectUrl ||
-      payment.checkoutUrl ||
-      payment.url;
+    const redirectUrl = session.url;
     const qrDataUrl = redirectUrl
       ? await QRCode.toDataURL(redirectUrl, { width: 420, margin: 2 })
       : null;
 
     return res.status(201).json({
       ok: true,
-      paymentId: payment.id,
+      paymentId: session.id,
       redirectUrl,
+      checkoutUrl: redirectUrl,
       qrDataUrl,
     });
   } catch (error) {
-    console.error('Error creando pago MONEI:', error.message);
-    return res.status(502).json({ ok: false, error: `MONEI: ${error.message}` });
+    console.error('Error creando pago Stripe:', error.message);
+    return res.status(502).json({ ok: false, error: `Stripe: ${error.message}` });
   }
 });
 
-app.get('/api/monei/payment/:paymentId', requireAuth, async (req, res) => {
+app.get('/api/stripe/payment/:paymentId', requireAuth, async (req, res) => {
   try {
-    const payment = await moneiRequest(`/payments/${encodeURIComponent(req.params.paymentId)}`, 'GET');
-    return res.json({ ok: true, paymentId: payment.id, status: payment.status });
+    const session = await requireStripe().checkout.sessions.retrieve(req.params.paymentId);
+    return res.json({
+      ok: true,
+      paymentId: session.id,
+      status: normalizeStripePaymentStatus(session),
+      checkoutStatus: session.status,
+      paymentStatus: session.payment_status,
+      amount: session.amount_total,
+      currency: session.currency,
+    });
   } catch (error) {
-    console.error('Error consultando pago MONEI:', error.message);
-    return res.status(502).json({ ok: false, error: 'No se pudo consultar el estado del pago MONEI.' });
+    console.error('Error consultando pago Stripe:', error.message);
+    return res.status(502).json({ ok: false, error: 'No se pudo consultar el estado del pago Stripe.' });
   }
 });
 
-app.get('/monei/complete', (req, res) => {
-  res.type('html').send('<h1>Pago recibido</h1><p>Puedes volver a la aplicación. El estado definitivo se confirma con MONEI.</p>');
+app.get('/stripe/complete', (req, res) => {
+  res.type('html').send('<h1>Pago recibido</h1><p>Puedes volver a la aplicación. El estado definitivo se confirma con Stripe.</p>');
 });
 
-app.get('/monei/cancel', (req, res) => {
+app.get('/stripe/cancel', (req, res) => {
   res.type('html').send('<h1>Pago cancelado</h1><p>Puedes volver a la aplicación e intentarlo de nuevo.</p>');
 });
 
@@ -278,58 +360,68 @@ app.post('/api/billing/checkout', requireAuth, async (req, res) => {
   const amount = 1089 + (additionalUsers * 303);
   const orderId = `subscription-${req.user.id}-${Date.now()}`;
 
+  if (!STRIPE_MAIN_SUBSCRIPTION_PRICE_ID) {
+    return res.status(500).json({ ok: false, error: 'STRIPE_MAIN_SUBSCRIPTION_PRICE_ID no está configurado en el backend.' });
+  }
+
+  if (additionalUsers > 0 && !STRIPE_ADDITIONAL_USER_PRICE_ID) {
+    return res.status(500).json({ ok: false, error: 'STRIPE_ADDITIONAL_USER_PRICE_ID no está configurado en el backend.' });
+  }
+
+  const lineItems = [
+    {
+      price: STRIPE_MAIN_SUBSCRIPTION_PRICE_ID,
+      quantity: 1,
+    },
+  ];
+
+  if (additionalUsers > 0) {
+    lineItems.push({
+      price: STRIPE_ADDITIONAL_USER_PRICE_ID,
+      quantity: additionalUsers,
+    });
+  }
+
   try {
-    const subscription = await moneiRequest('/subscriptions', 'POST', {
-      amount,
-      currency: 'EUR',
-      interval: 'month',
-      intervalCount: 1,
-      orderId,
-      description: `TPV Gestor - suscripción - ${additionalUsers} empleados`,
-      customer: {
-        email: req.user.email,
-      },
+    const session = await requireStripe().checkout.sessions.create({
+      mode: 'subscription',
+      customer_email: req.user.email,
+      line_items: lineItems,
       metadata: {
         supabase_user_id: req.user.id,
         additional_users: String(additionalUsers),
         total_monthly_cents: String(amount),
       },
-      callbackUrl: `${PUBLIC_API_URL}/api/monei/callback`,
-      paymentCallbackUrl: `${PUBLIC_API_URL}/api/monei/callback`,
-    });
-
-    const subscriptionId = subscription.id || subscription.subscriptionId;
-    if (!subscriptionId) {
-      throw new Error('MONEI no devolvió el identificador de la suscripción.');
-    }
-
-    const activation = await moneiRequest(`/subscriptions/${encodeURIComponent(subscriptionId)}/activate`, 'POST', {
-      completeUrl: `${PUBLIC_API_URL}/billing/success?orderId=${encodeURIComponent(orderId)}`,
-    });
-
-    await supabase.auth.admin.updateUserById(req.user.id, {
-      user_metadata: {
-        ...req.user.user_metadata,
-        subscription_provider: 'monei',
-        monei_subscription_id: subscriptionId || null,
-        monei_subscription_status: subscription.status || 'PENDING',
-        monei_subscription_additional_users: String(additionalUsers),
-        monei_subscription_amount_cents: String(amount),
+      subscription_data: {
+        metadata: {
+          supabase_user_id: req.user.id,
+          additional_users: String(additionalUsers),
+          total_monthly_cents: String(amount),
+        },
       },
+      success_url: `${PUBLIC_API_URL}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${PUBLIC_API_URL}/billing/cancelled?orderId=${encodeURIComponent(orderId)}`,
     });
 
-    const checkoutUrl = activation.nextAction?.redirectUrl || activation.redirectUrl || activation.checkoutUrl || activation.url;
+    await updateUserMetadata(req.user.id, {
+      subscription_provider: 'stripe',
+      stripe_checkout_session_id: session.id,
+      stripe_subscription_status: 'checkout_created',
+      stripe_subscription_additional_users: String(additionalUsers),
+      stripe_subscription_amount_cents: String(amount),
+    });
+
     return res.status(201).json({
       ok: true,
-      subscriptionId,
-      checkoutUrl,
-      redirectUrl: checkoutUrl,
+      checkoutSessionId: session.id,
+      checkoutUrl: session.url,
+      redirectUrl: session.url,
       amount,
       additionalUsers,
     });
   } catch (error) {
-    console.error('Error creando suscripción MONEI:', error.message);
-    return res.status(502).json({ ok: false, error: `MONEI: ${error.message}` });
+    console.error('Error creando suscripción Stripe:', error.message);
+    return res.status(502).json({ ok: false, error: `Stripe: ${error.message}` });
   }
 });
 
@@ -450,11 +542,11 @@ app.get('/api/documents/:token', async (req, res) => {
 });
 
 app.post('/api/companies', async (req, res) => {
-  res.status(503).json({ ok: false, error: 'El alta de suscripciones MONEI todavía no está configurada.' });
+  res.status(503).json({ ok: false, error: 'Usa /api/billing/checkout para crear suscripciones con Stripe.' });
 });
 
 app.post('/api/subscriptions/create', async (req, res) => {
-  res.status(503).json({ ok: false, error: 'Las suscripciones MONEI todavía no están configuradas.' });
+  res.status(503).json({ ok: false, error: 'Usa /api/billing/checkout para crear suscripciones con Stripe.' });
 });
 
 app.post('/api/companies/:companyId/users', async (req, res) => {

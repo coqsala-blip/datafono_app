@@ -41,6 +41,7 @@ type Issuer = {
 };
 type InvoiceItem = { id: string; description: string; price: string };
 type PendingInvoice = { client: Client; items: InvoiceItem[]; ivaRate: number; total: number; docType: DocumentType };
+type StripeCheckoutPaymentResult = { paymentId: string; checkoutUrl?: string; redirectUrl?: string; qrDataUrl?: string | null };
 
 const configuredDocumentApiUrl = process.env.EXPO_PUBLIC_DOCUMENT_API_URL?.replace(/\/$/, '');
 const DOCUMENT_API_URL_CANDIDATES = configuredDocumentApiUrl ? [configuredDocumentApiUrl] : [];
@@ -181,19 +182,6 @@ const formatCurrency = (amount: number) =>
 
 const formatDate = (isoDate: string) =>
   new Intl.DateTimeFormat('es-ES', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(isoDate));
-
-type PhysicalPaymentResult = {
-  status: 'unsupported';
-  message: string;
-};
-
-async function processPhysicalPaymentMock(amount: number): Promise<PhysicalPaymentResult> {
-  void amount;
-  return {
-    status: 'unsupported',
-    message: 'MONEI Pay presencial queda pendiente del SDK oficial de MONEI y sus credenciales de prueba.',
-  };
-}
 
 export default function TpvScreen() {
   const [digits, setDigits] = useState('0');
@@ -504,7 +492,7 @@ export default function TpvScreen() {
       const result = await response.json() as { checkoutUrl?: string; redirectUrl?: string; url?: string; error?: string };
       const checkoutUrl = result.checkoutUrl || result.redirectUrl || result.url;
       if (!response.ok || !checkoutUrl) {
-        const errorMessage = result.error || `MONEI no devolvió una URL de pago (HTTP ${response.status}).`;
+        const errorMessage = result.error || `Stripe no devolvió una URL de pago (HTTP ${response.status}).`;
         setSubscriptionError(errorMessage);
         Alert.alert('No se pudo abrir la suscripción', errorMessage);
         return;
@@ -518,12 +506,12 @@ export default function TpvScreen() {
       setHasActiveSubscription(Boolean(statusResult.active));
       setSubscriptionStatus(statusResult.status || 'missing');
       if (!statusResult.active) {
-        setSubscriptionError('El pago todavía no aparece activo. Cierra la página de MONEI y vuelve a comprobarlo en unos segundos.');
+        setSubscriptionError('El pago todavía no aparece activo. Cierra la página de Stripe y vuelve a comprobarlo en unos segundos.');
       }
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'No se pudo completar la conexión con MONEI.';
+      const errorMessage = error instanceof Error ? error.message : 'No se pudo completar la conexión con Stripe.';
       setSubscriptionError(errorMessage);
-      Alert.alert('Error de suscripción MONEI', errorMessage);
+      Alert.alert('Error de suscripción Stripe', errorMessage);
     } finally {
       setCheckoutLoading(false);
     }
@@ -866,6 +854,12 @@ export default function TpvScreen() {
   );
 
   async function registerTransactionDocument(transaction: Transaction): Promise<Transaction> {
+    if (DOCUMENT_API_URL_CANDIDATES.length === 0) {
+      const error = new Error('No hay una URL de backend configurada en la aplicación.');
+      setTerminalError(error.message);
+      return transaction;
+    }
+
     const logoDataUrl = transaction.issuer.logoUri
       ? await convertImageToBase64(transaction.issuer.logoUri)
       : undefined;
@@ -880,9 +874,8 @@ export default function TpvScreen() {
       },
     });
 
-    const attempts = DOCUMENT_API_URL_CANDIDATES.map(async (baseUrl) => {
-      let lastError: unknown;
-
+    let lastError: unknown;
+    for (const baseUrl of DOCUMENT_API_URL_CANDIDATES) {
       for (let attempt = 0; attempt < 3; attempt += 1) {
         try {
           const response = await fetchWithTimeout(`${baseUrl}/api/documents`, {
@@ -899,41 +892,34 @@ export default function TpvScreen() {
             } catch {
               // Mantener el error HTTP si el backend no devuelve JSON.
             }
-            throw new Error(errorMessage);
+            throw new Error(`${baseUrl}: ${errorMessage}`);
           }
 
           const result = await response.json() as { publicUrl?: string };
           if (!result.publicUrl) {
-            throw new Error('No se recibió una URL pública del backend.');
+            throw new Error(`${baseUrl}: el backend no devolvió una URL pública.`);
           }
 
           const publishedTransaction = { ...transaction, publicUrl: result.publicUrl };
-
           setTransactions((current) => current.map((item) =>
             item.id === transaction.id ? publishedTransaction : item
           ));
           setSelectedTicket((current) =>
             current?.id === transaction.id ? publishedTransaction : current
           );
+          setTerminalError('');
           return publishedTransaction;
         } catch (error) {
           lastError = error;
-          if (attempt < 2) {
-            await new Promise((resolve) => setTimeout(resolve, 1000));
-          }
+          if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 1000));
         }
       }
-
-      throw lastError instanceof Error ? lastError : new Error('No se pudo publicar el documento.');
-    });
-
-    try {
-      return await Promise.any(attempts);
-    } catch (error) {
-      console.warn('No se pudo publicar el documento con ninguna URL disponible; se mantiene sin QR.', error);
-      setTerminalError(error instanceof Error ? `No se pudo publicar el documento: ${error.message}` : 'No se pudo publicar el documento.');
-      return transaction;
     }
+
+    const errorMessage = lastError instanceof Error ? lastError.message : 'No se pudo publicar el documento.';
+    console.warn('No se pudo publicar el documento; se mantiene sin QR.', errorMessage);
+    setTerminalError(`No se pudo publicar el documento: ${errorMessage}`);
+    return transaction;
   }
 
   const handleKey = useCallback((key: string) => {
@@ -954,6 +940,7 @@ export default function TpvScreen() {
     }
 
     setIsProcessing(true);
+    setTerminalError('');
     const createdAt = new Date().toISOString();
     const randomSuffix = Math.random().toString(36).slice(2, 6).toUpperCase();
     const id = `${Date.now()}-${randomSuffix}`;
@@ -1052,86 +1039,141 @@ export default function TpvScreen() {
     setNfcModalVisible(true);
   };
 
+  const createStripeCheckoutPayment = async (paymentAmount: number, orderId: string): Promise<StripeCheckoutPaymentResult> => {
+    if (!accessToken || !configuredDocumentApiUrl) {
+      throw new Error('Inicia sesión para poder cobrar con Stripe.');
+    }
+
+    const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/stripe/payment`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify({ amount: paymentAmount, orderId }),
+    }, 15000);
+    const result = await response.json() as { paymentId?: string; checkoutUrl?: string; redirectUrl?: string; qrDataUrl?: string | null; error?: string };
+    if (!response.ok || !result.paymentId) {
+      throw new Error(result.error || 'Stripe no devolvió una sesión de pago.');
+    }
+
+    return {
+      paymentId: result.paymentId,
+      checkoutUrl: result.checkoutUrl,
+      redirectUrl: result.redirectUrl,
+      qrDataUrl: result.qrDataUrl,
+    };
+  };
+
+  const waitForStripePayment = async (paymentId: string) => {
+    let status = 'PENDING';
+    for (let attempt = 0; attempt < 45 && (status === 'PENDING' || status === 'PROCESSING') && !paymentQrCancelledRef.current; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      if (paymentQrCancelledRef.current) return status;
+      const statusResponse = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/stripe/payment/${encodeURIComponent(paymentId)}`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      }, 10000);
+      const statusResult = await statusResponse.json() as { status?: string; error?: string };
+      if (!statusResponse.ok) throw new Error(statusResult.error || 'No se pudo confirmar el pago Stripe.');
+      status = statusResult.status || 'PENDING';
+      setPaymentQrStatus(status);
+    }
+    return status;
+  };
+
+  const createTransactionFromConfirmedPayment = (method: string, paymentAmount: number) => {
+    setNfcModalVisible(false);
+    setPaymentQrDataUrl(null);
+
+    if (pendingInvoice) {
+      createTransaction(
+        'COBRO',
+        pendingInvoice.docType,
+        method,
+        paymentAmount,
+        pendingInvoice.client,
+        pendingInvoice.items,
+        pendingInvoice.ivaRate,
+      );
+      setPendingInvoice(null);
+      setClient({ name: '', nif: '', address: '' });
+      setInvoiceItems([{ id: '1', description: '', price: '' }]);
+      setInvoiceIvaInput('21');
+    } else {
+      createTransaction('COBRO', pendingDocumentType, method);
+    }
+  };
+
   const completePayment = async () => {
+    if (!accessToken || !configuredDocumentApiUrl) {
+      Alert.alert('Sesión requerida', 'Inicia sesión para poder cobrar con Stripe.');
+      return;
+    }
+
     const paymentAmount = pendingInvoice ? pendingInvoice.total : amount;
-    const result = await processPhysicalPaymentMock(paymentAmount);
-    if (result.status === 'unsupported') {
-      setTerminalError(result.message);
+    const orderId = `stripe-checkout-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    paymentQrCancelledRef.current = false;
+    setPaymentQrStatus('PENDING');
+    setIsProcessing(true);
+    setTerminalError('');
+
+    try {
+      const result = await createStripeCheckoutPayment(paymentAmount, orderId);
+      const checkoutUrl = result.checkoutUrl || result.redirectUrl;
+      if (!checkoutUrl) throw new Error('Stripe no devolvió una URL de Checkout.');
+
+      await WebBrowser.openBrowserAsync(checkoutUrl);
+      const status = await waitForStripePayment(result.paymentId);
+
+      if (paymentQrCancelledRef.current) return;
+      if (status !== 'SUCCEEDED') {
+        Alert.alert('Pago no confirmado', `Stripe ha devuelto el estado ${status}. No se ha creado el ticket.`);
+        return;
+      }
+
+      createTransactionFromConfirmedPayment('Stripe Checkout - Tarjeta', paymentAmount);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'No se pudo completar el cobro presencial.';
+      setTerminalError(message);
+      Alert.alert('Error de Stripe', message);
+    } finally {
+      setIsProcessing(false);
     }
   };
 
   const completePaymentQr = async () => {
     if (!accessToken || !configuredDocumentApiUrl) {
-      Alert.alert('Sesión requerida', 'Inicia sesión para poder cobrar con MONEI.');
+      Alert.alert('Sesión requerida', 'Inicia sesión para poder cobrar con Stripe.');
       return;
     }
 
     const paymentAmount = pendingInvoice ? pendingInvoice.total : amount;
-    const orderId = `monei-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const orderId = `stripe-qr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     paymentQrCancelledRef.current = false;
     setTerminalError('');
 
     try {
-      const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/monei/payment`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${accessToken}`,
-        },
-        body: JSON.stringify({ amount: paymentAmount, orderId }),
-      }, 15000);
-      const result = await response.json() as { paymentId?: string; redirectUrl?: string; qrDataUrl?: string | null; error?: string };
-      if (!response.ok || !result.paymentId || !result.qrDataUrl) {
-        throw new Error(result.error || 'MONEI no devolvió una página de pago.');
+      const result = await createStripeCheckoutPayment(paymentAmount, orderId);
+      if (!result.qrDataUrl) {
+        throw new Error('Stripe no devolvió una página de pago para generar el QR.');
       }
 
       setPaymentQrDataUrl(result.qrDataUrl);
       setPaymentQrStatus('PENDING');
-
-      let status = 'PENDING';
-      for (let attempt = 0; attempt < 45 && status === 'PENDING' && !paymentQrCancelledRef.current; attempt += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-        if (paymentQrCancelledRef.current) return;
-        const statusResponse = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/monei/payment/${encodeURIComponent(result.paymentId)}`, {
-          headers: { Authorization: `Bearer ${accessToken}` },
-        }, 10000);
-        const statusResult = await statusResponse.json() as { payment?: { status?: string }; status?: string; error?: string };
-        if (!statusResponse.ok) throw new Error(statusResult.error || 'No se pudo confirmar el pago MONEI.');
-        status = statusResult.status || statusResult.payment?.status || 'PENDING';
-        setPaymentQrStatus(status);
-      }
+      const status = await waitForStripePayment(result.paymentId);
 
       if (paymentQrCancelledRef.current) return;
 
       if (status !== 'SUCCEEDED') {
-        Alert.alert('Pago no confirmado', `MONEI ha devuelto el estado ${status}. No se ha creado el ticket.`);
+        Alert.alert('Pago no confirmado', `Stripe ha devuelto el estado ${status}. No se ha creado el ticket.`);
         return;
       }
 
-      setNfcModalVisible(false);
-      setPaymentQrDataUrl(null);
-
-      if (pendingInvoice) {
-        createTransaction(
-          'COBRO',
-          pendingInvoice.docType,
-          'MONEI - QR / Bizum',
-          paymentAmount,
-          pendingInvoice.client,
-          pendingInvoice.items,
-          pendingInvoice.ivaRate,
-        );
-        setPendingInvoice(null);
-        setClient({ name: '', nif: '', address: '' });
-        setInvoiceItems([{ id: '1', description: '', price: '' }]);
-        setInvoiceIvaInput('21');
-      } else {
-        createTransaction('COBRO', pendingDocumentType, 'MONEI - QR / Bizum');
-      }
+      createTransactionFromConfirmedPayment('Stripe Checkout - QR', paymentAmount);
     } catch (error) {
       if (!paymentQrCancelledRef.current) {
         setPaymentQrDataUrl(null);
-        Alert.alert('Error de pago MONEI', error instanceof Error ? error.message : 'No se pudo completar el cobro.');
+        Alert.alert('Error de pago Stripe', error instanceof Error ? error.message : 'No se pudo completar el cobro.');
       }
     }
   };
@@ -2762,8 +2804,8 @@ export default function TpvScreen() {
               <TextInput style={styles.input} placeholder="Dirección del negocio" placeholderTextColor="#94a3b8" value={issuer.address} onChangeText={(t) => setIssuer(i => ({ ...i, address: t }))} />
               <TextInput style={styles.input} placeholder="Correo electrónico del gestor" placeholderTextColor="#94a3b8" keyboardType="email-address" value={issuer.managerEmail || ''} onChangeText={(t) => setIssuer(i => ({ ...i, managerEmail: t }))} />
 
-              <Text style={[styles.cardTitle, { marginTop: 10 }]}>💳 COBROS CON MONEI</Text>
-              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>Las tarjetas online y Bizum se gestionan mediante MONEI. Configura la cuenta y la clave API secreta en el backend de Render.</Text>
+              <Text style={[styles.cardTitle, { marginTop: 10 }]}>💳 COBROS CON STRIPE</Text>
+              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>Las tarjetas online y los cobros por QR se gestionan mediante Stripe. Configura la clave secreta y el webhook en el backend de Render.</Text>
               <TextInput
                 style={styles.input}
                 placeholder="Usuarios adicionales (+2 €/mes cada uno)"
@@ -2841,7 +2883,7 @@ export default function TpvScreen() {
 
             {paymentQrDataUrl ? (
               <>
-                <Text style={[styles.modalSubtitle, { marginBottom: 8 }]}>El cliente debe escanear este QR con su móvil para abrir el pago MONEI.</Text>
+                <Text style={[styles.modalSubtitle, { marginBottom: 8 }]}>El cliente debe escanear este QR con su móvil para abrir el pago Stripe.</Text>
                 <Image
                   source={{ uri: paymentQrDataUrl }}
                   style={{ width: 260, height: 260, marginVertical: 8 }}
@@ -2856,12 +2898,12 @@ export default function TpvScreen() {
               <View style={{ gap: 10, marginTop: 15 }}>
                 <Pressable style={[styles.primaryButton, { backgroundColor: '#64748b' }]} onPress={completePayment}>
                   <Text style={styles.primaryButtonText}>
-                    💳 1. Tarjeta física / NFC con MONEI Pay
+                    💳 1. Tarjeta con Stripe Checkout
                   </Text>
                 </Pressable>
 
                 <Pressable style={[styles.primaryButton, { backgroundColor: '#0284c7' }]} onPress={completePaymentQr}>
-                  <Text style={styles.primaryButtonText}>📲 2. Cobrar con MONEI QR / Bizum</Text>
+                  <Text style={styles.primaryButtonText}>📲 2. Cobrar con Stripe QR</Text>
                 </Pressable>
               </View>
             ) : null}
@@ -2998,8 +3040,20 @@ export default function TpvScreen() {
                       />
                     ) : (
                       <View style={{ alignItems: 'center', marginVertical: 12 }}>
-                        <Text style={[styles.modalSubtitle, { textAlign: 'center', color: '#b45309', fontWeight: 'bold' }]}>Generando QR...</Text>
-                        <Text style={[styles.modalSubtitle, { textAlign: 'center', color: '#64748b', marginTop: 4 }]}>Se está publicando el ticket para que el cliente pueda escanearlo.</Text>
+                        <Text style={[styles.modalSubtitle, { textAlign: 'center', color: terminalError ? '#b91c1c' : '#b45309', fontWeight: 'bold' }]}>
+                          {terminalError ? 'No se pudo generar el QR' : 'Generando QR...'}
+                        </Text>
+                        <Text style={[styles.modalSubtitle, { textAlign: 'center', color: '#64748b', marginTop: 4 }]}>
+                          {terminalError ? terminalError : 'Se está publicando el ticket para que el cliente pueda escanearlo.'}
+                        </Text>
+                        {terminalError ? (
+                          <Pressable
+                            style={[styles.secondaryButton, { marginTop: 8 }]}
+                            onPress={() => void registerTransactionDocument(selectedTicket)}
+                          >
+                            <Text style={styles.secondaryButtonText}>Reintentar publicación</Text>
+                          </Pressable>
+                        ) : null}
                       </View>
                     )}
                     <Text style={[styles.modalSubtitle, { textAlign: 'center' }]}>Código: {selectedTicket.ticketCode}</Text>
