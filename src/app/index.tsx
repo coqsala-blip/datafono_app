@@ -2595,32 +2595,6 @@ export default function TpvScreen() {
             </View>
 
             <View style={styles.card}>
-              <Text style={styles.cardTitle}>👥 AÑADIR EMPLEADO</Text>
-              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>Añade una plaza, contrátala con la suscripción y crea un código de un solo uso para el nuevo empleado.</Text>
-              <TextInput
-                style={styles.input}
-                placeholder="Número de empleados adicionales"
-                placeholderTextColor="#94a3b8"
-                keyboardType="numeric"
-                value={String(issuer.additionalUsers || 0)}
-                onChangeText={(t) => setIssuer(i => ({ ...i, additionalUsers: Number(t.replace(/[^0-9]/g, '')) || 0 }))}
-              />
-              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 8 }]}>Después de añadir plazas de empleado, crea un código distinto del PIN. Cada empleado lo usará una sola vez al registrarse en su móvil.</Text>
-              <TextInput
-                style={styles.input}
-                placeholder="Código para empleados (mínimo 8 caracteres)"
-                placeholderTextColor="#94a3b8"
-                autoCapitalize="characters"
-                secureTextEntry
-                value={employeeAccessCode}
-                onChangeText={setEmployeeAccessCode}
-              />
-              <Pressable style={[styles.secondaryButton, { marginTop: 2 }]} onPress={() => void saveEmployeeAccessCode()}>
-                <Text style={styles.secondaryButtonText}>Guardar código de empleado</Text>
-              </Pressable>
-            </View>
-
-            <View style={styles.card}>
               <Text style={styles.cardTitle}>📋 LISTADO DE GASTOS REGISTRADOS ({expenses.length})</Text>
               {expenses.length === 0 ? (
                 <Text style={styles.emptyText}>No hay gastos registrados todavía.</Text>
@@ -2883,6 +2857,32 @@ export default function TpvScreen() {
                 <Text style={[styles.statLabel, { fontWeight: 'bold' }]}>Total mensual con IVA:</Text>
                 <Text style={[styles.statValue, { color: '#16a34a', fontWeight: 'bold' }]}>{formatCurrency(currentSubscriptionTotal * 1.21)}</Text>
               </View>
+            </View>
+
+            <View style={styles.card}>
+              <Text style={styles.cardTitle}>👥 AÑADIR EMPLEADO</Text>
+              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>Añade una plaza, contrátala con la suscripción y crea un código de un solo uso para el nuevo empleado.</Text>
+              <TextInput
+                style={styles.input}
+                placeholder="Número de empleados adicionales"
+                placeholderTextColor="#94a3b8"
+                keyboardType="numeric"
+                value={String(issuer.additionalUsers || 0)}
+                onChangeText={(t) => setIssuer(i => ({ ...i, additionalUsers: Number(t.replace(/[^0-9]/g, '')) || 0 }))}
+              />
+              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 8 }]}>Después de añadir plazas de empleado, crea un código distinto del PIN. Cada empleado lo usará una sola vez al registrarse en su móvil.</Text>
+              <TextInput
+                style={styles.input}
+                placeholder="Código para empleados (mínimo 8 caracteres)"
+                placeholderTextColor="#94a3b8"
+                autoCapitalize="characters"
+                secureTextEntry
+                value={employeeAccessCode}
+                onChangeText={setEmployeeAccessCode}
+              />
+              <Pressable style={[styles.secondaryButton, { marginTop: 2 }]} onPress={() => void saveEmployeeAccessCode()}>
+                <Text style={styles.secondaryButtonText}>Guardar código de empleado</Text>
+              </Pressable>
             </View>
 
             <View style={styles.card}>
