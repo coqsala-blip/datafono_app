@@ -2867,11 +2867,11 @@ export default function TpvScreen() {
               <TextInput style={styles.input} placeholder="Dirección del negocio" placeholderTextColor="#94a3b8" value={issuer.address} onChangeText={(t) => setIssuer(i => ({ ...i, address: t }))} />
               <TextInput style={styles.input} placeholder="Correo electrónico del gestor" placeholderTextColor="#94a3b8" keyboardType="email-address" value={issuer.managerEmail || ''} onChangeText={(t) => setIssuer(i => ({ ...i, managerEmail: t }))} />
 
-              <Text style={[styles.cardTitle, { marginTop: 10 }]}>💳 COBROS CON STRIPE</Text>
-              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>Las tarjetas online y los cobros por QR se gestionan mediante Stripe. Configura la clave secreta y el webhook en el backend de Render.</Text>
+              <Text style={[styles.cardTitle, { marginTop: 18 }]}>👥 AÑADIR EMPLEADO</Text>
+              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>Añade una plaza, contrátala con la suscripción y crea un código de un solo uso para el nuevo empleado.</Text>
               <TextInput
                 style={styles.input}
-                placeholder="Usuarios adicionales (+2 €/mes cada uno)"
+                placeholder="Número de empleados adicionales"
                 placeholderTextColor="#94a3b8"
                 keyboardType="numeric"
                 value={String(issuer.additionalUsers || 0)}
@@ -2890,6 +2890,9 @@ export default function TpvScreen() {
               <Pressable style={[styles.secondaryButton, { marginTop: 2 }]} onPress={() => void saveEmployeeAccessCode()}>
                 <Text style={styles.secondaryButtonText}>Guardar código de empleado</Text>
               </Pressable>
+
+              <Text style={[styles.cardTitle, { marginTop: 18 }]}>💳 COBROS CON STRIPE</Text>
+              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>Las tarjetas online y los cobros por QR se gestionan mediante Stripe. Configura la clave secreta y el webhook en el backend de Render.</Text>
 
               <Text style={[styles.cardTitle, { marginTop: 15 }]}>🎨 LOGOTIPO DE LA EMPRESA</Text>
               {issuer.logoUri && (
