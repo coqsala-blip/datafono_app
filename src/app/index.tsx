@@ -1156,6 +1156,9 @@ export default function TpvScreen() {
     setTerminalMessage('Conectando lector Tap to Pay...');
     const connectionResult = await easyConnect({
       discoveryMethod: 'tapToPay',
+      // Stripe no permite el lector Tap to Pay real en una app depurable.
+      // El lector simulado solo se activa durante el desarrollo local.
+      simulated: __DEV__,
       locationId: STRIPE_TERMINAL_LOCATION_ID,
       merchantDisplayName: issuer.name,
       autoReconnectOnUnexpectedDisconnect: true,
