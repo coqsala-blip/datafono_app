@@ -8,7 +8,7 @@
       "developmentClient": true,
       "distribution": "internal",
       "env": {
-        "EXPO_PUBLIC_DOCUMENT_API_URL": "http://192.168.1.135:4000"
+        "EXPO_PUBLIC_DOCUMENT_API_URL": "https://tpv-gestor-backend.onrender.com"
       }
     },
     "preview": {
