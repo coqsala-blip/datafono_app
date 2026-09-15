@@ -511,6 +511,10 @@ export default function TpvScreen() {
 
   const saveEmployeeAccessCode = async () => {
     if (!accessToken || !configuredDocumentApiUrl) return;
+    if (employeeAccessCode.trim().length < 8) {
+      Alert.alert('Código demasiado corto', 'Usa un código de al menos 8 caracteres. No es el PIN del jefe.');
+      return;
+    }
     try {
       const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/auth/employee-access-code`, {
         method: 'POST',
@@ -520,7 +524,13 @@ export default function TpvScreen() {
         },
         body: JSON.stringify({ accessCode: employeeAccessCode }),
       }, 10000);
-      const result = await response.json() as { error?: string };
+      const responseText = await response.text();
+      let result: { error?: string } = {};
+      try {
+        result = JSON.parse(responseText) as { error?: string };
+      } catch {
+        throw new Error('El servidor todavía no tiene disponible la función de empleados. Despliega la última versión del backend en Render.');
+      }
       if (!response.ok) throw new Error(result.error || 'No se pudo guardar el código.');
       setEmployeeAccessCode('');
       Alert.alert('Código de empleado guardado', 'Compártelo solo con los empleados que deban acceder al TPV.');
