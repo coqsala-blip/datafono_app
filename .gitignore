@@ -21,6 +21,10 @@ expo-env.d.ts
 
 # Metro
 .metro-health-check*
+.metro.log
+
+# logs locales de expo/metro (no deben subirse al repositorio)
+.expo-tunnel*.log
 
 # debug
 npm-debug.*

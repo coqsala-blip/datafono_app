@@ -45,6 +45,8 @@ type Issuer = {
 type InvoiceItem = { id: string; description: string; price: string };
 type PendingInvoice = { client: Client; items: InvoiceItem[]; ivaRate: number; total: number; docType: DocumentType };
 type StripeTerminalPaymentIntentResult = { paymentIntentId?: string; clientSecret?: string; error?: string };
+type StripeOnlinePaymentResult = { paymentId?: string; checkoutUrl?: string; redirectUrl?: string; qrDataUrl?: string | null; paymentMethods?: string[] | 'auto'; error?: string };
+type StripeOnlinePaymentStatusResult = { status?: string; paymentStatus?: string; checkoutStatus?: string; error?: string };
 
 const configuredDocumentApiUrl = process.env.EXPO_PUBLIC_DOCUMENT_API_URL?.replace(/\/$/, '');
 const DOCUMENT_API_URL_CANDIDATES = configuredDocumentApiUrl ? [configuredDocumentApiUrl] : [];
@@ -293,6 +295,13 @@ export default function TpvScreen() {
   const [scannerModalVisible, setScannerModalVisible] = useState(false);
   const [nfcModalVisible, setNfcModalVisible] = useState(false);
   const [clientModalVisible, setClientModalVisible] = useState(false);
+
+  // Cobro online con enlace/QR (tarjeta y Bizum) sobre Stripe Checkout
+  const [onlinePaymentModalVisible, setOnlinePaymentModalVisible] = useState(false);
+  const [onlinePaymentLoading, setOnlinePaymentLoading] = useState(false);
+  const [onlinePaymentError, setOnlinePaymentError] = useState('');
+  const [onlinePaymentMessage, setOnlinePaymentMessage] = useState('');
+  const [onlinePayment, setOnlinePayment] = useState<{ paymentId: string; checkoutUrl: string; qrDataUrl: string | null } | null>(null);
 
   // Facturas y productos
   const [invoiceItems, setInvoiceItems] = useState<InvoiceItem[]>([{ id: '1', description: '', price: '' }]);
@@ -1264,6 +1273,116 @@ export default function TpvScreen() {
   const cancelPayment = () => {
     setNfcModalVisible(false);
     setPendingInvoice(null);
+  };
+
+  const closeOnlinePaymentModal = () => {
+    setOnlinePaymentModalVisible(false);
+    setOnlinePayment(null);
+    setOnlinePaymentError('');
+    setOnlinePaymentMessage('');
+  };
+
+  const openOnlinePaymentModal = () => {
+    setNfcModalVisible(false);
+    setOnlinePayment(null);
+    setOnlinePaymentError('');
+    setOnlinePaymentMessage('');
+    setOnlinePaymentModalVisible(true);
+  };
+
+  const backToTerminalModal = () => {
+    closeOnlinePaymentModal();
+    setNfcModalVisible(true);
+  };
+
+  const createOnlinePayment = async () => {
+    if (!accessToken || !configuredDocumentApiUrl) {
+      Alert.alert('Sesión requerida', 'Inicia sesión para poder cobrar con Stripe.');
+      return;
+    }
+
+    const paymentAmount = pendingInvoice ? pendingInvoice.total : amount;
+    if (!Number.isFinite(paymentAmount) || paymentAmount < 0.5) {
+      setOnlinePaymentError('El importe debe ser de al menos 0,50 €.');
+      return;
+    }
+    if (paymentAmount > 999999.99) {
+      setOnlinePaymentError('El importe supera el máximo permitido para el cobro online.');
+      return;
+    }
+
+    const orderId = `stripe-online-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    setOnlinePaymentLoading(true);
+    setOnlinePaymentError('');
+    setOnlinePaymentMessage('Generando el enlace y el QR de pago...');
+
+    try {
+      const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/stripe/payment`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify({ amount: paymentAmount, orderId }),
+      }, 15000);
+      const result = await response.json() as StripeOnlinePaymentResult;
+      const checkoutUrl = result.checkoutUrl || result.redirectUrl;
+      if (!response.ok || !checkoutUrl || !result.paymentId) {
+        throw new Error(result.error || `Stripe no devolvió un enlace de pago (HTTP ${response.status}).`);
+      }
+
+      setOnlinePayment({ paymentId: result.paymentId, checkoutUrl, qrDataUrl: result.qrDataUrl || null });
+      setOnlinePaymentMessage('Muestra el QR al cliente o abre el enlace de pago. Puede pagar con tarjeta o Bizum.');
+    } catch (error) {
+      setOnlinePaymentMessage('');
+      setOnlinePaymentError(error instanceof Error ? error.message : 'No se pudo generar el cobro online.');
+    } finally {
+      setOnlinePaymentLoading(false);
+    }
+  };
+
+  const checkOnlinePaymentStatus = async () => {
+    if (!accessToken || !configuredDocumentApiUrl || !onlinePayment) return;
+
+    const paymentAmount = pendingInvoice ? pendingInvoice.total : amount;
+    setOnlinePaymentLoading(true);
+    setOnlinePaymentError('');
+    setOnlinePaymentMessage('Comprobando el pago en Stripe...');
+
+    try {
+      const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/stripe/payment/${onlinePayment.paymentId}`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      }, 10000);
+      const result = await response.json() as StripeOnlinePaymentStatusResult;
+      if (!response.ok) {
+        throw new Error(result.error || 'No se pudo consultar el pago en Stripe.');
+      }
+
+      if (result.status === 'SUCCEEDED') {
+        setOnlinePaymentMessage('Pago confirmado. Generando el ticket...');
+        createTransactionFromConfirmedPayment('Stripe - Enlace o QR (tarjeta o Bizum)', paymentAmount);
+        closeOnlinePaymentModal();
+        return;
+      }
+
+      if (result.status === 'EXPIRED') {
+        setOnlinePayment(null);
+        setOnlinePaymentError('El enlace de pago ha caducado. Genera uno nuevo.');
+        return;
+      }
+
+      setOnlinePaymentMessage('Stripe todavía no confirma el pago. Con Bizum el banco puede tardar unos segundos: espera un momento y vuelve a comprobar.');
+    } catch (error) {
+      setOnlinePaymentError(error instanceof Error ? error.message : 'No se pudo comprobar el pago.');
+    } finally {
+      setOnlinePaymentLoading(false);
+    }
+  };
+
+  const openOnlinePaymentPage = async () => {
+    if (!onlinePayment?.checkoutUrl) return;
+    await WebBrowser.openBrowserAsync(onlinePayment.checkoutUrl);
+    await checkOnlinePaymentStatus();
   };
 
   const pickExpenseImage = async (useCamera: boolean) => {
@@ -2980,9 +3099,67 @@ export default function TpvScreen() {
               <Text style={styles.primaryButtonText}>{isProcessing ? 'Procesando...' : 'Cobrar acercando tarjeta o móvil'}</Text>
             </Pressable>
 
+            <Pressable style={[styles.secondaryButton, { marginTop: 12 }]} onPress={openOnlinePaymentModal}>
+              <Text style={styles.secondaryButtonText}>Cobrar con enlace o QR (Bizum/tarjeta)</Text>
+            </Pressable>
+
             <Pressable style={[styles.secondaryButton, { marginTop: 12 }]} onPress={cancelPayment}>
               <Text style={styles.secondaryButtonText}>Cancelar</Text>
             </Pressable>
+          </View>
+        </View>
+      </Modal>
+
+      {/* MODAL: COBRO ONLINE CON ENLACE O QR (TARJETA Y BIZUM) */}
+      <Modal visible={onlinePaymentModalVisible} animationType="fade" transparent={true}>
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalContent, { maxHeight: '90%' }]}>
+            <ScrollView contentContainerStyle={{ alignItems: 'center' }}>
+              <Text style={styles.modalTitle}>🔗 COBRO CON ENLACE O QR</Text>
+              <Text style={styles.modalSubtitle}>
+                Importe a cobrar: {formatCurrency(pendingInvoice ? pendingInvoice.total : amount)}
+              </Text>
+              <Text style={[styles.modalSubtitle, { marginBottom: 8 }]}>
+                El cliente puede pagar con tarjeta o con Bizum desde el enlace o el QR. Bizum solo está disponible para cobros puntuales de 0,50 € a 5.000 € con un banco español.
+              </Text>
+
+              {onlinePayment?.qrDataUrl ? (
+                <Image
+                  source={{ uri: onlinePayment.qrDataUrl }}
+                  style={{ width: 220, height: 220, marginVertical: 8 }}
+                />
+              ) : null}
+
+              {onlinePaymentMessage ? (
+                <Text style={[styles.modalSubtitle, { color: onlinePaymentError ? '#b91c1c' : '#166534', fontWeight: 'bold' }]}>
+                  {onlinePaymentMessage}
+                </Text>
+              ) : null}
+
+              {onlinePaymentError ? (
+                <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 6, textAlign: 'center' }}>{onlinePaymentError}</Text>
+              ) : null}
+
+              {onlinePayment ? (
+                <>
+                  <Pressable style={[styles.primaryButton, { backgroundColor: '#0f766e', marginTop: 15, width: '100%' }]} onPress={openOnlinePaymentPage} disabled={onlinePaymentLoading}>
+                    <Text style={styles.primaryButtonText}>Abrir la página de pago</Text>
+                  </Pressable>
+
+                  <Pressable style={[styles.secondaryButton, { marginTop: 10, width: '100%' }]} onPress={checkOnlinePaymentStatus} disabled={onlinePaymentLoading}>
+                    <Text style={styles.secondaryButtonText}>{onlinePaymentLoading ? 'Comprobando...' : 'Ya ha pagado: comprobar ahora'}</Text>
+                  </Pressable>
+                </>
+              ) : (
+                <Pressable style={[styles.primaryButton, { backgroundColor: '#0f766e', marginTop: 15, width: '100%' }]} onPress={createOnlinePayment} disabled={onlinePaymentLoading}>
+                  <Text style={styles.primaryButtonText}>{onlinePaymentLoading ? 'Generando...' : 'Generar enlace y QR de pago'}</Text>
+                </Pressable>
+              )}
+
+              <Pressable style={[styles.secondaryButton, { marginTop: 10, width: '100%' }]} onPress={backToTerminalModal}>
+                <Text style={styles.secondaryButtonText}>Volver</Text>
+              </Pressable>
+            </ScrollView>
           </View>
         </View>
       </Modal>

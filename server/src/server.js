@@ -15,10 +15,58 @@ const STRIPE_MAIN_SUBSCRIPTION_PRICE_ID = process.env.STRIPE_MAIN_SUBSCRIPTION_P
 const STRIPE_ADDITIONAL_USER_PRICE_ID = process.env.STRIPE_ADDITIONAL_USER_PRICE_ID;
 const stripe = STRIPE_SECRET_KEY ? Stripe(STRIPE_SECRET_KEY) : null;
 const stripeCurrency = 'eur';
-const stripePaymentMethodTypes = (process.env.STRIPE_PAYMENT_METHOD_TYPES || 'card')
-  .split(',')
-  .map((method) => method.trim())
-  .filter(Boolean);
+
+// Métodos de pago del Checkout online (solo cobros puntuales).
+// 'auto' (recomendado por Stripe) = métodos dinámicos: NO se envía payment_method_types, por lo que
+// Stripe muestra los métodos activados en el Dashboard que sean elegibles para el cliente y el
+// importe. Así Bizum aparece sin más cambios de código (solo hay que activarlo en el Dashboard).
+// Referencia: https://docs.stripe.com/payments/bizum/accept-a-payment
+const stripePaymentMethodTypesSetting = String(process.env.STRIPE_PAYMENT_METHOD_TYPES || 'auto').trim().toLowerCase();
+const stripeDynamicPaymentMethods = stripePaymentMethodTypesSetting === '' || stripePaymentMethodTypesSetting === 'auto';
+const stripePaymentMethodTypes = stripeDynamicPaymentMethods
+  ? []
+  : stripePaymentMethodTypesSetting.split(',').map((method) => method.trim()).filter(Boolean);
+
+// Bizum: solo cobros puntuales en EUR, entre 0,50 € y 5.000 €. No admite suscripciones.
+const BIZUM_MIN_AMOUNT_CENTS = 50;
+const BIZUM_MAX_AMOUNT_CENTS = 500000;
+
+const resolveCheckoutPaymentMethodTypes = (amountCents) => {
+  if (stripeDynamicPaymentMethods) return null;
+  const eligible = stripePaymentMethodTypes.filter((method) => (
+    method !== 'bizum' || (amountCents >= BIZUM_MIN_AMOUNT_CENTS && amountCents <= BIZUM_MAX_AMOUNT_CENTS)
+  ));
+  return eligible.length > 0 ? eligible : ['card'];
+};
+
+// Detecta el error de Stripe cuando se pide Bizum pero no está activado en el Dashboard.
+const isBizumUnavailableError = (error) => {
+  const message = String(error?.message || '').toLowerCase();
+  if (!message.includes('bizum')) return false;
+  return ['not activated', 'no está activado', 'not enabled', 'not supported', 'invalid payment method'].some((text) => message.includes(text));
+};
+
+// Crea la sesión de Checkout. Si se pidió Bizum y Stripe responde que no está activado, se
+// reintenta solo con tarjeta para que el cobro nunca se rompa, avisando por log.
+const createCheckoutSessionWithBizumFallback = async (params, requestedPaymentMethodTypes) => {
+  const stripeClient = requireStripe();
+
+  try {
+    const session = await stripeClient.checkout.sessions.create(params);
+    return { session, paymentMethodTypes: requestedPaymentMethodTypes };
+  } catch (error) {
+    const requestedBizum = Array.isArray(requestedPaymentMethodTypes) && requestedPaymentMethodTypes.includes('bizum');
+    if (!requestedBizum || !isBizumUnavailableError(error)) {
+      throw error;
+    }
+
+    const fallbackTypes = requestedPaymentMethodTypes.filter((method) => method !== 'bizum');
+    const safeTypes = fallbackTypes.length > 0 ? fallbackTypes : ['card'];
+    console.warn('Bizum no está disponible en tu cuenta de Stripe. Se crea el cobro con:', safeTypes.join(', '), '- Activa Bizum en Settings > Payment methods del Dashboard.');
+    const session = await stripeClient.checkout.sessions.create({ ...params, payment_method_types: safeTypes });
+    return { session, paymentMethodTypes: safeTypes };
+  }
+};
 
 try {
   const publicApiUrl = new URL(PUBLIC_API_URL);
@@ -94,13 +142,21 @@ const normalizeStripePaymentStatus = (session) => {
 
 app.set('trust proxy', 1);
 app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!STRIPE_WEBHOOK_SECRET && NODE_ENV === 'production') {
+    console.error('Webhook Stripe rechazado: STRIPE_WEBHOOK_SECRET no está configurado.');
+    return res.status(500).json({ ok: false, error: 'STRIPE_WEBHOOK_SECRET no está configurado en el backend.' });
+  }
+
   let event;
   try {
     const stripeClient = requireStripe();
     const signature = req.headers['stripe-signature'];
-    event = STRIPE_WEBHOOK_SECRET
-      ? stripeClient.webhooks.constructEvent(req.body, signature, STRIPE_WEBHOOK_SECRET)
-      : JSON.parse(req.body.toString('utf8'));
+    if (STRIPE_WEBHOOK_SECRET) {
+      event = stripeClient.webhooks.constructEvent(req.body, signature, STRIPE_WEBHOOK_SECRET);
+    } else {
+      console.warn('Webhook Stripe recibido sin verificar firma (solo permitido en desarrollo).');
+      event = JSON.parse(req.body.toString('utf8'));
+    }
   } catch (error) {
     console.error('Webhook Stripe no válido:', error.message);
     return res.status(400).json({ ok: false, error: 'Webhook Stripe no válido.' });
@@ -389,9 +445,12 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
   }
 
   try {
-    const session = await requireStripe().checkout.sessions.create({
+    // Métodos dinámicos (Bizum incluido): no se pasa payment_method_types salvo que se configure
+    // una lista explícita en STRIPE_PAYMENT_METHOD_TYPES.
+    const requestedPaymentMethodTypes = resolveCheckoutPaymentMethodTypes(amount);
+    const checkoutSessionParams = {
       mode: 'payment',
-      payment_method_types: stripePaymentMethodTypes,
+      ...(requestedPaymentMethodTypes ? { payment_method_types: requestedPaymentMethodTypes } : {}),
       line_items: [
         {
           quantity: 1,
@@ -416,7 +475,11 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
       },
       success_url: `${PUBLIC_API_URL}/stripe/complete?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${PUBLIC_API_URL}/stripe/cancel?orderId=${encodeURIComponent(orderId)}`,
-    });
+    };
+    const { session, paymentMethodTypes } = await createCheckoutSessionWithBizumFallback(
+      checkoutSessionParams,
+      requestedPaymentMethodTypes,
+    );
 
     const redirectUrl = session.url;
     const qrDataUrl = redirectUrl
@@ -429,6 +492,8 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
       redirectUrl,
       checkoutUrl: redirectUrl,
       qrDataUrl,
+      paymentMethods: paymentMethodTypes || 'auto',
+      amount,
     });
   } catch (error) {
     console.error('Error creando pago Stripe:', error.message);
@@ -451,6 +516,47 @@ app.get('/api/stripe/payment/:paymentId', requireAuth, async (req, res) => {
   } catch (error) {
     console.error('Error consultando pago Stripe:', error.message);
     return res.status(502).json({ ok: false, error: 'No se pudo consultar el estado del pago Stripe.' });
+  }
+});
+
+// Diagnóstico: indica si Bizum está disponible y activado en la cuenta de Stripe.
+app.get('/api/stripe/payment-methods', requireAuth, async (req, res) => {
+  const warnings = [];
+  const bizum = { capability: null, enabledInDashboard: null, available: null };
+
+  try {
+    const stripeClient = requireStripe();
+
+    try {
+      const account = await stripeClient.accounts.retrieve();
+      bizum.capability = account?.capabilities?.bizum_payments || null;
+    } catch (error) {
+      warnings.push(`No se pudieron leer las capacidades de la cuenta: ${error.message}`);
+    }
+
+    try {
+      const configurations = await stripeClient.paymentMethodConfigurations.list({ limit: 1 });
+      const config = configurations?.data?.[0] || null;
+      if (config?.bizum) {
+        bizum.available = config.bizum.available === true;
+        bizum.enabledInDashboard = config.bizum.display_preference?.value || null;
+      }
+    } catch (error) {
+      warnings.push(`No se pudo leer la configuración de métodos de pago: ${error.message}`);
+    }
+
+    return res.json({
+      ok: true,
+      dynamicPaymentMethods: stripeDynamicPaymentMethods,
+      configuredSetting: stripeDynamicPaymentMethods ? 'auto' : stripePaymentMethodTypes.join(','),
+      requestedForOnlinePayments: stripeDynamicPaymentMethods
+        ? 'Dinámicos: Stripe muestra los métodos activados en el Dashboard'
+        : stripePaymentMethodTypes,
+      bizum,
+      warnings,
+    });
+  } catch (error) {
+    return res.status(502).json({ ok: false, error: `Stripe: ${error.message}` });
   }
 });
 
