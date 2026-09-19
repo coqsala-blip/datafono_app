@@ -108,24 +108,28 @@ Requisitos de Bizum según Stripe (https://docs.stripe.com/payments/bizum):
 - Reembolsos totales y parciales, pero **asíncronos (pueden tardar hasta 5 minutos)**. Se admiten
   disputas hasta 120 días después del cobro.
 
-El backend pide explícitamente **tarjeta + métodos locales europeos**
-(`STRIPE_PAYMENT_METHOD_TYPES=card,bizum,mb_way,bancontact,eps,ideal,wero`, valor por defecto), de
-modo que el Checkout muestra esos métodos y **no** los demás que Stripe activa por defecto en la
-cuenta (Klarna, Amazon Pay, etc.). En cada país solo se mostrarán los métodos **activados en
-Settings → Payment methods del Dashboard**: antes de cada cobro el backend consulta la
-configuración real de la cuenta y solo pide los disponibles (cacheada 10 minutos); si Stripe
-respondiera que uno no está disponible, el backend **lo retira y reintenta automáticamente**
-(con límite) en lugar de fallar. Si se prefiere que Stripe
-decida automáticamente según el Dashboard, usa `STRIPE_PAYMENT_METHOD_TYPES=auto` (métodos
-dinámicos). Con una lista explícita, el backend **excluye Bizum automáticamente** para importes
-fuera del rango 0,50 €–5.000 € y, si un método local no está activado en la cuenta, **reintenta el
-cobro sin él**. Cobertura por método: Bizum (España), MB WAY (Portugal), Bancontact (Bélgica),
-EPS (Austria), iDEAL (Países Bajos) y Wero (paneuropeo, en *private preview*). Todos requieren
-EUR y cobros puntuales; **ninguno admite suscripciones**, por lo que el plan mensual sigue
-cobrándose con tarjeta.
+El backend usa **métodos dinámicos** por defecto
+(`STRIPE_PAYMENT_METHOD_TYPES=auto`): no envía `payment_method_types` al Checkout, de modo que es
+**Stripe quien muestra los métodos activados en Settings → Payment methods del Dashboard** —el modo
+recomendado por Stripe, que garantiza que lo que actives allí salga siempre sin tocar el código
+(tarjeta, Bizum en España, MB WAY en Portugal, Bancontact en Bélgica, EPS en Austria, iDEAL en
+Países Bajos, Wero paneuropeo...). Si prefieres limitar la lista a mano, define
+`STRIPE_PAYMENT_METHOD_TYPES` con tu propia lista (p. ej. `card,bizum`): en ese caso el backend
+consulta la configuración real de la cuenta antes de cada cobro (cacheada 10 minutos), pide solo los
+métodos disponibles, **excluye Bizum automáticamente** fuera del rango 0,50 €–5.000 € y, si Stripe
+rechazara un método local, **lo retira y reintenta con límite** en lugar de fallar. Todos los métodos
+locales requieren EUR y cobros puntuales; **ninguno admite suscripciones**, por lo que el plan mensual
+sigue cobrándose con tarjeta.
 
-`GET /api/stripe/payment-methods` (requiere sesión) devuelve el estado real de la cuenta, y en la app
-puedes verlo en **Config → "Comprobar Bizum en Stripe"**.
+`GET /api/stripe/payment-methods` (requiere sesión) devuelve el estado real de la cuenta. Con
+`?probe=1` además crea un Checkout de 1,00 € que **caduca al momento** (no cobra nada) y devuelve
+los métodos que Stripe resuelve de verdad, junto con el modo (test/live), el país de la cuenta, el
+estado de cada método y un enlace al Dashboard para activarlos. En la app lo tienes en
+**Config → "Comprobar Bizum en Stripe"**, junto al botón "Abrir Stripe para activar Bizum".
+
+Si el Checkout solo ofrece tarjeta, es que Bizum (u otro método) **no está activado en esa cuenta o
+modo**: test y live se activan por separado en el Dashboard y Bizum exige una cuenta con ubicación de
+negocio en España.
 
 Pruebas en modo test: en el Checkout elige Bizum y usa el teléfono `+34600000002` para simular un
 rechazo del banco; cualquier otro número simula un pago correcto.

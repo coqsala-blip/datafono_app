@@ -13,6 +13,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Image,
+  Linking,
   Modal,
   Platform,
   Pressable,
@@ -50,11 +51,18 @@ type StripeOnlinePaymentResult = { paymentId?: string; checkoutUrl?: string; red
 type StripeOnlinePaymentStatusResult = { status?: string; paymentStatus?: string; checkoutStatus?: string; usedMethod?: string | null; error?: string };
 type StripePaymentMethodsResult = {
   ok?: boolean;
+  checkoutMode?: string;
+  dynamicPaymentMethods?: boolean;
+  envPaymentMethodTypes?: string | null;
   configuredSetting?: string;
   requestedForOnlinePayments?: string[] | string;
-  effectiveCheckoutMethods?: string[] | null;
+  effectiveCheckoutMethods?: string[] | string | null;
+  methods?: Record<string, { available?: boolean | null; preference?: string | null }>;
   livemode?: boolean | null;
+  accountCountry?: string | null;
+  dashboardUrl?: string;
   bizum?: { capability?: string | null; enabledInDashboard?: string | null; available?: boolean | null };
+  probe?: { requested?: string[] | string; resolved?: string[] | null; amount?: number; currency?: string } | null;
   warnings?: string[];
   error?: string;
 };
@@ -370,6 +378,7 @@ export default function TpvScreen() {
   const [stripeMethodsLoading, setStripeMethodsLoading] = useState(false);
   const [stripeMethodsInfo, setStripeMethodsInfo] = useState('');
   const [stripeMethodsError, setStripeMethodsError] = useState('');
+  const [stripeDashboardUrl, setStripeDashboardUrl] = useState('');
 
   // Facturas y productos
   const [invoiceItems, setInvoiceItems] = useState<InvoiceItem[]>([{ id: '1', description: '', price: '' }]);
@@ -1407,7 +1416,15 @@ export default function TpvScreen() {
       }
 
       setOnlinePayment({ paymentId: result.paymentId, checkoutUrl, qrDataUrl: result.qrDataUrl || null });
-      setOnlinePaymentMessage('Muestra el QR al cliente o abre el enlace de pago. Puede pagar con tarjeta o Bizum.');
+      // Se indican al vendedor los métodos que Stripe ofrece en este cobro concreto.
+      const offeredMethods = Array.isArray(result.paymentMethods) && result.paymentMethods.length > 0
+        ? result.paymentMethods.join(', ')
+        : '';
+      setOnlinePaymentMessage(
+        offeredMethods
+          ? `Muestra el QR al cliente o abre el enlace de pago. Métodos en este cobro: ${offeredMethods}.`
+          : 'Muestra el QR al cliente o abre el enlace de pago. Stripe mostrará los métodos activados en tu cuenta (tarjeta, Bizum...).',
+      );
       // Persistir el cobro pendiente: al volver del navegador la app puede remontarse y
       // perder el estado en memoria; asi se reanuda la comprobacion automaticamente.
       try {
@@ -1711,42 +1728,66 @@ export default function TpvScreen() {
     setStripeMethodsLoading(true);
     setStripeMethodsError('');
     setStripeMethodsInfo('');
+    setStripeDashboardUrl('');
 
     try {
-      const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/stripe/payment-methods`, {
+      // probe=1: el backend crea un Checkout real de 1,00 € (se caduca al momento, no cobra nada) y
+      // devuelve los métodos que Stripe resuelve de verdad para esta cuenta y modo.
+      const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/stripe/payment-methods?probe=1`, {
         headers: { Authorization: `Bearer ${accessToken}` },
-      }, 15000);
+      }, 30000);
       const result = await response.json() as StripePaymentMethodsResult;
       if (!response.ok) {
         throw new Error(result.error || 'No se pudo consultar el estado en Stripe.');
       }
 
       const bizum = result.bizum || {};
-      const configured = Array.isArray(result.requestedForOnlinePayments)
-        ? result.requestedForOnlinePayments.join(', ')
-        : (result.requestedForOnlinePayments || 'dinámicos');
-      const effective = Array.isArray(result.effectiveCheckoutMethods) && result.effectiveCheckoutMethods.length > 0
-        ? result.effectiveCheckoutMethods.join(', ')
-        : 'dinámicos';
+      const asText = (value: string[] | string | null | undefined) => (
+        Array.isArray(value) ? (value.length > 0 ? value.join(', ') : 'ninguno') : (value || 'desconocido')
+      );
+      const dynamic = result.checkoutMode === 'dynamic' || result.dynamicPaymentMethods === true;
+      const effective = asText(result.effectiveCheckoutMethods);
+      const probed = asText(result.probe?.resolved);
+      const bizumOnOffer = effective.includes('bizum') || probed.includes('bizum');
       const bizumEnabled = bizum.enabledInDashboard === 'on';
       const lines = [
         `Modo de Stripe: ${result.livemode === true ? 'REAL (live): cobra dinero de verdad' : result.livemode === false ? 'PRUEBAS (test)' : 'desconocido'}`,
-        `Métodos configurados: ${configured}`,
+        `País de la cuenta: ${result.accountCountry || 'desconocido'}`,
+        `Tipo de Checkout: ${dynamic ? 'dinámicos: Stripe usa los métodos activados en el Dashboard' : `lista fija: ${asText(result.requestedForOnlinePayments)}`}`,
         `Saldrán en el Checkout: ${effective}`,
         `Bizum activado en tu cuenta: ${bizumEnabled ? 'SÍ' : 'NO'}`,
         `Bizum disponible en Stripe: ${bizum.available ? 'SÍ' : 'NO'}`,
         `Capacidad de Bizum: ${bizum.capability || 'sin activar'}`,
       ];
 
-      if (!effective.includes('bizum')) {
+      if (result.methods && Object.keys(result.methods).length > 0) {
+        const detail = Object.entries(result.methods).map(([method, entry]) => {
+          const state = entry?.available === true ? 'disponible' : entry?.available === false ? 'NO disponible' : 'sin datos';
+          return `${method}: ${state}${entry?.preference ? ` (${entry.preference})` : ''}`;
+        });
+        lines.push(`Estado por método: ${detail.join(' | ')}`);
+      }
+
+      if (result.probe) {
+        lines.push(`Comprobación real (Checkout de 1,00 € caducado al momento, sin cobro): Stripe ofrecería ${probed}`);
+      }
+
+      if (result.envPaymentMethodTypes && result.envPaymentMethodTypes !== 'auto') {
         lines.push('');
-        lines.push('Bizum NO saldrá en el Checkout: Stripe lo marca como no disponible en esta cuenta o modo. Actívalo en Dashboard > Settings > Payment methods > Bizum (en modo test y en modo real por separado).');
+        lines.push(`Aviso: en el servidor hay una lista fija de métodos (STRIPE_PAYMENT_METHOD_TYPES=${result.envPaymentMethodTypes}). Bórrala en Render o ponla en 'auto' para que Stripe use los métodos activados en el Dashboard.`);
+      }
+
+      if (!bizumOnOffer) {
+        lines.push('');
+        lines.push('Bizum NO saldrá en el Checkout: Stripe no lo ofrece en esta cuenta o modo. Actívalo en Dashboard > Settings > Payment methods > Bizum (el modo test y el real se activan por separado).');
+        setStripeDashboardUrl(result.dashboardUrl || 'https://dashboard.stripe.com/settings/payment_methods');
       }
 
       if (!bizumEnabled && !bizum.available) {
         lines.push('');
-        lines.push('Para que Bizum aparezca, actívalo en el Dashboard de Stripe: Settings > Payment methods > Bizum (en modo test y en modo real). Tu cuenta debe estar dada de alta en España.');
-      } else if (bizumEnabled) {
+        lines.push('Para que Bizum aparezca, actívalo en el Dashboard de Stripe: Settings > Payment methods > Bizum. Tu cuenta debe estar dada de alta en España.');
+        setStripeDashboardUrl(result.dashboardUrl || 'https://dashboard.stripe.com/settings/payment_methods');
+      } else if (bizumOnOffer) {
         lines.push('');
         lines.push('Bizum está listo. Al escanear el QR, el cliente podrá elegir Bizum e introducir su número de teléfono.');
       }
@@ -3410,6 +3451,14 @@ export default function TpvScreen() {
               </Pressable>
               {stripeMethodsInfo ? (
                 <Text style={{ color: '#0f172a', fontSize: 12, marginTop: 10, lineHeight: 18 }}>{stripeMethodsInfo}</Text>
+              ) : null}
+              {stripeDashboardUrl ? (
+                <Pressable
+                  style={[styles.secondaryButton, { marginTop: 8 }]}
+                  onPress={() => void Linking.openURL(stripeDashboardUrl)}
+                >
+                  <Text style={styles.secondaryButtonText}>{tr('stripe.openDashboard')}</Text>
+                </Pressable>
               ) : null}
               {stripeMethodsError ? (
                 <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 10 }}>{stripeMethodsError}</Text>

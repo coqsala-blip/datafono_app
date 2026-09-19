@@ -17,15 +17,16 @@ const stripe = STRIPE_SECRET_KEY ? Stripe(STRIPE_SECRET_KEY) : null;
 const stripeCurrency = 'eur';
 
 // Métodos de pago del cobro online (solo cobros puntuales, en EUR).
-// Por defecto tarjeta + métodos locales europeos: card, bizum (España), mb_way (Portugal),
-// bancontact (Bélgica), eps (Austria), ideal (Países Bajos) y wero (paneuropeo, en preview).
-// En el Checkout solo aparecen los que estén ACTIVADOS en Settings > Payment methods del
-// Dashboard de Stripe; los no disponibles se retiran automáticamente con reintento.
-// Con 'auto' se dejan como métodos dinámicos: Stripe mostraría todos los activados en el
-// Dashboard. También puedes poner tu propia lista, p. ej. 'card,bizum'.
-// Referencia: https://docs.stripe.com/payments/payment-methods/overview
+// Por defecto se usan MÉTODOS DINÁMICOS (equivalente a 'auto'): no se envía payment_method_types
+// al Checkout y es Stripe quien muestra los métodos ACTIVADOS en Settings > Payment methods del
+// Dashboard (Bizum en España, MB WAY en Portugal, Bancontact en Bélgica, EPS en Austria, iDEAL en
+// Países Bajos, Wero paneuropeo...). Es el modo recomendado por Stripe y el que garantiza que lo
+// activado en el Dashboard salga siempre, sin listas en el código.
+// Si prefieres limitarlo a mano, define STRIPE_PAYMENT_METHOD_TYPES con tu lista, p. ej.
+// 'card,bizum': en ese caso los métodos no activados se retiran solos con reintentos acotados.
+// Referencia: https://docs.stripe.com/payments/payment-methods/dynamic-payment-methods
 const EUR_LOCAL_PAYMENT_METHODS = ['bizum', 'mb_way', 'bancontact', 'eps', 'ideal', 'wero'];
-const stripePaymentMethodTypesSetting = String(process.env.STRIPE_PAYMENT_METHOD_TYPES || 'card,bizum,mb_way,bancontact,eps,ideal,wero').trim().toLowerCase();
+const stripePaymentMethodTypesSetting = String(process.env.STRIPE_PAYMENT_METHOD_TYPES || 'auto').trim().toLowerCase();
 const stripeDynamicPaymentMethods = stripePaymentMethodTypesSetting === '' || stripePaymentMethodTypesSetting === 'auto';
 const stripePaymentMethodTypes = stripeDynamicPaymentMethods
   ? []
@@ -114,7 +115,14 @@ const createCheckoutSessionWithLocalMethodsFallback = async (params, requestedPa
       const session = await stripeClient.checkout.sessions.create(
         Array.isArray(currentTypes) ? { ...params, payment_method_types: currentTypes } : params,
       );
-      return { session, paymentMethodTypes: currentTypes };
+      // Con métodos dinámicos (currentTypes null) se devuelve la lista que Stripe resuelve para la
+      // sesión, para poder mostrar al vendedor qué métodos ofrecerá este cobro concreto.
+      const resolvedTypes = Array.isArray(currentTypes)
+        ? currentTypes
+        : (Array.isArray(session?.payment_method_types) && session.payment_method_types.length > 0
+          ? session.payment_method_types
+          : null);
+      return { session, paymentMethodTypes: resolvedTypes };
     } catch (error) {
       const requestedLocal = Array.isArray(currentTypes) && currentTypes.some((method) => EUR_LOCAL_PAYMENT_METHODS.includes(method));
       if (!requestedLocal || removalsLeft <= 0 || !isLocalPaymentMethodUnavailableError(error)) {
@@ -619,12 +627,17 @@ app.get('/api/stripe/payment/:paymentId', requireAuth, async (req, res) => {
   }
 });
 
-// Diagnóstico: indica si Bizum está disponible y activado en la cuenta de Stripe.
+// Diagnóstico: indica qué métodos saldrán en el Checkout y el estado de Bizum en la cuenta.
+// Admite ?probe=1: crea una sesión de Checkout real de 1,00 € (se caduca al momento, no cobra nada)
+// y devuelve los métodos que Stripe resuelve de verdad para esta cuenta.
 app.get('/api/stripe/payment-methods', requireAuth, async (req, res) => {
   const warnings = [];
   const bizum = { capability: null, enabledInDashboard: null, available: null };
+  const methods = {};
   let livemode = null;
+  let accountCountry = null;
   let effectiveCheckoutMethods = null;
+  let probe = null;
 
   try {
     const stripeClient = requireStripe();
@@ -633,6 +646,7 @@ app.get('/api/stripe/payment-methods', requireAuth, async (req, res) => {
       const account = await stripeClient.accounts.retrieve();
       bizum.capability = account?.capabilities?.bizum_payments || null;
       livemode = account?.livemode ?? null;
+      accountCountry = account?.country || null;
     } catch (error) {
       warnings.push(`No se pudieron leer las capacidades de la cuenta: ${error.message}`);
     }
@@ -641,6 +655,13 @@ app.get('/api/stripe/payment-methods', requireAuth, async (req, res) => {
     try {
       configuration = await readDefaultPaymentMethodConfiguration();
       livemode = livemode ?? configuration?.livemode ?? null;
+      for (const method of ['card', ...EUR_LOCAL_PAYMENT_METHODS]) {
+        const entry = configuration?.[method];
+        methods[method] = {
+          available: typeof entry?.available === 'boolean' ? entry.available : null,
+          preference: entry?.display_preference?.value || null,
+        };
+      }
       if (configuration?.bizum) {
         bizum.available = configuration.bizum.available === true;
         bizum.enabledInDashboard = configuration.bizum.display_preference?.value || null;
@@ -649,22 +670,71 @@ app.get('/api/stripe/payment-methods', requireAuth, async (req, res) => {
       warnings.push(`No se pudo leer la configuración de métodos de pago: ${error.message}`);
     }
 
-    // Lista efectiva que se pedirá en el Checkout tras el prefiltrado (misma regla que el cobro).
-    if (!stripeDynamicPaymentMethods) {
+    // Lista efectiva que se pedirá en el Checkout (misma regla que el cobro real).
+    if (stripeDynamicPaymentMethods) {
+      effectiveCheckoutMethods = 'dinámicos';
+    } else {
       const effective = stripePaymentMethodTypes.filter((method) => method === 'card' || configuration?.[method]?.available !== false);
       effectiveCheckoutMethods = effective.length > 0 ? effective : ['card'];
     }
 
+    // Sondeo opcional: comprobar con Stripe qué métodos resolvería el Checkout de verdad.
+    if (String(req.query?.probe || '') === '1') {
+      try {
+        const probeTypes = resolveCheckoutPaymentMethodTypes(100);
+        const { session, paymentMethodTypes } = await createCheckoutSessionWithLocalMethodsFallback({
+          mode: 'payment',
+          ...(probeTypes ? { payment_method_types: probeTypes } : {}),
+          line_items: [
+            {
+              quantity: 1,
+              price_data: {
+                currency: stripeCurrency,
+                unit_amount: 100,
+                product_data: { name: 'Comprobación de métodos de pago' },
+              },
+            },
+          ],
+          metadata: { supabase_user_id: req.user.id, diagnostic: 'payment-methods-probe' },
+          success_url: `${PUBLIC_API_URL}/stripe/complete`,
+          cancel_url: `${PUBLIC_API_URL}/stripe/cancel`,
+        }, probeTypes);
+
+        probe = {
+          requested: paymentMethodTypes || 'dinámicos',
+          resolved: Array.isArray(session.payment_method_types) ? session.payment_method_types : null,
+          amount: session.amount_total,
+          currency: session.currency,
+        };
+
+        try {
+          await stripeClient.checkout.sessions.expire(session.id);
+        } catch (error) {
+          warnings.push(`La sesión de comprobación no se pudo caducar: ${error.message}`);
+        }
+      } catch (error) {
+        warnings.push(`No se pudo comprobar el Checkout real: ${error.message}`);
+      }
+    }
+
     return res.json({
       ok: true,
+      checkoutMode: stripeDynamicPaymentMethods ? 'dynamic' : 'list',
       dynamicPaymentMethods: stripeDynamicPaymentMethods,
+      envPaymentMethodTypes: process.env.STRIPE_PAYMENT_METHOD_TYPES ?? null,
       configuredSetting: stripeDynamicPaymentMethods ? 'auto' : stripePaymentMethodTypes.join(','),
       requestedForOnlinePayments: stripeDynamicPaymentMethods
         ? 'Dinámicos: Stripe muestra los métodos activados en el Dashboard'
         : stripePaymentMethodTypes,
       effectiveCheckoutMethods,
+      methods,
       livemode,
+      accountCountry,
+      dashboardUrl: livemode === true
+        ? 'https://dashboard.stripe.com/settings/payment_methods'
+        : 'https://dashboard.stripe.com/test/settings/payment_methods',
       bizum,
+      probe,
       warnings,
     });
   } catch (error) {
