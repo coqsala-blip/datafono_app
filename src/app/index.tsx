@@ -52,6 +52,8 @@ type StripePaymentMethodsResult = {
   ok?: boolean;
   configuredSetting?: string;
   requestedForOnlinePayments?: string[] | string;
+  effectiveCheckoutMethods?: string[] | null;
+  livemode?: boolean | null;
   bizum?: { capability?: string | null; enabledInDashboard?: string | null; available?: boolean | null };
   warnings?: string[];
   error?: string;
@@ -1723,13 +1725,23 @@ export default function TpvScreen() {
       const configured = Array.isArray(result.requestedForOnlinePayments)
         ? result.requestedForOnlinePayments.join(', ')
         : (result.requestedForOnlinePayments || 'dinámicos');
+      const effective = Array.isArray(result.effectiveCheckoutMethods) && result.effectiveCheckoutMethods.length > 0
+        ? result.effectiveCheckoutMethods.join(', ')
+        : 'dinámicos';
       const bizumEnabled = bizum.enabledInDashboard === 'on';
       const lines = [
-        `Métodos en el cobro online: ${configured}`,
+        `Modo de Stripe: ${result.livemode === true ? 'REAL (live): cobra dinero de verdad' : result.livemode === false ? 'PRUEBAS (test)' : 'desconocido'}`,
+        `Métodos configurados: ${configured}`,
+        `Saldrán en el Checkout: ${effective}`,
         `Bizum activado en tu cuenta: ${bizumEnabled ? 'SÍ' : 'NO'}`,
         `Bizum disponible en Stripe: ${bizum.available ? 'SÍ' : 'NO'}`,
         `Capacidad de Bizum: ${bizum.capability || 'sin activar'}`,
       ];
+
+      if (!effective.includes('bizum')) {
+        lines.push('');
+        lines.push('Bizum NO saldrá en el Checkout: Stripe lo marca como no disponible en esta cuenta o modo. Actívalo en Dashboard > Settings > Payment methods > Bizum (en modo test y en modo real por separado).');
+      }
 
       if (!bizumEnabled && !bizum.available) {
         lines.push('');

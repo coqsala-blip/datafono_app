@@ -79,13 +79,15 @@ const getPaymentMethodConfiguration = async () => {
   return cachedPaymentMethodConfiguration;
 };
 
-// Deja en la lista solo los métodos que Stripe reporta disponibles; la tarjeta siempre se mantiene.
+// Deja en la lista los métodos que Stripe no marca explícitamente como no disponibles; la tarjeta
+// siempre se mantiene. Regla conservadora: si la configuración no menciona a un método, se conserva
+// y será el reintento acotado quien lo retire si Stripe lo rechaza.
 const filterAvailablePaymentMethods = async (paymentMethodTypes) => {
   if (!Array.isArray(paymentMethodTypes)) return paymentMethodTypes;
   const configuration = await getPaymentMethodConfiguration();
   if (!configuration) return paymentMethodTypes;
   const available = paymentMethodTypes.filter((method) => (
-    method === 'card' || configuration[method]?.available === true
+    method === 'card' || configuration[method]?.available !== false
   ));
   return available.length > 0 ? available : ['card'];
 };
@@ -614,6 +616,8 @@ app.get('/api/stripe/payment/:paymentId', requireAuth, async (req, res) => {
 app.get('/api/stripe/payment-methods', requireAuth, async (req, res) => {
   const warnings = [];
   const bizum = { capability: null, enabledInDashboard: null, available: null };
+  let livemode = null;
+  let effectiveCheckoutMethods = null;
 
   try {
     const stripeClient = requireStripe();
@@ -621,19 +625,28 @@ app.get('/api/stripe/payment-methods', requireAuth, async (req, res) => {
     try {
       const account = await stripeClient.accounts.retrieve();
       bizum.capability = account?.capabilities?.bizum_payments || null;
+      livemode = account?.livemode ?? null;
     } catch (error) {
       warnings.push(`No se pudieron leer las capacidades de la cuenta: ${error.message}`);
     }
 
+    let configuration = null;
     try {
       const configurations = await stripeClient.paymentMethodConfigurations.list({ limit: 1 });
-      const config = configurations?.data?.[0] || null;
-      if (config?.bizum) {
-        bizum.available = config.bizum.available === true;
-        bizum.enabledInDashboard = config.bizum.display_preference?.value || null;
+      configuration = configurations?.data?.[0] || null;
+      livemode = livemode ?? configuration?.livemode ?? null;
+      if (configuration?.bizum) {
+        bizum.available = configuration.bizum.available === true;
+        bizum.enabledInDashboard = configuration.bizum.display_preference?.value || null;
       }
     } catch (error) {
       warnings.push(`No se pudo leer la configuración de métodos de pago: ${error.message}`);
+    }
+
+    // Lista efectiva que se pedirá en el Checkout tras el prefiltrado (misma regla que el cobro).
+    if (!stripeDynamicPaymentMethods) {
+      const effective = stripePaymentMethodTypes.filter((method) => method === 'card' || configuration?.[method]?.available !== false);
+      effectiveCheckoutMethods = effective.length > 0 ? effective : ['card'];
     }
 
     return res.json({
@@ -643,6 +656,8 @@ app.get('/api/stripe/payment-methods', requireAuth, async (req, res) => {
       requestedForOnlinePayments: stripeDynamicPaymentMethods
         ? 'Dinámicos: Stripe muestra los métodos activados en el Dashboard'
         : stripePaymentMethodTypes,
+      effectiveCheckoutMethods,
+      livemode,
       bizum,
       warnings,
     });
