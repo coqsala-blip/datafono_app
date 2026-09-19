@@ -665,6 +665,7 @@ app.get('/api/stripe/payment-methods', requireAuth, async (req, res) => {
       for (const method of ['card', ...EUR_LOCAL_PAYMENT_METHODS]) {
         const entry = configuration?.[method];
         methods[method] = {
+          present: Boolean(entry),
           available: typeof entry?.available === 'boolean' ? entry.available : null,
           preference: entry?.display_preference?.value || null,
         };
@@ -814,10 +815,22 @@ app.post('/api/stripe/enable-bizum', requireAuth, async (req, res) => {
         capability,
       });
     } catch (error) {
+      const raw = String(error?.message || 'error desconocido de Stripe');
+      const lower = raw.toLowerCase();
+      let hint = '';
+      if (lower.includes('not activated') || lower.includes('not enabled') || lower.includes('not available') || lower.includes('unsupported')) {
+        hint = ' Stripe todavía no permite Bizum en esta cuenta: hay que activar la capacidad de Bizum (Dashboard → Settings → Payment methods → Bizum → "Turn on"). Si la opción no aparece o queda en revisión, escribe a soporte de Stripe pidiendo activar la capacidad "bizum_payments".';
+      }
+      if (account?.country && account.country !== 'ES') {
+        hint += ` Además, tu cuenta está dada de alta en "${account.country}" y Bizum solo admite negocios con ubicación en España.`;
+      }
+      if (!account) {
+        hint += ' No se pudieron leer los datos de la cuenta de Stripe para dar más detalle.';
+      }
       return res.status(502).json({
         ok: false,
         activated: false,
-        error: `Stripe no permitió activar Bizum: ${error.message}`,
+        error: `Stripe no permitió activar Bizum: ${raw}.${hint}`,
         configurationId: configuration.id,
         before,
         accountCountry: account?.country || null,

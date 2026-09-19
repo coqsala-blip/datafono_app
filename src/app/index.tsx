@@ -69,7 +69,7 @@ type StripePaymentMethodsResult = {
   configuredSetting?: string;
   requestedForOnlinePayments?: string[] | string;
   effectiveCheckoutMethods?: string[] | string | null;
-  methods?: Record<string, { available?: boolean | null; preference?: string | null }>;
+  methods?: Record<string, { present?: boolean; available?: boolean | null; preference?: string | null }>;
   livemode?: boolean | null;
   accountCountry?: string | null;
   accountInfo?: {
@@ -1796,7 +1796,9 @@ export default function TpvScreen() {
 
       if (result.methods && Object.keys(result.methods).length > 0) {
         const detail = Object.entries(result.methods).map(([method, entry]) => {
-          const state = entry?.available === true ? 'disponible' : entry?.available === false ? 'NO disponible' : 'sin datos';
+          const state = entry?.present === false
+            ? 'no está en la configuración'
+            : entry?.available === true ? 'disponible' : entry?.available === false ? 'NO disponible' : 'sin datos';
           return `${method}: ${state}${entry?.preference ? ` (${entry.preference})` : ''}`;
         });
         lines.push(`Estado por método: ${detail.join(' | ')}`);
@@ -1833,6 +1835,9 @@ export default function TpvScreen() {
         setStripeDashboardUrl(result.dashboardUrl || 'https://dashboard.stripe.com/settings/payment_methods');
       } else if (bizum.enabledInDashboard === 'off') {
         lines.push('VEREDICTO: Bizum está desactivado (off) en la configuración de métodos de pago. Actívalo en Settings → Payment methods → Bizum.');
+        setStripeDashboardUrl(result.dashboardUrl || 'https://dashboard.stripe.com/settings/payment_methods');
+      } else if (result.methods?.bizum?.present === false) {
+        lines.push('VEREDICTO: Bizum no está incluido en la configuración de métodos de pago que usa el Checkout. Pulsa "Intentar activar Bizum automáticamente" para añadirlo, o hazlo en Settings → Payment methods → Bizum → "Turn on".');
         setStripeDashboardUrl(result.dashboardUrl || 'https://dashboard.stripe.com/settings/payment_methods');
       } else if (result.probe && !bizumOnOffer) {
         lines.push('VEREDICTO: tu cuenta sí contempla Bizum, pero Stripe no lo ofrece en este Checkout. Causas típicas: reglas de métodos de pago o un A/B test activo en el Dashboard (Settings → Payment methods → Rules / A/B tests), o que el comprador no esté en España (Bizum solo se ofrece a clientes con móvil e IBAN españoles).');
