@@ -1437,6 +1437,11 @@ export default function TpvScreen() {
         lines.push('Bizum está listo. Al escanear el QR, el cliente podrá elegir Bizum e introducir su número de teléfono.');
       }
 
+      if (Array.isArray(result.warnings) && result.warnings.length > 0) {
+        lines.push('');
+        lines.push(`Avisos: ${result.warnings.join(' | ')}`);
+      }
+
       setStripeMethodsInfo(lines.join('\n'));
     } catch (error) {
       setStripeMethodsError(error instanceof Error ? error.message : 'No se pudo comprobar los métodos de pago.');
