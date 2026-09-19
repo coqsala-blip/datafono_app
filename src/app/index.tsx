@@ -47,6 +47,14 @@ type PendingInvoice = { client: Client; items: InvoiceItem[]; ivaRate: number; t
 type StripeTerminalPaymentIntentResult = { paymentIntentId?: string; clientSecret?: string; error?: string };
 type StripeOnlinePaymentResult = { paymentId?: string; checkoutUrl?: string; redirectUrl?: string; qrDataUrl?: string | null; paymentMethods?: string[] | 'auto'; error?: string };
 type StripeOnlinePaymentStatusResult = { status?: string; paymentStatus?: string; checkoutStatus?: string; error?: string };
+type StripePaymentMethodsResult = {
+  ok?: boolean;
+  configuredSetting?: string;
+  requestedForOnlinePayments?: string[] | string;
+  bizum?: { capability?: string | null; enabledInDashboard?: string | null; available?: boolean | null };
+  warnings?: string[];
+  error?: string;
+};
 
 const configuredDocumentApiUrl = process.env.EXPO_PUBLIC_DOCUMENT_API_URL?.replace(/\/$/, '');
 const DOCUMENT_API_URL_CANDIDATES = configuredDocumentApiUrl ? [configuredDocumentApiUrl] : [];
@@ -302,6 +310,11 @@ export default function TpvScreen() {
   const [onlinePaymentError, setOnlinePaymentError] = useState('');
   const [onlinePaymentMessage, setOnlinePaymentMessage] = useState('');
   const [onlinePayment, setOnlinePayment] = useState<{ paymentId: string; checkoutUrl: string; qrDataUrl: string | null } | null>(null);
+
+  // Diagnóstico del estado de Bizum en la cuenta de Stripe
+  const [stripeMethodsLoading, setStripeMethodsLoading] = useState(false);
+  const [stripeMethodsInfo, setStripeMethodsInfo] = useState('');
+  const [stripeMethodsError, setStripeMethodsError] = useState('');
 
   // Facturas y productos
   const [invoiceItems, setInvoiceItems] = useState<InvoiceItem[]>([{ id: '1', description: '', price: '' }]);
@@ -1383,6 +1396,53 @@ export default function TpvScreen() {
     if (!onlinePayment?.checkoutUrl) return;
     await WebBrowser.openBrowserAsync(onlinePayment.checkoutUrl);
     await checkOnlinePaymentStatus();
+  };
+
+  const checkStripePaymentMethods = async () => {
+    if (!accessToken || !configuredDocumentApiUrl) {
+      Alert.alert('Sesión requerida', 'Inicia sesión para comprobar los métodos de pago.');
+      return;
+    }
+
+    setStripeMethodsLoading(true);
+    setStripeMethodsError('');
+    setStripeMethodsInfo('');
+
+    try {
+      const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/stripe/payment-methods`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      }, 15000);
+      const result = await response.json() as StripePaymentMethodsResult;
+      if (!response.ok) {
+        throw new Error(result.error || 'No se pudo consultar el estado en Stripe.');
+      }
+
+      const bizum = result.bizum || {};
+      const configured = Array.isArray(result.requestedForOnlinePayments)
+        ? result.requestedForOnlinePayments.join(', ')
+        : (result.requestedForOnlinePayments || 'dinámicos');
+      const bizumEnabled = bizum.enabledInDashboard === 'on';
+      const lines = [
+        `Métodos en el cobro online: ${configured}`,
+        `Bizum activado en tu cuenta: ${bizumEnabled ? 'SÍ' : 'NO'}`,
+        `Bizum disponible en Stripe: ${bizum.available ? 'SÍ' : 'NO'}`,
+        `Capacidad de Bizum: ${bizum.capability || 'sin activar'}`,
+      ];
+
+      if (!bizumEnabled && !bizum.available) {
+        lines.push('');
+        lines.push('Para que Bizum aparezca, actívalo en el Dashboard de Stripe: Settings > Payment methods > Bizum (en modo test y en modo real). Tu cuenta debe estar dada de alta en España.');
+      } else if (bizumEnabled) {
+        lines.push('');
+        lines.push('Bizum está listo. Al escanear el QR, el cliente podrá elegir Bizum e introducir su número de teléfono.');
+      }
+
+      setStripeMethodsInfo(lines.join('\n'));
+    } catch (error) {
+      setStripeMethodsError(error instanceof Error ? error.message : 'No se pudo comprobar los métodos de pago.');
+    } finally {
+      setStripeMethodsLoading(false);
+    }
   };
 
   const pickExpenseImage = async (useCamera: boolean) => {
@@ -2986,6 +3046,26 @@ export default function TpvScreen() {
                 <Text style={[styles.statLabel, { fontWeight: 'bold' }]}>Total mensual con IVA:</Text>
                 <Text style={[styles.statValue, { color: '#16a34a', fontWeight: 'bold' }]}>{formatCurrency(currentSubscriptionTotal * 1.21)}</Text>
               </View>
+            </View>
+
+            <View style={styles.card}>
+              <Text style={styles.cardTitle}>💳 ESTADO DE COBROS CON STRIPE</Text>
+              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>
+                En el cobro con enlace o QR se ofrecen tarjeta y Bizum. Comprueba aquí si Bizum está activado en tu cuenta de Stripe.
+              </Text>
+              <Pressable
+                style={[styles.secondaryButton, { marginTop: 8 }]}
+                onPress={checkStripePaymentMethods}
+                disabled={stripeMethodsLoading}
+              >
+                <Text style={styles.secondaryButtonText}>{stripeMethodsLoading ? 'Comprobando...' : 'Comprobar Bizum en Stripe'}</Text>
+              </Pressable>
+              {stripeMethodsInfo ? (
+                <Text style={{ color: '#0f172a', fontSize: 12, marginTop: 10, lineHeight: 18 }}>{stripeMethodsInfo}</Text>
+              ) : null}
+              {stripeMethodsError ? (
+                <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 10 }}>{stripeMethodsError}</Text>
+              ) : null}
             </View>
 
             <View style={styles.card}>

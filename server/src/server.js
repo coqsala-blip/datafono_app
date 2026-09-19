@@ -16,12 +16,13 @@ const STRIPE_ADDITIONAL_USER_PRICE_ID = process.env.STRIPE_ADDITIONAL_USER_PRICE
 const stripe = STRIPE_SECRET_KEY ? Stripe(STRIPE_SECRET_KEY) : null;
 const stripeCurrency = 'eur';
 
-// Métodos de pago del Checkout online (solo cobros puntuales).
-// 'auto' (recomendado por Stripe) = métodos dinámicos: NO se envía payment_method_types, por lo que
-// Stripe muestra los métodos activados en el Dashboard que sean elegibles para el cliente y el
-// importe. Así Bizum aparece sin más cambios de código (solo hay que activarlo en el Dashboard).
+// Métodos de pago del cobro online (solo cobros puntuales).
+// Por defecto 'card,bizum': en el Checkout se muestran ÚNICAMENTE tarjeta y Bizum, sin los demás
+// métodos que Stripe activa por defecto en la cuenta (Klarna, Bancontact, Amazon Pay, etc.).
+// Con 'auto' se dejan como métodos dinámicos: Stripe mostraría todos los que estén activados en el
+// Dashboard. También puedes poner tu propia lista, p. ej. 'card'.
 // Referencia: https://docs.stripe.com/payments/bizum/accept-a-payment
-const stripePaymentMethodTypesSetting = String(process.env.STRIPE_PAYMENT_METHOD_TYPES || 'auto').trim().toLowerCase();
+const stripePaymentMethodTypesSetting = String(process.env.STRIPE_PAYMENT_METHOD_TYPES || 'card,bizum').trim().toLowerCase();
 const stripeDynamicPaymentMethods = stripePaymentMethodTypesSetting === '' || stripePaymentMethodTypesSetting === 'auto';
 const stripePaymentMethodTypes = stripeDynamicPaymentMethods
   ? []

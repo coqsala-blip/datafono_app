@@ -108,11 +108,16 @@ Requisitos de Bizum según Stripe (https://docs.stripe.com/payments/bizum):
 - Reembolsos totales y parciales, pero **asíncronos (pueden tardar hasta 5 minutos)**. Se admiten
   disputas hasta 120 días después del cobro.
 
-El backend usa **métodos de pago dinámicos** (no envía `payment_method_types` cuando
-`STRIPE_PAYMENT_METHOD_TYPES=auto`, que es el valor recomendado por Stripe): así Stripe muestra a
-cada cliente los métodos activados en el Dashboard que sean elegibles por país, divisa e importe.
-Si necesitas fijar la lista, usa `STRIPE_PAYMENT_METHOD_TYPES=card,bizum`; en ese caso el backend
-excluye Bizum automáticamente para importes fuera del rango 0,50 €–5.000 €.
+El backend pide explícitamente **tarjeta y Bizum** (`STRIPE_PAYMENT_METHOD_TYPES=card,bizum`, valor
+por defecto), de modo que el Checkout muestra únicamente esos dos métodos y **no** los demás que
+Stripe activa por defecto en la cuenta (Klarna, Bancontact, Amazon Pay, etc.). Si se prefiere que
+Stripe decida automáticamente según el Dashboard, usa `STRIPE_PAYMENT_METHOD_TYPES=auto` (métodos
+dinámicos). En el caso de una lista explícita, el backend **excluye Bizum automáticamente** para
+importes fuera del rango 0,50 €–5.000 € y, si Stripe responde que Bizum no está activado en la
+cuenta, **reintenta el cobro solo con tarjeta** en lugar de fallar.
+
+`GET /api/stripe/payment-methods` (requiere sesión) devuelve el estado real de la cuenta, y en la app
+puedes verlo en **Config → "Comprobar Bizum en Stripe"**.
 
 Pruebas en modo test: en el Checkout elige Bizum y usa el teléfono `+34600000002` para simular un
 rechazo del banco; cualquier otro número simula un pago correcto.
