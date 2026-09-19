@@ -112,8 +112,10 @@ El backend pide explícitamente **tarjeta + métodos locales europeos**
 (`STRIPE_PAYMENT_METHOD_TYPES=card,bizum,mb_way,bancontact,eps,ideal,wero`, valor por defecto), de
 modo que el Checkout muestra esos métodos y **no** los demás que Stripe activa por defecto en la
 cuenta (Klarna, Amazon Pay, etc.). En cada país solo se mostrarán los métodos **activados en
-Settings → Payment methods del Dashboard**: si Stripe responde que uno no está disponible, el
-backend **lo retira y reintenta automáticamente** en lugar de fallar. Si se prefiere que Stripe
+Settings → Payment methods del Dashboard**: antes de cada cobro el backend consulta la
+configuración real de la cuenta y solo pide los disponibles (cacheada 10 minutos); si Stripe
+respondiera que uno no está disponible, el backend **lo retira y reintenta automáticamente**
+(con límite) en lugar de fallar. Si se prefiere que Stripe
 decida automáticamente según el Dashboard, usa `STRIPE_PAYMENT_METHOD_TYPES=auto` (métodos
 dinámicos). Con una lista explícita, el backend **excluye Bizum automáticamente** para importes
 fuera del rango 0,50 €–5.000 € y, si un método local no está activado en la cuenta, **reintenta el

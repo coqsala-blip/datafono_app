@@ -43,18 +43,62 @@ const resolveCheckoutPaymentMethodTypes = (amountCents) => {
   return eligible.length > 0 ? eligible : ['card'];
 };
 
+// Comprueba si el mensaje de error menciona a un método local europeo (por palabra completa,
+// evitando falsos positivos de subcadenas como 'steps' conteniendo 'eps').
+const messageMentionsLocalMethod = (method, message) => {
+  const pattern = method.includes('_') ? method.replace(/_/g, '[_ ]') : method;
+  return new RegExp(`\\b${pattern}\\b`).test(message);
+};
+
 // Detecta el error de Stripe cuando se pide un método local que no está activado en el Dashboard.
 const isLocalPaymentMethodUnavailableError = (error) => {
   const message = String(error?.message || '').toLowerCase();
-  if (EUR_LOCAL_PAYMENT_METHODS.some((method) => message.includes(method.replace('_', ' ')) || message.includes(method))) return true;
+  if (EUR_LOCAL_PAYMENT_METHODS.some((method) => messageMentionsLocalMethod(method, message))) return true;
   return ['not activated', 'no está activado', 'not enabled', 'not supported', 'invalid payment method'].some((text) => message.includes(text));
 };
 
-// Crea la sesión de Checkout. Si se pidió un método local europeo y Stripe responde que no está
-// activado, se retira ese método y se reintenta, para que el cobro nunca se rompa. Avisando por log.
+// Configuración de métodos de pago de la cuenta (misma fuente que el diagnóstico), cacheada 10
+// minutos para no ralentizar cada cobro: indica qué métodos están realmente disponibles en Stripe.
+let cachedPaymentMethodConfiguration = null;
+let cachedPaymentMethodConfigurationAt = 0;
+const PAYMENT_METHOD_CONFIGURATION_TTL_MS = 10 * 60 * 1000;
+
+const getPaymentMethodConfiguration = async () => {
+  const now = Date.now();
+  if (cachedPaymentMethodConfiguration && now - cachedPaymentMethodConfigurationAt < PAYMENT_METHOD_CONFIGURATION_TTL_MS) {
+    return cachedPaymentMethodConfiguration;
+  }
+  try {
+    const configurations = await requireStripe().paymentMethodConfigurations.list({ limit: 1 });
+    cachedPaymentMethodConfiguration = configurations?.data?.[0] || null;
+    cachedPaymentMethodConfigurationAt = now;
+  } catch (error) {
+    // Sin configuración no se prefiltra: la lista pedida pasa tal cual y filtran los reintentos.
+    console.warn('No se pudo leer la configuración de métodos de pago de Stripe:', error.message);
+  }
+  return cachedPaymentMethodConfiguration;
+};
+
+// Deja en la lista solo los métodos que Stripe reporta disponibles; la tarjeta siempre se mantiene.
+const filterAvailablePaymentMethods = async (paymentMethodTypes) => {
+  if (!Array.isArray(paymentMethodTypes)) return paymentMethodTypes;
+  const configuration = await getPaymentMethodConfiguration();
+  if (!configuration) return paymentMethodTypes;
+  const available = paymentMethodTypes.filter((method) => (
+    method === 'card' || configuration[method]?.available === true
+  ));
+  return available.length > 0 ? available : ['card'];
+};
+
+// Crea la sesión de Checkout. Primero se filtran los métodos no disponibles según la cuenta; si aun
+// así Stripe rechaza un método local, se retira y se reintenta (con límite y garantizando progreso)
+// para que el cobro nunca se rompa. Avisando por log.
 const createCheckoutSessionWithLocalMethodsFallback = async (params, requestedPaymentMethodTypes) => {
   const stripeClient = requireStripe();
-  let currentTypes = Array.isArray(requestedPaymentMethodTypes) ? [...requestedPaymentMethodTypes] : requestedPaymentMethodTypes;
+  let currentTypes = await filterAvailablePaymentMethods(
+    Array.isArray(requestedPaymentMethodTypes) ? [...requestedPaymentMethodTypes] : requestedPaymentMethodTypes,
+  );
+  let removalsLeft = EUR_LOCAL_PAYMENT_METHODS.length;
 
   for (;;) {
     try {
@@ -64,13 +108,15 @@ const createCheckoutSessionWithLocalMethodsFallback = async (params, requestedPa
       return { session, paymentMethodTypes: currentTypes };
     } catch (error) {
       const requestedLocal = Array.isArray(currentTypes) && currentTypes.some((method) => EUR_LOCAL_PAYMENT_METHODS.includes(method));
-      if (!requestedLocal || !isLocalPaymentMethodUnavailableError(error)) {
+      if (!requestedLocal || removalsLeft <= 0 || !isLocalPaymentMethodUnavailableError(error)) {
         throw error;
       }
+      removalsLeft -= 1;
 
-      // Retirar el método mencionado en el error (si se identifica) o el último local de la lista.
+      // Retirar el método mencionado en el error SI está en la lista actual; si no, el último
+      // local de la lista. Siempre se retira uno, para que el reintento progrese siempre.
       const lower = String(error?.message || '').toLowerCase();
-      const mentioned = EUR_LOCAL_PAYMENT_METHODS.find((method) => lower.includes(method) || lower.includes(method.replace('_', ' ')));
+      const mentioned = EUR_LOCAL_PAYMENT_METHODS.find((method) => currentTypes.includes(method) && messageMentionsLocalMethod(method, lower));
       const toRemove = mentioned || [...currentTypes].reverse().find((method) => EUR_LOCAL_PAYMENT_METHODS.includes(method));
       currentTypes = currentTypes.filter((method) => method !== toRemove);
       if (currentTypes.length === 0) currentTypes = ['card'];

@@ -69,6 +69,12 @@ const fetchWithTimeout = async (url: string, options: RequestInit = {}, timeoutM
 
   try {
     return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    // AbortError expuesto tal cual confunde ('Aborted'): se traduce a un aviso accionable.
+    if (controller.signal.aborted) {
+      throw new Error(`El servidor no respondió en ${Math.round(timeoutMs / 1000)} s. Comprueba tu conexión e inténtalo de nuevo.`);
+    }
+    throw error;
   } finally {
     clearTimeout(timeoutId);
   }
@@ -1391,7 +1397,7 @@ export default function TpvScreen() {
           Authorization: `Bearer ${accessToken}`,
         },
         body: JSON.stringify({ amount: paymentAmount, orderId }),
-      }, 15000);
+      }, 30000);
       const result = await response.json() as StripeOnlinePaymentResult;
       const checkoutUrl = result.checkoutUrl || result.redirectUrl;
       if (!response.ok || !checkoutUrl || !result.paymentId) {
