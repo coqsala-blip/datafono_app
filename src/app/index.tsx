@@ -3,7 +3,6 @@ import { requestNeededAndroidPermissions, useStripeTerminal } from '@stripe/stri
 import { Camera, CameraView } from 'expo-camera';
 import * as FileSystemLegacy from 'expo-file-system/legacy';
 import * as ImagePicker from 'expo-image-picker';
-import * as Localization from 'expo-localization';
 import * as MailComposer from 'expo-mail-composer';
 import { APP_LOCALES, APP_LOCALE_STORAGE_KEY, detectDeviceLocale, isAppLocale, t as translateKey, type AppLocale } from '../i18n';
 import * as Print from 'expo-print';
@@ -321,6 +320,9 @@ export default function TpvScreen() {
   const [appLocale, setAppLocaleState] = useState<AppLocale>('es');
   const tr = useCallback((key: string) => translateKey(appLocale, key), [appLocale]);
   // Al arrancar: idioma guardado > idioma del pais del dispositivo > espanol.
+  // expo-localization es un modulo nativo: si el APK/cliente instalado es anterior a su
+  // instalacion, cargarlo estaticamente romperia el arranque. Se importa de forma dinamica
+  // y tolerante: sin el modulo, la app arranca en espanol y el selector sigue funcionando.
   useEffect(() => {
     (async () => {
       try {
@@ -332,8 +334,14 @@ export default function TpvScreen() {
       } catch {
         // Sin almacen: sigue la deteccion por dispositivo.
       }
-      const device = Localization.getLocales()[0];
-      setAppLocaleState(detectDeviceLocale(device?.regionCode, device?.languageTag));
+      try {
+        const Localization = await import('expo-localization');
+        const device = Localization.getLocales()[0];
+        setAppLocaleState(detectDeviceLocale(device?.regionCode, device?.languageTag));
+      } catch {
+        // Cliente compilado sin expo-localization (habra que regenerarlo): espanol por defecto.
+        setAppLocaleState('es');
+      }
     })();
   }, []);
   const setAppLocale = async (locale: AppLocale) => {
