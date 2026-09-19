@@ -63,14 +63,21 @@ let cachedPaymentMethodConfiguration = null;
 let cachedPaymentMethodConfigurationAt = 0;
 const PAYMENT_METHOD_CONFIGURATION_TTL_MS = 10 * 60 * 1000;
 
+// Lee la configuración de métodos de pago de la cuenta. Si hay varias (p. ej. una personalizada
+// creada desde el Dashboard), usa SIEMPRE la por defecto, que es la que aplica el Checkout.
+const readDefaultPaymentMethodConfiguration = async () => {
+  const configurations = await requireStripe().paymentMethodConfigurations.list({ limit: 10 });
+  const items = Array.isArray(configurations?.data) ? configurations.data : [];
+  return items.find((item) => item?.default === true) || items[0] || null;
+};
+
 const getPaymentMethodConfiguration = async () => {
   const now = Date.now();
   if (cachedPaymentMethodConfiguration && now - cachedPaymentMethodConfigurationAt < PAYMENT_METHOD_CONFIGURATION_TTL_MS) {
     return cachedPaymentMethodConfiguration;
   }
   try {
-    const configurations = await requireStripe().paymentMethodConfigurations.list({ limit: 1 });
-    cachedPaymentMethodConfiguration = configurations?.data?.[0] || null;
+    cachedPaymentMethodConfiguration = await readDefaultPaymentMethodConfiguration();
     cachedPaymentMethodConfigurationAt = now;
   } catch (error) {
     // Sin configuración no se prefiltra: la lista pedida pasa tal cual y filtran los reintentos.
@@ -632,8 +639,7 @@ app.get('/api/stripe/payment-methods', requireAuth, async (req, res) => {
 
     let configuration = null;
     try {
-      const configurations = await stripeClient.paymentMethodConfigurations.list({ limit: 1 });
-      configuration = configurations?.data?.[0] || null;
+      configuration = await readDefaultPaymentMethodConfiguration();
       livemode = livemode ?? configuration?.livemode ?? null;
       if (configuration?.bizum) {
         bizum.available = configuration.bizum.available === true;
