@@ -16,13 +16,16 @@ const STRIPE_ADDITIONAL_USER_PRICE_ID = process.env.STRIPE_ADDITIONAL_USER_PRICE
 const stripe = STRIPE_SECRET_KEY ? Stripe(STRIPE_SECRET_KEY) : null;
 const stripeCurrency = 'eur';
 
-// Métodos de pago del cobro online (solo cobros puntuales).
-// Por defecto 'card,bizum': en el Checkout se muestran ÚNICAMENTE tarjeta y Bizum, sin los demás
-// métodos que Stripe activa por defecto en la cuenta (Klarna, Bancontact, Amazon Pay, etc.).
-// Con 'auto' se dejan como métodos dinámicos: Stripe mostraría todos los que estén activados en el
-// Dashboard. También puedes poner tu propia lista, p. ej. 'card'.
-// Referencia: https://docs.stripe.com/payments/bizum/accept-a-payment
-const stripePaymentMethodTypesSetting = String(process.env.STRIPE_PAYMENT_METHOD_TYPES || 'card,bizum').trim().toLowerCase();
+// Métodos de pago del cobro online (solo cobros puntuales, en EUR).
+// Por defecto tarjeta + métodos locales europeos: card, bizum (España), mb_way (Portugal),
+// bancontact (Bélgica), eps (Austria), ideal (Países Bajos) y wero (paneuropeo, en preview).
+// En el Checkout solo aparecen los que estén ACTIVADOS en Settings > Payment methods del
+// Dashboard de Stripe; los no disponibles se retiran automáticamente con reintento.
+// Con 'auto' se dejan como métodos dinámicos: Stripe mostraría todos los activados en el
+// Dashboard. También puedes poner tu propia lista, p. ej. 'card,bizum'.
+// Referencia: https://docs.stripe.com/payments/payment-methods/overview
+const EUR_LOCAL_PAYMENT_METHODS = ['bizum', 'mb_way', 'bancontact', 'eps', 'ideal', 'wero'];
+const stripePaymentMethodTypesSetting = String(process.env.STRIPE_PAYMENT_METHOD_TYPES || 'card,bizum,mb_way,bancontact,eps,ideal,wero').trim().toLowerCase();
 const stripeDynamicPaymentMethods = stripePaymentMethodTypesSetting === '' || stripePaymentMethodTypesSetting === 'auto';
 const stripePaymentMethodTypes = stripeDynamicPaymentMethods
   ? []
@@ -40,32 +43,39 @@ const resolveCheckoutPaymentMethodTypes = (amountCents) => {
   return eligible.length > 0 ? eligible : ['card'];
 };
 
-// Detecta el error de Stripe cuando se pide Bizum pero no está activado en el Dashboard.
-const isBizumUnavailableError = (error) => {
+// Detecta el error de Stripe cuando se pide un método local que no está activado en el Dashboard.
+const isLocalPaymentMethodUnavailableError = (error) => {
   const message = String(error?.message || '').toLowerCase();
-  if (!message.includes('bizum')) return false;
+  if (EUR_LOCAL_PAYMENT_METHODS.some((method) => message.includes(method.replace('_', ' ')) || message.includes(method))) return true;
   return ['not activated', 'no está activado', 'not enabled', 'not supported', 'invalid payment method'].some((text) => message.includes(text));
 };
 
-// Crea la sesión de Checkout. Si se pidió Bizum y Stripe responde que no está activado, se
-// reintenta solo con tarjeta para que el cobro nunca se rompa, avisando por log.
-const createCheckoutSessionWithBizumFallback = async (params, requestedPaymentMethodTypes) => {
+// Crea la sesión de Checkout. Si se pidió un método local europeo y Stripe responde que no está
+// activado, se retira ese método y se reintenta, para que el cobro nunca se rompa. Avisando por log.
+const createCheckoutSessionWithLocalMethodsFallback = async (params, requestedPaymentMethodTypes) => {
   const stripeClient = requireStripe();
+  let currentTypes = Array.isArray(requestedPaymentMethodTypes) ? [...requestedPaymentMethodTypes] : requestedPaymentMethodTypes;
 
-  try {
-    const session = await stripeClient.checkout.sessions.create(params);
-    return { session, paymentMethodTypes: requestedPaymentMethodTypes };
-  } catch (error) {
-    const requestedBizum = Array.isArray(requestedPaymentMethodTypes) && requestedPaymentMethodTypes.includes('bizum');
-    if (!requestedBizum || !isBizumUnavailableError(error)) {
-      throw error;
+  for (;;) {
+    try {
+      const session = await stripeClient.checkout.sessions.create(
+        Array.isArray(currentTypes) ? { ...params, payment_method_types: currentTypes } : params,
+      );
+      return { session, paymentMethodTypes: currentTypes };
+    } catch (error) {
+      const requestedLocal = Array.isArray(currentTypes) && currentTypes.some((method) => EUR_LOCAL_PAYMENT_METHODS.includes(method));
+      if (!requestedLocal || !isLocalPaymentMethodUnavailableError(error)) {
+        throw error;
+      }
+
+      // Retirar el método mencionado en el error (si se identifica) o el último local de la lista.
+      const lower = String(error?.message || '').toLowerCase();
+      const mentioned = EUR_LOCAL_PAYMENT_METHODS.find((method) => lower.includes(method) || lower.includes(method.replace('_', ' ')));
+      const toRemove = mentioned || [...currentTypes].reverse().find((method) => EUR_LOCAL_PAYMENT_METHODS.includes(method));
+      currentTypes = currentTypes.filter((method) => method !== toRemove);
+      if (currentTypes.length === 0) currentTypes = ['card'];
+      console.warn(`Método ${toRemove} no disponible en tu cuenta de Stripe. Se reintenta con:`, currentTypes.join(', '), '- Actívalo en Settings > Payment methods del Dashboard.');
     }
-
-    const fallbackTypes = requestedPaymentMethodTypes.filter((method) => method !== 'bizum');
-    const safeTypes = fallbackTypes.length > 0 ? fallbackTypes : ['card'];
-    console.warn('Bizum no está disponible en tu cuenta de Stripe. Se crea el cobro con:', safeTypes.join(', '), '- Activa Bizum en Settings > Payment methods del Dashboard.');
-    const session = await stripeClient.checkout.sessions.create({ ...params, payment_method_types: safeTypes });
-    return { session, paymentMethodTypes: safeTypes };
   }
 };
 
@@ -225,7 +235,9 @@ if (NODE_ENV === 'production') {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'TPV & GESTOR backend' });
+  // RENDER_GIT_COMMIT lo inyecta Render automaticamente en cada despliegue: permite verificar
+  // desde fuera que el backend servido corresponde exactamente al commit desplegado.
+  res.json({ ok: true, service: 'TPV & GESTOR backend', commit: process.env.RENDER_GIT_COMMIT || null });
 });
 
 const getBearerToken = (req) => {
@@ -504,7 +516,7 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
       success_url: `${PUBLIC_API_URL}/stripe/complete?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${PUBLIC_API_URL}/stripe/cancel?orderId=${encodeURIComponent(orderId)}`,
     };
-    const { session, paymentMethodTypes } = await createCheckoutSessionWithBizumFallback(
+    const { session, paymentMethodTypes } = await createCheckoutSessionWithLocalMethodsFallback(
       checkoutSessionParams,
       requestedPaymentMethodTypes,
     );

@@ -108,13 +108,19 @@ Requisitos de Bizum según Stripe (https://docs.stripe.com/payments/bizum):
 - Reembolsos totales y parciales, pero **asíncronos (pueden tardar hasta 5 minutos)**. Se admiten
   disputas hasta 120 días después del cobro.
 
-El backend pide explícitamente **tarjeta y Bizum** (`STRIPE_PAYMENT_METHOD_TYPES=card,bizum`, valor
-por defecto), de modo que el Checkout muestra únicamente esos dos métodos y **no** los demás que
-Stripe activa por defecto en la cuenta (Klarna, Bancontact, Amazon Pay, etc.). Si se prefiere que
-Stripe decida automáticamente según el Dashboard, usa `STRIPE_PAYMENT_METHOD_TYPES=auto` (métodos
-dinámicos). En el caso de una lista explícita, el backend **excluye Bizum automáticamente** para
-importes fuera del rango 0,50 €–5.000 € y, si Stripe responde que Bizum no está activado en la
-cuenta, **reintenta el cobro solo con tarjeta** en lugar de fallar.
+El backend pide explícitamente **tarjeta + métodos locales europeos**
+(`STRIPE_PAYMENT_METHOD_TYPES=card,bizum,mb_way,bancontact,eps,ideal,wero`, valor por defecto), de
+modo que el Checkout muestra esos métodos y **no** los demás que Stripe activa por defecto en la
+cuenta (Klarna, Amazon Pay, etc.). En cada país solo se mostrarán los métodos **activados en
+Settings → Payment methods del Dashboard**: si Stripe responde que uno no está disponible, el
+backend **lo retira y reintenta automáticamente** en lugar de fallar. Si se prefiere que Stripe
+decida automáticamente según el Dashboard, usa `STRIPE_PAYMENT_METHOD_TYPES=auto` (métodos
+dinámicos). Con una lista explícita, el backend **excluye Bizum automáticamente** para importes
+fuera del rango 0,50 €–5.000 € y, si un método local no está activado en la cuenta, **reintenta el
+cobro sin él**. Cobertura por método: Bizum (España), MB WAY (Portugal), Bancontact (Bélgica),
+EPS (Austria), iDEAL (Países Bajos) y Wero (paneuropeo, en *private preview*). Todos requieren
+EUR y cobros puntuales; **ninguno admite suscripciones**, por lo que el plan mensual sigue
+cobrándose con tarjeta.
 
 `GET /api/stripe/payment-methods` (requiere sesión) devuelve el estado real de la cuenta, y en la app
 puedes verlo en **Config → "Comprobar Bizum en Stripe"**.

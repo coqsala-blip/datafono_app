@@ -3,7 +3,9 @@ import { requestNeededAndroidPermissions, useStripeTerminal } from '@stripe/stri
 import { Camera, CameraView } from 'expo-camera';
 import * as FileSystemLegacy from 'expo-file-system/legacy';
 import * as ImagePicker from 'expo-image-picker';
+import * as Localization from 'expo-localization';
 import * as MailComposer from 'expo-mail-composer';
+import { APP_LOCALES, APP_LOCALE_STORAGE_KEY, detectDeviceLocale, isAppLocale, t as translateKey, type AppLocale } from '../i18n';
 import * as Print from 'expo-print';
 import * as SecureStore from 'expo-secure-store';
 import * as Sharing from 'expo-sharing';
@@ -315,6 +317,34 @@ export default function TpvScreen() {
   const [onlinePaymentMessage, setOnlinePaymentMessage] = useState('');
   const [onlinePayment, setOnlinePayment] = useState<{ paymentId: string; checkoutUrl: string; qrDataUrl: string | null } | null>(null);
   const onlinePaymentConfirmedRef = useRef(false);
+  // Idioma de la app: eleccion manual guardada en AsyncStorage; si no hay, el pais del movil.
+  const [appLocale, setAppLocaleState] = useState<AppLocale>('es');
+  const tr = useCallback((key: string) => translateKey(appLocale, key), [appLocale]);
+  // Al arrancar: idioma guardado > idioma del pais del dispositivo > espanol.
+  useEffect(() => {
+    (async () => {
+      try {
+        const stored = await AsyncStorage.getItem(APP_LOCALE_STORAGE_KEY);
+        if (isAppLocale(stored)) {
+          setAppLocaleState(stored);
+          return;
+        }
+      } catch {
+        // Sin almacen: sigue la deteccion por dispositivo.
+      }
+      const device = Localization.getLocales()[0];
+      setAppLocaleState(detectDeviceLocale(device?.regionCode, device?.languageTag));
+    })();
+  }, []);
+  const setAppLocale = async (locale: AppLocale) => {
+    setAppLocaleState(locale);
+    try {
+      await AsyncStorage.setItem(APP_LOCALE_STORAGE_KEY, locale);
+      Alert.alert(tr('lang.title'), tr('lang.saved'));
+    } catch {
+      // Sin almacen persistente: el idioma se aplica solo en esta sesion.
+    }
+  };
   // Refs para leer el estado actual desde el sondeo sin depender de cierres obsoletos.
   const onlinePaymentRef = useRef<{ paymentId: string; checkoutUrl: string; qrDataUrl: string | null } | null>(null);
   const createOnlinePaymentRef = useRef<(method: string, paymentAmount: number) => void>(() => {});
@@ -2975,22 +3005,22 @@ export default function TpvScreen() {
       >
         {userRole === 'principal' && (
           <Pressable style={[styles.tabButton, activeTab === 'gastos_facturacion' && styles.tabButtonActive]} onPress={() => setActiveTab('gastos_facturacion')}>
-            <Text style={[styles.tabText, activeTab === 'gastos_facturacion' && styles.tabTextActive]}>Gastos/Facturas</Text>
+            <Text style={[styles.tabText, activeTab === 'gastos_facturacion' && styles.tabTextActive]}>{tr('tab.expenses')}</Text>
           </Pressable>
         )}
         <Pressable style={[styles.tabButton, activeTab === 'tpv' && styles.tabButtonActive]} onPress={() => setActiveTab('tpv')}>
-          <Text style={[styles.tabText, activeTab === 'tpv' && styles.tabTextActive]}>TPV Caja</Text>
+          <Text style={[styles.tabText, activeTab === 'tpv' && styles.tabTextActive]}>{tr('tab.tpv')}</Text>
         </Pressable>
         {userRole === 'principal' && (
           <>
             <Pressable style={[styles.tabButton, activeTab === 'presupuesto' && styles.tabButtonActive]} onPress={() => setActiveTab('presupuesto')}>
-              <Text style={[styles.tabText, activeTab === 'presupuesto' && styles.tabTextActive]}>Presupuesto/Factura</Text>
+              <Text style={[styles.tabText, activeTab === 'presupuesto' && styles.tabTextActive]}>{tr('tab.quote')}</Text>
             </Pressable>
             <Pressable style={[styles.tabButton, activeTab === 'stats' && styles.tabButtonActive]} onPress={() => setActiveTab('stats')}>
-              <Text style={[styles.tabText, activeTab === 'stats' && styles.tabTextActive]}>Informes</Text>
+              <Text style={[styles.tabText, activeTab === 'stats' && styles.tabTextActive]}>{tr('tab.reports')}</Text>
             </Pressable>
             <Pressable style={[styles.tabButton, activeTab === 'config' && styles.tabButtonActive]} onPress={() => { if (requireSubscription('abrir Configuración')) setActiveTab('config'); }}>
-              <Text style={[styles.tabText, activeTab === 'config' && styles.tabTextActive]}>Config</Text>
+              <Text style={[styles.tabText, activeTab === 'config' && styles.tabTextActive]}>{tr('tab.config')}</Text>
             </Pressable>
           </>
         )}
@@ -3312,16 +3342,45 @@ export default function TpvScreen() {
             </View>
 
             <View style={styles.card}>
-              <Text style={styles.cardTitle}>💳 ESTADO DE COBROS CON STRIPE</Text>
+              <Text style={styles.cardTitle}>🌍 {tr('lang.title').toUpperCase()}</Text>
+              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>{tr('lang.subtitle')}</Text>
+              {APP_LOCALES.map((option) => (
+                <Pressable
+                  key={option.code}
+                  style={{
+                    flexDirection: 'row',
+                    alignItems: 'center',
+                    paddingVertical: 10,
+                    paddingHorizontal: 12,
+                    borderRadius: 8,
+                    marginTop: 6,
+                    backgroundColor: appLocale === option.code ? '#ccfbf1' : '#f1f5f9',
+                    borderWidth: appLocale === option.code ? 2 : 0,
+                    borderColor: '#0f766e',
+                  }}
+                  onPress={() => void setAppLocale(option.code)}
+                  accessibilityRole="button"
+                  accessibilityLabel={option.label}
+                >
+                  <Text style={{ flex: 1, color: '#0f172a', fontSize: 14, fontWeight: appLocale === option.code ? 'bold' : 'normal' }}>
+                    {option.label}
+                  </Text>
+                  <Text style={{ color: '#64748b', fontSize: 11, textAlign: 'right' }}>{option.countries}</Text>
+                </Pressable>
+              ))}
+            </View>
+
+            <View style={styles.card}>
+              <Text style={styles.cardTitle}>💳 {tr('stripe.methodsTitle')}</Text>
               <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>
-                En el cobro con enlace o QR se ofrecen tarjeta y Bizum. Comprueba aquí si Bizum está activado en tu cuenta de Stripe.
+                {tr('stripe.methodsSubtitle')}
               </Text>
               <Pressable
                 style={[styles.secondaryButton, { marginTop: 8 }]}
                 onPress={checkStripePaymentMethods}
                 disabled={stripeMethodsLoading}
               >
-                <Text style={styles.secondaryButtonText}>{stripeMethodsLoading ? 'Comprobando...' : 'Comprobar Bizum en Stripe'}</Text>
+                <Text style={styles.secondaryButtonText}>{stripeMethodsLoading ? tr('common.checking') : tr('stripe.checkButton')}</Text>
               </Pressable>
               {stripeMethodsInfo ? (
                 <Text style={{ color: '#0f172a', fontSize: 12, marginTop: 10, lineHeight: 18 }}>{stripeMethodsInfo}</Text>
@@ -3439,15 +3498,15 @@ export default function TpvScreen() {
             {terminalError ? <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 10, textAlign: 'center' }}>{terminalError}</Text> : null}
 
             <Pressable style={[styles.primaryButton, { backgroundColor: '#0f766e', marginTop: 15 }]} onPress={completePayment} disabled={isProcessing}>
-              <Text style={styles.primaryButtonText}>{isProcessing ? 'Procesando...' : 'Cobrar acercando tarjeta o móvil'}</Text>
+              <Text style={styles.primaryButtonText}>{isProcessing ? tr('common.loading') : tr('pay.tapToPay')}</Text>
             </Pressable>
 
             <Pressable style={[styles.secondaryButton, { marginTop: 12 }]} onPress={openOnlinePaymentModal}>
-              <Text style={styles.secondaryButtonText}>Cobrar con enlace o QR (Bizum/tarjeta)</Text>
+              <Text style={styles.secondaryButtonText}>{tr('pay.chargeQr')}</Text>
             </Pressable>
 
             <Pressable style={[styles.secondaryButton, { marginTop: 12 }]} onPress={cancelPayment}>
-              <Text style={styles.secondaryButtonText}>Cancelar</Text>
+              <Text style={styles.secondaryButtonText}>{tr('common.cancel')}</Text>
             </Pressable>
           </View>
         </View>
@@ -3463,7 +3522,7 @@ export default function TpvScreen() {
                 Importe a cobrar: {formatCurrency(pendingInvoice ? pendingInvoice.total : amount)}
               </Text>
               <Text style={[styles.modalSubtitle, { marginBottom: 8 }]}>
-                El cliente puede pagar con tarjeta o con Bizum desde el enlace o el QR. Bizum solo está disponible para cobros puntuales de 0,50 € a 5.000 € con un banco español.
+                {tr('pay.waitBody')}
               </Text>
 
               {onlinePayment?.qrDataUrl ? (
@@ -3486,21 +3545,21 @@ export default function TpvScreen() {
               {onlinePayment ? (
                 <>
                   <Pressable style={[styles.primaryButton, { backgroundColor: '#0f766e', marginTop: 15, width: '100%' }]} onPress={openOnlinePaymentPage} disabled={onlinePaymentLoading}>
-                    <Text style={styles.primaryButtonText}>Abrir la página de pago</Text>
+                    <Text style={styles.primaryButtonText}>{tr('pay.openPage')}</Text>
                   </Pressable>
 
                   <Pressable style={[styles.secondaryButton, { marginTop: 10, width: '100%' }]} onPress={checkOnlinePaymentStatus} disabled={onlinePaymentLoading}>
-                    <Text style={styles.secondaryButtonText}>{onlinePaymentLoading ? 'Comprobando...' : 'Ya ha pagado: comprobar ahora'}</Text>
+                    <Text style={styles.secondaryButtonText}>{onlinePaymentLoading ? tr('pay.checkingShort') : tr('pay.checkNow')}</Text>
                   </Pressable>
                 </>
               ) : (
                 <Pressable style={[styles.primaryButton, { backgroundColor: '#0f766e', marginTop: 15, width: '100%' }]} onPress={createOnlinePayment} disabled={onlinePaymentLoading}>
-                  <Text style={styles.primaryButtonText}>{onlinePaymentLoading ? 'Generando...' : 'Generar enlace y QR de pago'}</Text>
+                  <Text style={styles.primaryButtonText}>{onlinePaymentLoading ? tr('pay.generatingShort') : tr('pay.newLink')}</Text>
                 </Pressable>
               )}
 
               <Pressable style={[styles.secondaryButton, { marginTop: 10, width: '100%' }]} onPress={backToTerminalModal}>
-                <Text style={styles.secondaryButtonText}>Volver</Text>
+                <Text style={styles.secondaryButtonText}>{tr('pay.back')}</Text>
               </Pressable>
             </ScrollView>
           </View>
