@@ -634,6 +634,7 @@ app.get('/api/stripe/payment-methods', requireAuth, async (req, res) => {
   const warnings = [];
   const bizum = { capability: null, enabledInDashboard: null, available: null };
   const methods = {};
+  const accountInfo = { country: null, chargesEnabled: null, payoutsEnabled: null, detailsSubmitted: null, disabledReason: null, defaultCurrency: null };
   let livemode = null;
   let accountCountry = null;
   let effectiveCheckoutMethods = null;
@@ -647,6 +648,12 @@ app.get('/api/stripe/payment-methods', requireAuth, async (req, res) => {
       bizum.capability = account?.capabilities?.bizum_payments || null;
       livemode = account?.livemode ?? null;
       accountCountry = account?.country || null;
+      accountInfo.country = account?.country || null;
+      accountInfo.chargesEnabled = account?.charges_enabled ?? null;
+      accountInfo.payoutsEnabled = account?.payouts_enabled ?? null;
+      accountInfo.detailsSubmitted = account?.details_submitted ?? null;
+      accountInfo.disabledReason = account?.requirements?.disabled_reason || null;
+      accountInfo.defaultCurrency = account?.default_currency || null;
     } catch (error) {
       warnings.push(`No se pudieron leer las capacidades de la cuenta: ${error.message}`);
     }
@@ -700,9 +707,15 @@ app.get('/api/stripe/payment-methods', requireAuth, async (req, res) => {
           cancel_url: `${PUBLIC_API_URL}/stripe/cancel`,
         }, probeTypes);
 
+        const sessionTypes = Array.isArray(session.payment_method_types) && session.payment_method_types.length > 0
+          ? session.payment_method_types
+          : null;
+
         probe = {
           requested: paymentMethodTypes || 'dinámicos',
-          resolved: Array.isArray(session.payment_method_types) ? session.payment_method_types : null,
+          resolved: sessionTypes || paymentMethodTypes,
+          resolvedFromSession: sessionTypes,
+          configurationId: session.payment_method_configuration || null,
           amount: session.amount_total,
           currency: session.currency,
         };
@@ -730,6 +743,9 @@ app.get('/api/stripe/payment-methods', requireAuth, async (req, res) => {
       methods,
       livemode,
       accountCountry,
+      accountInfo,
+      configurationId: configuration?.id || null,
+      configurationName: configuration?.name || null,
       dashboardUrl: livemode === true
         ? 'https://dashboard.stripe.com/settings/payment_methods'
         : 'https://dashboard.stripe.com/test/settings/payment_methods',
@@ -737,6 +753,80 @@ app.get('/api/stripe/payment-methods', requireAuth, async (req, res) => {
       probe,
       warnings,
     });
+  } catch (error) {
+    return res.status(502).json({ ok: false, error: `Stripe: ${error.message}` });
+  }
+});
+
+// Activa Bizum en la configuración de métodos de pago por defecto de la cuenta, con un solo clic
+// desde la app (Config -> "Intentar activar Bizum"). Usa la misma clave de Stripe del backend y
+// devuelve el resultado real de la API. Nota: solo funciona si la cuenta ya puede usar Bizum
+// (ubicación de negocio en España y capacidad verificada); si no, se devuelve el motivo exacto.
+app.post('/api/stripe/enable-bizum', requireAuth, async (req, res) => {
+  try {
+    const stripeClient = requireStripe();
+
+    let account = null;
+    try {
+      account = await stripeClient.accounts.retrieve();
+    } catch (error) {
+      console.warn('No se pudieron leer los datos de la cuenta de Stripe:', error.message);
+    }
+
+    const configuration = await readDefaultPaymentMethodConfiguration();
+    if (!configuration?.id) {
+      return res.status(409).json({
+        ok: false,
+        error: 'No se encontró la configuración de métodos de pago por defecto en tu cuenta de Stripe.',
+        accountCountry: account?.country || null,
+        dashboardUrl: account?.livemode === true
+          ? 'https://dashboard.stripe.com/settings/payment_methods'
+          : 'https://dashboard.stripe.com/test/settings/payment_methods',
+      });
+    }
+
+    const capability = String(account?.capabilities?.bizum_payments || '').toLowerCase() || null;
+    const before = {
+      available: typeof configuration?.bizum?.available === 'boolean' ? configuration.bizum.available : null,
+      preference: configuration?.bizum?.display_preference?.value || null,
+    };
+
+    try {
+      const updated = await stripeClient.paymentMethodConfigurations.update(configuration.id, {
+        bizum: { display_preference: { preference: 'on' } },
+      });
+
+      // Invalidar la caché para que el siguiente cobro y el diagnóstico lean el estado nuevo.
+      cachedPaymentMethodConfiguration = null;
+      cachedPaymentMethodConfigurationAt = 0;
+
+      return res.json({
+        ok: true,
+        activated: true,
+        configurationId: configuration.id,
+        configurationName: configuration.name || null,
+        before,
+        after: {
+          available: typeof updated?.bizum?.available === 'boolean' ? updated.bizum.available : null,
+          preference: updated?.bizum?.display_preference?.value || null,
+        },
+        accountCountry: account?.country || null,
+        capability,
+      });
+    } catch (error) {
+      return res.status(502).json({
+        ok: false,
+        activated: false,
+        error: `Stripe no permitió activar Bizum: ${error.message}`,
+        configurationId: configuration.id,
+        before,
+        accountCountry: account?.country || null,
+        capability,
+        dashboardUrl: account?.livemode === true
+          ? 'https://dashboard.stripe.com/settings/payment_methods'
+          : 'https://dashboard.stripe.com/test/settings/payment_methods',
+      });
+    }
   } catch (error) {
     return res.status(502).json({ ok: false, error: `Stripe: ${error.message}` });
   }

@@ -111,6 +111,8 @@ const es: Dict = {
   'stripe.methodsTitle': 'ESTADO DE COBROS CON STRIPE',
   'stripe.methodsSubtitle': 'En el cobro con enlace o QR se ofrecen tarjeta y métodos locales europeos. Comprueba aquí cuáles están activos en tu cuenta de Stripe.',
   'stripe.openDashboard': 'Abrir Stripe para activar Bizum',
+  'stripe.enableBizumButton': 'Intentar activar Bizum automáticamente',
+  'stripe.enablingBizum': 'Activando Bizum en Stripe...',
 };
 
 const en: Dict = {
@@ -157,6 +159,8 @@ const en: Dict = {
   'stripe.methodsTitle': 'STRIPE PAYOUT STATUS',
   'stripe.methodsSubtitle': 'Link/QR charges offer card and European local methods. Check here which ones are active in your Stripe account.',
   'stripe.openDashboard': 'Open Stripe to enable Bizum',
+  'stripe.enableBizumButton': 'Try to enable Bizum automatically',
+  'stripe.enablingBizum': 'Enabling Bizum in Stripe...',
 };
 
 const fr: Dict = {
@@ -194,6 +198,8 @@ const fr: Dict = {
   'stripe.methodsTitle': 'ÉTAT DES ENCAISSEMENTS STRIPE',
   'stripe.methodsSubtitle': 'L’encaissement par lien ou QR propose la carte et les moyens locaux européens. Vérifiez ici ceux actifs sur votre compte Stripe.',
   'stripe.openDashboard': 'Ouvrir Stripe pour activer Bizum',
+  'stripe.enableBizumButton': 'Essayer d’activer Bizum automatiquement',
+  'stripe.enablingBizum': 'Activation de Bizum dans Stripe...',
   'pay.maxAmount': 'Le montant dépasse le maximum autorisé pour le paiement en ligne.',
   'pay.sessionRequired': 'Session requise',
   'pay.sessionRequiredBody': 'Connectez-vous pour encaisser avec Stripe.',
@@ -240,6 +246,8 @@ const de: Dict = {
   'stripe.methodsTitle': 'STRIPE-ZAHLUNGSSTATUS',
   'stripe.methodsSubtitle': 'Link-/QR-Zahlungen bieten Karte und europäische lokale Methoden. Prüfen Sie hier, welche in Ihrem Stripe-Konto aktiv sind.',
   'stripe.openDashboard': 'Stripe öffnen, um Bizum zu aktivieren',
+  'stripe.enableBizumButton': 'Bizum automatisch aktivieren',
+  'stripe.enablingBizum': 'Bizum wird in Stripe aktiviert...',
   'pay.maxAmount': 'Der Betrag übersteigt das Maximum für Online-Zahlungen.',
   'pay.sessionRequired': 'Sitzung erforderlich',
   'pay.sessionRequiredBody': 'Melden Sie sich an, um mit Stripe zu kassieren.',
@@ -286,6 +294,8 @@ const it: Dict = {
   'stripe.methodsTitle': 'STATO DEGLI INCASSI STRIPE',
   'stripe.methodsSubtitle': 'L’incasso con link o QR offre carta e metodi locali europei. Verifica qui quali sono attivi sul tuo account Stripe.',
   'stripe.openDashboard': 'Apri Stripe per attivare Bizum',
+  'stripe.enableBizumButton': 'Prova ad attivare Bizum automaticamente',
+  'stripe.enablingBizum': 'Attivazione di Bizum in Stripe...',
   'pay.maxAmount': 'L’importo supera il massimo consentito per il pagamento online.',
   'pay.sessionRequired': 'Sessione richiesta',
   'pay.sessionRequiredBody': 'Accedi per incassare con Stripe.',
@@ -332,6 +342,8 @@ const pt: Dict = {
   'stripe.methodsTitle': 'ESTADO DAS COBRANÇAS STRIPE',
   'stripe.methodsSubtitle': 'A cobrança por link ou QR oferece cartão e métodos locais europeus. Verifique aqui quais estão ativos na sua conta Stripe.',
   'stripe.openDashboard': 'Abrir o Stripe para ativar o Bizum',
+  'stripe.enableBizumButton': 'Tentar ativar o Bizum automaticamente',
+  'stripe.enablingBizum': 'A ativar o Bizum no Stripe...',
   'pay.maxAmount': 'O valor excede o máximo permitido para cobranças online.',
   'pay.sessionRequired': 'Sessão necessária',
   'pay.sessionRequiredBody': 'Inicie sessão para cobrar com o Stripe.',
@@ -378,6 +390,8 @@ const nl: Dict = {
   'stripe.methodsTitle': 'STRIPE-BETALINGSSTATUS',
   'stripe.methodsSubtitle': 'Link-/QR-betalingen bieden kaart en Europese lokale methoden. Controleer hier welke actief zijn in je Stripe-account.',
   'stripe.openDashboard': 'Stripe openen om Bizum te activeren',
+  'stripe.enableBizumButton': 'Bizum automatisch proberen te activeren',
+  'stripe.enablingBizum': 'Bizum activeren in Stripe...',
   'pay.maxAmount': 'Het bedrag overschrijdt het maximum voor online betalingen.',
   'pay.sessionRequired': 'Sessie vereist',
   'pay.sessionRequiredBody': 'Log in om met Stripe te incasseren.',
@@ -424,6 +438,8 @@ const pl: Dict = {
   'stripe.methodsTitle': 'STATUS PŁATNOŚCI STRIPE',
   'stripe.methodsSubtitle': 'Płatności linkiem/QR oferują kartę i europejskie metody lokalne. Sprawdź tutaj, które są aktywne na Twoim koncie Stripe.',
   'stripe.openDashboard': 'Otwórz Stripe, aby włączyć Bizum',
+  'stripe.enableBizumButton': 'Spróbuj włączyć Bizum automatycznie',
+  'stripe.enablingBizum': 'Włączanie Bizum w Stripe...',
   'pay.maxAmount': 'Kwota przekracza maksimum dozwolone dla płatności online.',
   'pay.sessionRequired': 'Wymagana sesja',
   'pay.sessionRequiredBody': 'Zaloguj się, aby pobierać opłaty przez Stripe.',

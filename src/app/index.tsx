@@ -49,6 +49,18 @@ type PendingInvoice = { client: Client; items: InvoiceItem[]; ivaRate: number; t
 type StripeTerminalPaymentIntentResult = { paymentIntentId?: string; clientSecret?: string; error?: string };
 type StripeOnlinePaymentResult = { paymentId?: string; checkoutUrl?: string; redirectUrl?: string; qrDataUrl?: string | null; paymentMethods?: string[] | 'auto'; error?: string };
 type StripeOnlinePaymentStatusResult = { status?: string; paymentStatus?: string; checkoutStatus?: string; usedMethod?: string | null; error?: string };
+type StripeEnableBizumResult = {
+  ok?: boolean;
+  activated?: boolean;
+  configurationId?: string | null;
+  configurationName?: string | null;
+  before?: { available?: boolean | null; preference?: string | null };
+  after?: { available?: boolean | null; preference?: string | null };
+  accountCountry?: string | null;
+  capability?: string | null;
+  dashboardUrl?: string;
+  error?: string;
+};
 type StripePaymentMethodsResult = {
   ok?: boolean;
   checkoutMode?: string;
@@ -60,9 +72,26 @@ type StripePaymentMethodsResult = {
   methods?: Record<string, { available?: boolean | null; preference?: string | null }>;
   livemode?: boolean | null;
   accountCountry?: string | null;
+  accountInfo?: {
+    country?: string | null;
+    chargesEnabled?: boolean | null;
+    payoutsEnabled?: boolean | null;
+    detailsSubmitted?: boolean | null;
+    disabledReason?: string | null;
+    defaultCurrency?: string | null;
+  };
   dashboardUrl?: string;
+  configurationId?: string | null;
+  configurationName?: string | null;
   bizum?: { capability?: string | null; enabledInDashboard?: string | null; available?: boolean | null };
-  probe?: { requested?: string[] | string; resolved?: string[] | null; amount?: number; currency?: string } | null;
+  probe?: {
+    requested?: string[] | string;
+    resolved?: string[] | null;
+    resolvedFromSession?: string[] | null;
+    configurationId?: string | null;
+    amount?: number;
+    currency?: string;
+  } | null;
   warnings?: string[];
   error?: string;
 };
@@ -379,6 +408,7 @@ export default function TpvScreen() {
   const [stripeMethodsInfo, setStripeMethodsInfo] = useState('');
   const [stripeMethodsError, setStripeMethodsError] = useState('');
   const [stripeDashboardUrl, setStripeDashboardUrl] = useState('');
+  const [stripeBizumEnabling, setStripeBizumEnabling] = useState(false);
 
   // Facturas y productos
   const [invoiceItems, setInvoiceItems] = useState<InvoiceItem[]>([{ id: '1', description: '', price: '' }]);
@@ -1742,6 +1772,7 @@ export default function TpvScreen() {
       }
 
       const bizum = result.bizum || {};
+      const account = result.accountInfo || {};
       const asText = (value: string[] | string | null | undefined) => (
         Array.isArray(value) ? (value.length > 0 ? value.join(', ') : 'ninguno') : (value || 'desconocido')
       );
@@ -1750,14 +1781,17 @@ export default function TpvScreen() {
       const probed = asText(result.probe?.resolved);
       const bizumOnOffer = effective.includes('bizum') || probed.includes('bizum');
       const bizumEnabled = bizum.enabledInDashboard === 'on';
+      const accountCountry = account.country || result.accountCountry || null;
       const lines = [
         `Modo de Stripe: ${result.livemode === true ? 'REAL (live): cobra dinero de verdad' : result.livemode === false ? 'PRUEBAS (test)' : 'desconocido'}`,
-        `País de la cuenta: ${result.accountCountry || 'desconocido'}`,
+        `País de la cuenta: ${accountCountry || 'desconocido'}${accountCountry && accountCountry !== 'ES' ? ' (Bizum exige ubicación de negocio en España)' : ''}`,
         `Tipo de Checkout: ${dynamic ? 'dinámicos: Stripe usa los métodos activados en el Dashboard' : `lista fija: ${asText(result.requestedForOnlinePayments)}`}`,
+        `Configuración de métodos por defecto: ${result.configurationName || 'sin nombre'} (${result.configurationId || 'sin id'})`,
         `Saldrán en el Checkout: ${effective}`,
         `Bizum activado en tu cuenta: ${bizumEnabled ? 'SÍ' : 'NO'}`,
         `Bizum disponible en Stripe: ${bizum.available ? 'SÍ' : 'NO'}`,
         `Capacidad de Bizum: ${bizum.capability || 'sin activar'}`,
+        `Cuenta puede cobrar: ${account.chargesEnabled === true ? 'SÍ' : account.chargesEnabled === false ? 'NO' : 'desconocido'}${account.disabledReason ? ` (${account.disabledReason})` : ''}`,
       ];
 
       if (result.methods && Object.keys(result.methods).length > 0) {
@@ -1769,7 +1803,14 @@ export default function TpvScreen() {
       }
 
       if (result.probe) {
-        lines.push(`Comprobación real (Checkout de 1,00 € caducado al momento, sin cobro): Stripe ofrecería ${probed}`);
+        if (result.probe.resolvedFromSession) {
+          lines.push(`Comprobación real (Checkout de 1,00 € caducado al momento, sin cobro): Stripe ofrecería ${probed}`);
+        } else {
+          lines.push('Comprobación real: se creó y caducó un Checkout de 1,00 € sin cobrar nada. Con métodos dinámicos Stripe decide la lista según el comprador y no la devuelve cerrada, así que el estado de Bizum se lee de la configuración de tu cuenta.');
+        }
+        if (result.configurationId) {
+          lines.push(`Configuración de métodos usada: ${result.configurationName ? `${result.configurationName} ` : ''}(${result.configurationId}${result.configurationId === 'pmc_default' ? ', la por defecto' : ''})`);
+        }
       }
 
       if (result.envPaymentMethodTypes && result.envPaymentMethodTypes !== 'auto') {
@@ -1777,19 +1818,28 @@ export default function TpvScreen() {
         lines.push(`Aviso: en el servidor hay una lista fija de métodos (STRIPE_PAYMENT_METHOD_TYPES=${result.envPaymentMethodTypes}). Bórrala en Render o ponla en 'auto' para que Stripe use los métodos activados en el Dashboard.`);
       }
 
-      if (!bizumOnOffer) {
-        lines.push('');
-        lines.push('Bizum NO saldrá en el Checkout: Stripe no lo ofrece en esta cuenta o modo. Actívalo en Dashboard > Settings > Payment methods > Bizum (el modo test y el real se activan por separado).');
+      // Veredicto en lenguaje claro: por qué Bizum no sale y qué hacer exactamente.
+      lines.push('');
+      if (bizumOnOffer) {
+        lines.push('VEREDICTO: Bizum está listo. Al escanear el QR el cliente podrá elegir Bizum e introducir su número de teléfono.');
+      } else if (accountCountry && accountCountry !== 'ES') {
+        lines.push(`VEREDICTO: Bizum no puede aparecer porque tu cuenta de Stripe está dada de alta en "${accountCountry}" y Bizum solo está disponible para negocios con ubicación en España. Cambia el país de la cuenta en Stripe (Settings → Business → Country) o abre una cuenta española; el resto de métodos seguirán funcionando.`);
+        setStripeDashboardUrl('https://dashboard.stripe.com/settings/account');
+      } else if (String(bizum.capability || '').toLowerCase() !== 'active') {
+        lines.push('VEREDICTO: falta activar la capacidad de Bizum en tu cuenta. Ve a Settings → Payment methods → Bizum y pulsa "Turn on"; Stripe revisará el alta de Bizum (si no aparece la opción o queda en revisión, escribe a soporte de Stripe pidiendo activar la capacidad "bizum_payments").');
         setStripeDashboardUrl(result.dashboardUrl || 'https://dashboard.stripe.com/settings/payment_methods');
-      }
-
-      if (!bizumEnabled && !bizum.available) {
-        lines.push('');
-        lines.push('Para que Bizum aparezca, actívalo en el Dashboard de Stripe: Settings > Payment methods > Bizum. Tu cuenta debe estar dada de alta en España.');
+      } else if (bizum.available === false) {
+        lines.push('VEREDICTO: Bizum está en tu cuenta pero Stripe lo marca como NO disponible en la configuración de métodos de pago que usa el Checkout. Entra en Settings → Payment methods → Bizum y actívalo; revisa también "Payment method configurations" para que la configuración por defecto lo incluya.');
         setStripeDashboardUrl(result.dashboardUrl || 'https://dashboard.stripe.com/settings/payment_methods');
-      } else if (bizumOnOffer) {
-        lines.push('');
-        lines.push('Bizum está listo. Al escanear el QR, el cliente podrá elegir Bizum e introducir su número de teléfono.');
+      } else if (bizum.enabledInDashboard === 'off') {
+        lines.push('VEREDICTO: Bizum está desactivado (off) en la configuración de métodos de pago. Actívalo en Settings → Payment methods → Bizum.');
+        setStripeDashboardUrl(result.dashboardUrl || 'https://dashboard.stripe.com/settings/payment_methods');
+      } else if (result.probe && !bizumOnOffer) {
+        lines.push('VEREDICTO: tu cuenta sí contempla Bizum, pero Stripe no lo ofrece en este Checkout. Causas típicas: reglas de métodos de pago o un A/B test activo en el Dashboard (Settings → Payment methods → Rules / A/B tests), o que el comprador no esté en España (Bizum solo se ofrece a clientes con móvil e IBAN españoles).');
+        setStripeDashboardUrl(result.dashboardUrl || 'https://dashboard.stripe.com/settings/payment_methods');
+      } else {
+        lines.push('Bizum NO saldrá en el Checkout: Stripe no lo ofrece en esta cuenta o modo. Actívalo en Dashboard → Settings → Payment methods → Bizum (el modo test y el real se configuran por separado).');
+        setStripeDashboardUrl(result.dashboardUrl || 'https://dashboard.stripe.com/settings/payment_methods');
       }
 
       if (Array.isArray(result.warnings) && result.warnings.length > 0) {
@@ -1802,6 +1852,53 @@ export default function TpvScreen() {
       setStripeMethodsError(error instanceof Error ? error.message : 'No se pudo comprobar los métodos de pago.');
     } finally {
       setStripeMethodsLoading(false);
+    }
+  };
+
+  // Intenta activar Bizum en la configuración de métodos de pago de Stripe con un solo toque,
+  // usando la misma clave que el backend. Devuelve el resultado real de la API de Stripe.
+  const enableBizumInStripe = async () => {
+    if (!accessToken || !configuredDocumentApiUrl) {
+      Alert.alert('Sesión requerida', 'Inicia sesión para activar Bizum en Stripe.');
+      return;
+    }
+
+    setStripeBizumEnabling(true);
+    setStripeMethodsError('');
+
+    try {
+      const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/stripe/enable-bizum`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify({}),
+      }, 30000);
+      const result = await response.json() as StripeEnableBizumResult;
+
+      if (!response.ok || !result.ok) {
+        const countryNote = result.accountCountry && result.accountCountry !== 'ES'
+          ? ` Tu cuenta de Stripe está dada de alta en "${result.accountCountry}" y Bizum solo admite negocios con ubicación en España.`
+          : '';
+        setStripeMethodsError(`${result.error || 'No se pudo activar Bizum.'}${countryNote}`);
+        if (result.dashboardUrl) setStripeDashboardUrl(result.dashboardUrl);
+        return;
+      }
+
+      Alert.alert(
+        'Bizum activado en Stripe',
+        `Configuración ${result.configurationName ? `"${result.configurationName}" ` : ''}(${result.configurationId || 'por defecto'}).\n`
+        + `Antes: ${result.before?.preference || 'sin datos'} (disponible: ${result.before?.available === true ? 'SÍ' : 'NO'}).\n`
+        + `Ahora: ${result.after?.preference || 'sin datos'} (disponible: ${result.after?.available === true ? 'SÍ' : 'NO'}).`,
+      );
+
+      // Releer el estado real para mostrar el veredicto actualizado.
+      await checkStripePaymentMethods();
+    } catch (error) {
+      setStripeMethodsError(error instanceof Error ? error.message : 'No se pudo activar Bizum en Stripe.');
+    } finally {
+      setStripeBizumEnabling(false);
     }
   };
 
@@ -3452,6 +3549,13 @@ export default function TpvScreen() {
               {stripeMethodsInfo ? (
                 <Text style={{ color: '#0f172a', fontSize: 12, marginTop: 10, lineHeight: 18 }}>{stripeMethodsInfo}</Text>
               ) : null}
+              <Pressable
+                style={[styles.secondaryButton, { marginTop: 8 }]}
+                onPress={enableBizumInStripe}
+                disabled={stripeBizumEnabling || stripeMethodsLoading}
+              >
+                <Text style={styles.secondaryButtonText}>{stripeBizumEnabling ? tr('stripe.enablingBizum') : tr('stripe.enableBizumButton')}</Text>
+              </Pressable>
               {stripeDashboardUrl ? (
                 <Pressable
                   style={[styles.secondaryButton, { marginTop: 8 }]}
