@@ -137,8 +137,35 @@ const findPrincipalByEmployeeAccessCode = async (accessCode) => {
 const normalizeStripePaymentStatus = (session) => {
   if (session.payment_status === 'paid') return 'SUCCEEDED';
   if (session.status === 'expired') return 'EXPIRED';
+  // Pago rechazado (p. ej. Bizum con el banco declinando, o tarjeta denegada): Checkout queda
+  // completo pero sin cobrar y con error en el PaymentIntent. Hay que mostrarlo, no esperar.
+  const paymentIntent = session.payment_intent && typeof session.payment_intent === 'object'
+    ? session.payment_intent
+    : null;
+  if (
+    session.status === 'complete' &&
+    session.payment_status === 'unpaid' &&
+    (paymentIntent?.last_payment_error || paymentIntent?.status === 'requires_payment_method')
+  ) {
+    return 'FAILED';
+  }
   if (session.status === 'complete') return 'PROCESSING';
   return 'PENDING';
+};
+
+// Método usado en el intento de pago (card, bizum...). Null si aún no hay intento.
+const resolveOnlinePaymentUsedMethod = (session) => {
+  const paymentIntent = session.payment_intent && typeof session.payment_intent === 'object'
+    ? session.payment_intent
+    : null;
+  const methodObject = paymentIntent?.payment_method && typeof paymentIntent.payment_method === 'object'
+    ? paymentIntent.payment_method
+    : null;
+  if (typeof methodObject?.type === 'string' && methodObject.type) return methodObject.type;
+  const errorMethod = paymentIntent?.last_payment_error?.payment_method;
+  const errorMethodObject = errorMethod && typeof errorMethod === 'object' ? errorMethod : null;
+  if (typeof errorMethodObject?.type === 'string' && errorMethodObject.type) return errorMethodObject.type;
+  return null;
 };
 
 app.set('trust proxy', 1);
@@ -504,13 +531,18 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
 
 app.get('/api/stripe/payment/:paymentId', requireAuth, async (req, res) => {
   try {
-    const session = await requireStripe().checkout.sessions.retrieve(req.params.paymentId);
+    // Se expande payment_intent + payment_method para detectar rechazos (p. ej. Bizum
+    // declinado por el banco) y saber con qué método pagó el cliente.
+    const session = await requireStripe().checkout.sessions.retrieve(req.params.paymentId, {
+      expand: ['payment_intent.payment_method', 'payment_intent.last_payment_error.payment_method'],
+    });
     return res.json({
       ok: true,
       paymentId: session.id,
       status: normalizeStripePaymentStatus(session),
       checkoutStatus: session.status,
       paymentStatus: session.payment_status,
+      usedMethod: resolveOnlinePaymentUsedMethod(session),
       amount: session.amount_total,
       currency: session.currency,
     });
@@ -562,7 +594,21 @@ app.get('/api/stripe/payment-methods', requireAuth, async (req, res) => {
 });
 
 app.get('/stripe/complete', (req, res) => {
-  res.type('html').send('<h1>Pago recibido</h1><p>Puedes volver a la aplicación. El estado definitivo se confirma con Stripe.</p>');
+  const sessionId = typeof req.query.session_id === 'string' ? req.query.session_id : '';
+  const deepLink = `tpvapp://pago-completado${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''}`;
+
+  res.type('html').send(`<!doctype html>
+<html lang="es">
+  <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Pago recibido</title>
+  <style>body{font-family:system-ui,-apple-system,sans-serif;background:#f1f5f9;color:#0f172a;margin:0;padding:40px 24px;text-align:center}h1{font-size:22px}p{color:#475569;font-size:14px;line-height:20px}a{display:inline-block;margin-top:20px;padding:14px 22px;background:#0f766e;color:#ffffff;border-radius:8px;text-decoration:none;font-weight:bold}</style>
+  <script>window.location.replace(${JSON.stringify(deepLink)});</script>
+  </head>
+  <body>
+    <h1>Pago recibido</h1>
+    <p>Gracias. Volviendo a la aplicación para mostrar tu ticket...</p>
+    <a href="${deepLink}">Volver a la aplicación</a>
+  </body>
+</html>`);
 });
 
 app.get('/stripe/cancel', (req, res) => {

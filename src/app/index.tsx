@@ -8,7 +8,7 @@ import * as Print from 'expo-print';
 import * as SecureStore from 'expo-secure-store';
 import * as Sharing from 'expo-sharing';
 import * as WebBrowser from 'expo-web-browser';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Image,
@@ -46,7 +46,7 @@ type InvoiceItem = { id: string; description: string; price: string };
 type PendingInvoice = { client: Client; items: InvoiceItem[]; ivaRate: number; total: number; docType: DocumentType };
 type StripeTerminalPaymentIntentResult = { paymentIntentId?: string; clientSecret?: string; error?: string };
 type StripeOnlinePaymentResult = { paymentId?: string; checkoutUrl?: string; redirectUrl?: string; qrDataUrl?: string | null; paymentMethods?: string[] | 'auto'; error?: string };
-type StripeOnlinePaymentStatusResult = { status?: string; paymentStatus?: string; checkoutStatus?: string; error?: string };
+type StripeOnlinePaymentStatusResult = { status?: string; paymentStatus?: string; checkoutStatus?: string; usedMethod?: string | null; error?: string };
 type StripePaymentMethodsResult = {
   ok?: boolean;
   configuredSetting?: string;
@@ -59,6 +59,8 @@ type StripePaymentMethodsResult = {
 const configuredDocumentApiUrl = process.env.EXPO_PUBLIC_DOCUMENT_API_URL?.replace(/\/$/, '');
 const DOCUMENT_API_URL_CANDIDATES = configuredDocumentApiUrl ? [configuredDocumentApiUrl] : [];
 const STRIPE_TERMINAL_LOCATION_ID = process.env.EXPO_PUBLIC_STRIPE_TERMINAL_LOCATION_ID?.trim();
+// Enlace al que Stripe Checkout redirige al terminar el pago: devuelve al cliente a la app.
+const ONLINE_PAYMENT_REDIRECT_URL = 'tpvapp://pago-completado';
 
 const fetchWithTimeout = async (url: string, options: RequestInit = {}, timeoutMs = 1500) => {
   const controller = new AbortController();
@@ -189,6 +191,8 @@ const STORAGE_KEY_ISSUER = '@tpv_issuer_v1';
 const STORAGE_KEY_OWNER_PIN = '@tpv_owner_pin_v1';
 const STORAGE_KEY_OWNER_RECOVERY_EMAIL = '@tpv_owner_recovery_email_v1';
 const STORAGE_KEY_OWNER_RECOVERY_PHONE = '@tpv_owner_recovery_phone_v1';
+// Cobro online pendiente: permite confirmar el ticket aunque la app se recargue al volver de Stripe.
+const STORAGE_KEY_PENDING_ONLINE_PAYMENT = '@tpv_pending_online_payment_v1';
 const AUTH_TOKEN_KEY = 'tpv_access_token';
 
 const roleFromUser = (user?: AuthenticatedUser): UserRole =>
@@ -310,6 +314,11 @@ export default function TpvScreen() {
   const [onlinePaymentError, setOnlinePaymentError] = useState('');
   const [onlinePaymentMessage, setOnlinePaymentMessage] = useState('');
   const [onlinePayment, setOnlinePayment] = useState<{ paymentId: string; checkoutUrl: string; qrDataUrl: string | null } | null>(null);
+  const onlinePaymentConfirmedRef = useRef(false);
+  // Refs para leer el estado actual desde el sondeo sin depender de cierres obsoletos.
+  const onlinePaymentRef = useRef<{ paymentId: string; checkoutUrl: string; qrDataUrl: string | null } | null>(null);
+  const createOnlinePaymentRef = useRef<(method: string, paymentAmount: number) => void>(() => {});
+  onlinePaymentRef.current = onlinePayment;
 
   // Diagnóstico del estado de Bizum en la cuenta de Stripe
   const [stripeMethodsLoading, setStripeMethodsLoading] = useState(false);
@@ -1182,9 +1191,11 @@ export default function TpvScreen() {
     return result.clientSecret;
   };
 
-  const createTransactionFromConfirmedPayment = (method: string, paymentAmount: number) => {
+  const createTransactionFromConfirmedPayment = (method: string, paymentAmount: number): void => {
     setNfcModalVisible(false);
 
+    // createTransaction ya deja el ticket seleccionado (setSelectedTicket) y lo publica con su QR,
+    // asi que al confirmarse el pago se abre directamente el recibo/factura para el cliente.
     if (pendingInvoice) {
       createTransaction(
         'COBRO',
@@ -1203,6 +1214,9 @@ export default function TpvScreen() {
       createTransaction('COBRO', pendingDocumentType, method);
     }
   };
+  useEffect(() => {
+    createOnlinePaymentRef.current = createTransactionFromConfirmedPayment;
+  });
 
   const ensureTapToPayReader = async () => {
     if (!STRIPE_TERMINAL_LOCATION_ID) {
@@ -1293,6 +1307,7 @@ export default function TpvScreen() {
     setOnlinePayment(null);
     setOnlinePaymentError('');
     setOnlinePaymentMessage('');
+    onlinePaymentConfirmedRef.current = false;
   };
 
   const openOnlinePaymentModal = () => {
@@ -1300,6 +1315,7 @@ export default function TpvScreen() {
     setOnlinePayment(null);
     setOnlinePaymentError('');
     setOnlinePaymentMessage('');
+    onlinePaymentConfirmedRef.current = false;
     setOnlinePaymentModalVisible(true);
   };
 
@@ -1346,6 +1362,21 @@ export default function TpvScreen() {
 
       setOnlinePayment({ paymentId: result.paymentId, checkoutUrl, qrDataUrl: result.qrDataUrl || null });
       setOnlinePaymentMessage('Muestra el QR al cliente o abre el enlace de pago. Puede pagar con tarjeta o Bizum.');
+      // Persistir el cobro pendiente: al volver del navegador la app puede remontarse y
+      // perder el estado en memoria; asi se reanuda la comprobacion automaticamente.
+      try {
+        await AsyncStorage.setItem(STORAGE_KEY_PENDING_ONLINE_PAYMENT, JSON.stringify({
+          paymentId: result.paymentId,
+          checkoutUrl,
+          qrDataUrl: result.qrDataUrl || null,
+          paymentAmount,
+          pendingDocumentType,
+          pendingInvoice,
+          createdAt: new Date().toISOString(),
+        }));
+      } catch {
+        // Error no bloqueante: la comprobacion en memoria sigue funcionando.
+      }
     } catch (error) {
       setOnlinePaymentMessage('');
       setOnlinePaymentError(error instanceof Error ? error.message : 'No se pudo generar el cobro online.');
@@ -1355,36 +1386,17 @@ export default function TpvScreen() {
   };
 
   const checkOnlinePaymentStatus = async () => {
-    if (!accessToken || !configuredDocumentApiUrl || !onlinePayment) return;
+    if (!accessToken || !configuredDocumentApiUrl || !onlinePaymentRef.current) return;
 
-    const paymentAmount = pendingInvoice ? pendingInvoice.total : amount;
     setOnlinePaymentLoading(true);
     setOnlinePaymentError('');
     setOnlinePaymentMessage('Comprobando el pago en Stripe...');
 
     try {
-      const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/stripe/payment/${onlinePayment.paymentId}`, {
-        headers: { Authorization: `Bearer ${accessToken}` },
-      }, 10000);
-      const result = await response.json() as StripeOnlinePaymentStatusResult;
-      if (!response.ok) {
-        throw new Error(result.error || 'No se pudo consultar el pago en Stripe.');
+      const finished = await confirmOnlinePaymentInBackground(onlinePaymentRef.current.paymentId);
+      if (!finished) {
+        setOnlinePaymentMessage('Stripe todavía no confirma el pago. Con Bizum el banco puede tardar unos segundos: seguimos comprobando automáticamente.');
       }
-
-      if (result.status === 'SUCCEEDED') {
-        setOnlinePaymentMessage('Pago confirmado. Generando el ticket...');
-        createTransactionFromConfirmedPayment('Stripe - Enlace o QR (tarjeta o Bizum)', paymentAmount);
-        closeOnlinePaymentModal();
-        return;
-      }
-
-      if (result.status === 'EXPIRED') {
-        setOnlinePayment(null);
-        setOnlinePaymentError('El enlace de pago ha caducado. Genera uno nuevo.');
-        return;
-      }
-
-      setOnlinePaymentMessage('Stripe todavía no confirma el pago. Con Bizum el banco puede tardar unos segundos: espera un momento y vuelve a comprobar.');
     } catch (error) {
       setOnlinePaymentError(error instanceof Error ? error.message : 'No se pudo comprobar el pago.');
     } finally {
@@ -1392,11 +1404,257 @@ export default function TpvScreen() {
     }
   };
 
+  const readOnlinePaymentStatus = async (paymentId?: string): Promise<StripeOnlinePaymentStatusResult | null> => {
+    const targetPaymentId = paymentId || onlinePaymentRef.current?.paymentId || onlinePayment?.paymentId;
+    if (!accessToken || !configuredDocumentApiUrl || !targetPaymentId) return null;
+
+    const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/stripe/payment/${targetPaymentId}`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    }, 10000);
+    const result = await response.json() as StripeOnlinePaymentStatusResult;
+    if (!response.ok) {
+      throw new Error(result.error || 'No se pudo consultar el pago en Stripe.');
+    }
+
+    return result;
+  };
+
+  const methodLabelFor = (method: string | null | undefined): 'bizum' | 'card' | null => {
+    if (method === 'bizum') return 'bizum';
+    if (method === 'card') return 'card';
+    return null;
+  };
+
+  // Comprueba el pago sin tocar los mensajes de la interfaz (para la espera automatica).
+  // Devuelve true cuando ya no hay que seguir esperando (pago confirmado o enlace caducado).
+  const confirmOnlinePaymentInBackground = async (paymentId?: string): Promise<boolean> => {
+    const payment = await readOnlinePaymentStatus(paymentId);
+    const status = payment?.status;
+    if (!status) return false;
+
+    const paymentAmount = pendingInvoice ? pendingInvoice.total : amount;
+    const usedMethod = methodLabelFor(payment?.usedMethod);
+
+    if (status === 'SUCCEEDED') {
+      if (onlinePaymentConfirmedRef.current) return true;
+      onlinePaymentConfirmedRef.current = true;
+      setOnlinePaymentMessage('Pago confirmado. Generando el ticket con su QR...');
+      createTransactionFromConfirmedPayment(
+        usedMethod === 'bizum' ? 'Stripe - Bizum (enlace o QR)' : usedMethod === 'card' ? 'Stripe - Tarjeta online' : 'Stripe - Enlace o QR (tarjeta o Bizum)',
+        paymentAmount,
+      );
+      try {
+        await AsyncStorage.removeItem(STORAGE_KEY_PENDING_ONLINE_PAYMENT);
+      } catch {
+        // No bloqueante.
+      }
+      closeOnlinePaymentModal();
+      // createTransaction ya deja el ticket en selectedTicket: el recibo/factura con su QR
+      // para el cliente se muestra solo al volver del pago.
+      return true;
+    }
+
+    // Pago rechazado por el banco (p. ej. Bizum declinado con +34600000002): el enlace sigue
+    // sirviendo, asi que NO se borra el cobro y el cliente puede reintentar. Hay que mostrarlo
+    // en vez de dejar la espera girando.
+    if (status === 'FAILED') {
+      setOnlinePaymentMessage(usedMethod === 'bizum'
+        ? 'Bizum ha sido rechazado por el banco. El cliente puede reintentar el pago con el mismo enlace o QR.'
+        : 'El pago ha sido rechazado. El cliente puede reintentar el pago con el mismo enlace o QR.');
+      return false;
+    }
+
+    if (status === 'EXPIRED') {
+      setOnlinePayment(null);
+      setOnlinePaymentError('El enlace de pago ha caducado. Genera uno nuevo.');
+      try {
+        await AsyncStorage.removeItem(STORAGE_KEY_PENDING_ONLINE_PAYMENT);
+      } catch {
+        // No bloqueante.
+      }
+      return true;
+    }
+
+    return false;
+  };
+
+  // Espera automatica: comprueba el pago cada 3 segundos mientras el QR este en pantalla,
+  // asi el ticket aparece solo cuando el cliente termina de pagar.
+  useEffect(() => {
+    if (!onlinePaymentModalVisible || !onlinePayment || !accessToken || !configuredDocumentApiUrl) return;
+
+    let cancelled = false;
+    let attempts = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const poll = async () => {
+      if (cancelled) return;
+      attempts += 1;
+
+      let finished = false;
+      try {
+        finished = await confirmOnlinePaymentInBackground();
+      } catch {
+        // Si una comprobacion puntual falla, se reintenta en el siguiente ciclo.
+      }
+      if (cancelled || finished) return;
+
+      if (attempts >= 120) {
+        setOnlinePaymentMessage('No hemos podido confirmar el pago automáticamente. Pulsa "Ya ha pagado: comprobar ahora".');
+        return;
+      }
+
+      timer = setTimeout(poll, 3000);
+    };
+
+    timer = setTimeout(poll, 2500);
+
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [onlinePaymentModalVisible, onlinePayment?.paymentId, accessToken]);
+
   const openOnlinePaymentPage = async () => {
-    if (!onlinePayment?.checkoutUrl) return;
-    await WebBrowser.openBrowserAsync(onlinePayment.checkoutUrl);
+    const currentOnlinePayment = onlinePaymentRef.current;
+    if (!currentOnlinePayment?.checkoutUrl) return;
+
+    try {
+      // openAuthSessionAsync cierra el navegador solo cuando Checkout redirige a la app.
+      await WebBrowser.openAuthSessionAsync(currentOnlinePayment.checkoutUrl, ONLINE_PAYMENT_REDIRECT_URL);
+    } catch {
+      await WebBrowser.openBrowserAsync(currentOnlinePayment.checkoutUrl);
+    }
+
     await checkOnlinePaymentStatus();
   };
+
+  // Al volver del navegador (incluso del mismo movil), el sistema puede remontar la app y
+  // vaciar el estado en memoria. Aqui se recupera el cobro pendiente guardado y se sigue
+  // comprobando hasta que Stripe confirma el pago y se muestra el ticket con su QR.
+  useEffect(() => {
+    if (!accessToken || !configuredDocumentApiUrl || !isLoaded) return;
+
+    let cancelled = false;
+
+    const readOnlinePaymentStatusWith = async (paymentId: string): Promise<StripeOnlinePaymentStatusResult | null> => {
+      if (!accessToken || !configuredDocumentApiUrl) return null;
+      const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/stripe/payment/${paymentId}`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      }, 10000);
+      const result = await response.json() as StripeOnlinePaymentStatusResult;
+      if (!response.ok) {
+        throw new Error(result.error || 'No se pudo consultar el pago en Stripe.');
+      }
+      return result;
+    };
+
+    const resumePendingOnlinePayment = async () => {
+      let stored: string | null = null;
+      try {
+        stored = await AsyncStorage.getItem(STORAGE_KEY_PENDING_ONLINE_PAYMENT);
+      } catch {
+        return;
+      }
+      if (cancelled || !stored) return;
+
+      let pending: {
+        paymentId?: string;
+        checkoutUrl?: string;
+        qrDataUrl?: string | null;
+        paymentAmount?: number;
+        pendingDocumentType?: DocumentType;
+        pendingInvoice?: PendingInvoice | null;
+      } | null = null;
+      try {
+        pending = JSON.parse(stored);
+      } catch {
+        return;
+      }
+      if (cancelled || !pending?.paymentId || !pending?.checkoutUrl) return;
+
+      // Restaurar el contexto del cobro para generar el mismo ticket al confirmarse.
+      // digits guarda centimos (amount = Number(digits) / 100), asi que se multiplica por 100.
+      if (typeof pending.paymentAmount === 'number' && Number.isFinite(pending.paymentAmount)) {
+        setDigits(String(Math.max(0, Math.round(pending.paymentAmount * 100))));
+      }
+      if (pending.pendingDocumentType) setPendingDocumentType(pending.pendingDocumentType);
+      if (pending.pendingInvoice) {
+        setPendingInvoice(pending.pendingInvoice);
+        setClient(pending.pendingInvoice.client);
+        setInvoiceItems(pending.pendingInvoice.items);
+        setInvoiceIvaInput(String(pending.pendingInvoice.ivaRate));
+      }
+
+      onlinePaymentConfirmedRef.current = false;
+      setOnlinePayment({ paymentId: pending.paymentId, checkoutUrl: pending.checkoutUrl, qrDataUrl: pending.qrDataUrl || null });
+      setOnlinePaymentError('');
+      setOnlinePaymentMessage('Comprobando el pago realizado...');
+      setOnlinePaymentModalVisible(true);
+
+      const amountToConfirm = pending.pendingInvoice ? pending.pendingInvoice.total : (pending.paymentAmount || 0);
+      let attempts = 0;
+      while (!cancelled && attempts < 120) {
+        attempts += 1;
+        try {
+          const payment = await readOnlinePaymentStatusWith(pending.paymentId);
+          const status = payment?.status;
+          const resumeUsedMethod = methodLabelFor(payment?.usedMethod);
+          if (status === 'SUCCEEDED') {
+            if (!onlinePaymentConfirmedRef.current) {
+              onlinePaymentConfirmedRef.current = true;
+              setOnlinePaymentMessage('Pago confirmado. Generando el ticket con su QR...');
+              createOnlinePaymentRef.current(
+                resumeUsedMethod === 'bizum' ? 'Stripe - Bizum (enlace o QR)' : resumeUsedMethod === 'card' ? 'Stripe - Tarjeta online' : 'Stripe - Enlace o QR (tarjeta o Bizum)',
+                amountToConfirm,
+              );
+            }
+            try {
+              await AsyncStorage.removeItem(STORAGE_KEY_PENDING_ONLINE_PAYMENT);
+            } catch {
+              // No bloqueante.
+            }
+            setOnlinePaymentModalVisible(false);
+            setOnlinePayment(null);
+            onlinePaymentConfirmedRef.current = false;
+            return;
+          }
+          // Rechazado (p. ej. Bizum declinado): el enlace sigue sirviendo, se muestra y se sigue
+          // esperando un reintento del cliente en vez de dejar la espera girando en silencio.
+          if (status === 'FAILED') {
+            setOnlinePaymentMessage(resumeUsedMethod === 'bizum'
+              ? 'Bizum ha sido rechazado por el banco. El cliente puede reintentar el pago con el mismo enlace o QR.'
+              : 'El pago ha sido rechazado. El cliente puede reintentar el pago con el mismo enlace o QR.');
+          }
+          if (status === 'EXPIRED') {
+            try {
+              await AsyncStorage.removeItem(STORAGE_KEY_PENDING_ONLINE_PAYMENT);
+            } catch {
+              // No bloqueante.
+            }
+            setOnlinePayment(null);
+            setOnlinePaymentModalVisible(false);
+            setOnlinePaymentError('El enlace de pago ha caducado. Genera uno nuevo.');
+            return;
+          }
+        } catch {
+          // Error puntual de red: se reintenta en el siguiente ciclo.
+        }
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+      }
+
+      if (!cancelled) {
+        setOnlinePaymentMessage('No hemos podido confirmar el pago automáticamente. Pulsa "Ya ha pagado: comprobar ahora".');
+      }
+    };
+
+    void resumePendingOnlinePayment();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [accessToken, isLoaded]);
 
   const checkStripePaymentMethods = async () => {
     if (!accessToken || !configuredDocumentApiUrl) {
