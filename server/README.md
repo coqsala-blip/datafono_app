@@ -26,7 +26,9 @@ npm run dev
 - `POST /api/companies/:companyId/users`
 - `POST /api/stripe/payment`
 - `GET /api/stripe/payment/:paymentId`
-- `GET /api/stripe/payment-methods` (diagnóstico: estado de Bizum en la cuenta)
+- `GET /api/stripe/payment-methods` (diagnóstico de métodos; `?probe=1` comprueba el Checkout real)
+- `GET /api/stripe/account` (datos de la cuenta y enlaces al Dashboard: cobros, pagos y banco)
+- `POST /api/stripe/enable-bizum` (intenta activar Bizum en la configuración de la cuenta)
 - `POST /api/stripe/terminal/connection-token`
 - `POST /api/stripe/payment-intent`
 - `POST /api/billing/checkout`
@@ -126,6 +128,19 @@ sigue cobrándose con tarjeta.
 los métodos que Stripe resuelve de verdad, junto con el modo (test/live), el país de la cuenta, el
 estado de cada método y un enlace al Dashboard para activarlos. En la app lo tienes en
 **Config → "Comprobar Bizum en Stripe"**, junto al botón "Abrir Stripe para activar Bizum".
+
+`GET /api/stripe/account` (requiere sesión) devuelve el estado de la cuenta —modo test/live, país,
+cobros y pagos activados, calendario de pagos, requisitos pendientes y las **cuentas bancarias de
+abono** (banco, `····last4`, divisa y estado)— junto con enlaces directos al Dashboard para
+configurarla. Es lo que usa **Config → "CONFIGURAR TU CUENTA" → "CONFIGURAR DÓNDE RECIBIR LOS
+COBROS"**: muestra el resumen real y abre en el navegador del móvil la página de Stripe donde el
+comercio elige **dónde y cada cuánto** recibe el dinero
+(`Settings → Payouts → Bank accounts and scheduling`, en modo test o live según la clave del
+backend).
+
+Si el listado de cuentas bancarias no se pudiera leer con la clave de la plataforma, la app lo
+degrada con elegancia: muestra el resto del estado y abre igualmente la página correcta del
+Dashboard para añadirla.
 
 Si el Checkout solo ofrece tarjeta, es que Bizum (u otro método) **no está activado en esa cuenta o
 modo**: test y live se activan por separado en el Dashboard y Bizum exige una cuenta con ubicación de
