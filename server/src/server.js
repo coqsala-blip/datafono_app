@@ -151,7 +151,12 @@ const buildStripeAccountSnapshot = async (stripeClient) => {
   const livemode = typeof account?.livemode === 'boolean' ? account.livemode : secretKey.startsWith('sk_live');
   const base = livemode ? 'https://dashboard.stripe.com' : 'https://dashboard.stripe.com/test';
 
+  // Leer la cuenta bancaria de abono solo es posible con claves de plataforma (Connect). Con la
+  // clave estándar de la propia cuenta Stripe no lo permite: se informa como "no legible" en vez de
+  // decir que no hay ninguna, y el comercio la configura en el Dashboard que se abre desde la app.
   let bankAccounts = [];
+  let bankAccountsReadable = true;
+  let bankAccountsNote = null;
   try {
     const list = await stripeClient.accounts.listExternalAccounts(account.id, { object: 'bank_account', limit: 10 });
     bankAccounts = (Array.isArray(list?.data) ? list.data : []).map((bank) => ({
@@ -163,6 +168,8 @@ const buildStripeAccountSnapshot = async (stripeClient) => {
       status: bank.status || null,
     }));
   } catch (error) {
+    bankAccountsReadable = false;
+    bankAccountsNote = error.message;
     console.warn('No se pudieron leer las cuentas bancarias de Stripe:', error.message);
   }
 
@@ -180,6 +187,8 @@ const buildStripeAccountSnapshot = async (stripeClient) => {
     requirementsDue: Array.isArray(account?.requirements?.currently_due) ? account.requirements.currently_due : [],
     disabledReason: account?.requirements?.disabled_reason || null,
     bankAccounts,
+    bankAccountsReadable,
+    bankAccountsNote,
     dashboardUrls: {
       account: `${base}/settings/account`,
       payouts: `${base}/settings/payouts`,
