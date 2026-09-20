@@ -61,6 +61,24 @@ type StripeEnableBizumResult = {
   dashboardUrl?: string;
   error?: string;
 };
+type StripeAccountResult = {
+  ok?: boolean;
+  livemode?: boolean | null;
+  accountId?: string | null;
+  country?: string | null;
+  businessType?: string | null;
+  businessName?: string | null;
+  defaultCurrency?: string | null;
+  chargesEnabled?: boolean | null;
+  payoutsEnabled?: boolean | null;
+  detailsSubmitted?: boolean | null;
+  payoutSchedule?: { interval?: string | null; delay_days?: number | null; monthly_anchor?: number | null; weekly_anchor?: string | null } | null;
+  requirementsDue?: string[];
+  disabledReason?: string | null;
+  bankAccounts?: { id?: string; bankName?: string | null; last4?: string | null; country?: string | null; currency?: string | null; status?: string | null }[];
+  dashboardUrls?: { account?: string; payouts?: string; paymentMethods?: string; balances?: string; overview?: string };
+  error?: string;
+};
 type StripePaymentMethodsResult = {
   ok?: boolean;
   checkoutMode?: string;
@@ -406,6 +424,8 @@ export default function TpvScreen() {
   const createOnlinePaymentRef = useRef<(method: string, paymentAmount: number) => void>(() => {});
   onlinePaymentRef.current = onlinePayment;
 
+  // Configuración de la cuenta de Stripe (dónde recibe los cobros)
+  const [stripeAccountLoading, setStripeAccountLoading] = useState(false);
   // Diagnóstico del estado de Bizum en la cuenta de Stripe
   const [stripeMethodsLoading, setStripeMethodsLoading] = useState(false);
   const [stripeMethodsInfo, setStripeMethodsInfo] = useState('');
@@ -1751,6 +1771,75 @@ export default function TpvScreen() {
       cancelled = true;
     };
   }, [accessToken, isLoaded]);
+
+  // Abre en el navegador del móvil el Dashboard de Stripe (modo test o real según la clave del
+  // backend) para que el comercio configure DÓNDE recibe sus cobros: cuenta bancaria y titular,
+  // calendario de pagos y datos de la cuenta. Antes de abrirlo, muestra un resumen del estado real.
+  const openStripeAccountSettings = async () => {
+    if (!accessToken || !configuredDocumentApiUrl) {
+      Alert.alert('Sesión requerida', 'Inicia sesión para configurar tu cuenta de Stripe.');
+      return;
+    }
+
+    setStripeAccountLoading(true);
+    setStripeMethodsError('');
+    setStripeMethodsInfo('');
+
+    try {
+      const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/stripe/account`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      }, 30000);
+      const result = await response.json() as StripeAccountResult;
+      if (!response.ok || !result.ok) {
+        throw new Error(result.error || 'No se pudo consultar tu cuenta de Stripe.');
+      }
+
+      const schedule = result.payoutSchedule || {};
+      const scheduleText = schedule.interval
+        ? `${schedule.interval}${typeof schedule.delay_days === 'number' ? ` (cada ${schedule.delay_days} días)` : ''}`
+        : 'por defecto';
+      const lines = [
+        `Modo de Stripe: ${result.livemode === true ? 'REAL (live): cobra dinero de verdad' : result.livemode === false ? 'PRUEBAS (test)' : 'desconocido'}`,
+        `Cuenta: ${result.accountId || 'desconocida'}${result.businessName ? ` · ${result.businessName}` : ''}`,
+        `País de la cuenta: ${result.country || 'desconocido'}`,
+        `Cobros (charges): ${result.chargesEnabled === true ? 'activados' : result.chargesEnabled === false ? 'NO activados' : 'desconocido'}`,
+        `Pagos a tu banco (payouts): ${result.payoutsEnabled === true ? 'activados' : result.payoutsEnabled === false ? 'NO activados' : 'desconocido'}`,
+        `Calendario de pagos: ${scheduleText}`,
+        `Moneda por defecto: ${(result.defaultCurrency || 'eur').toUpperCase()}`,
+      ];
+
+      if (Array.isArray(result.bankAccounts) && result.bankAccounts.length > 0) {
+        const banks = result.bankAccounts.map((bank) => (
+          `${bank.bankName || 'Banco'} ····${bank.last4 || '????'} (${(bank.currency || 'eur').toUpperCase()}${bank.country ? `, ${bank.country}` : ''})${bank.status ? ` - ${bank.status}` : ''}`
+        ));
+        lines.push(`Cuenta bancaria de abono: ${banks.join(' | ')}`);
+      } else {
+        lines.push('Cuenta bancaria de abono: NINGUNA configurada todavía. Añádela en Stripe para poder recibir el dinero de los cobros.');
+      }
+
+      if (result.detailsSubmitted === false) {
+        lines.push('Datos de la empresa: pendientes de completar en Stripe.');
+      }
+      if (Array.isArray(result.requirementsDue) && result.requirementsDue.length > 0) {
+        lines.push(`Stripe pide completar: ${result.requirementsDue.join(', ')}`);
+      }
+      if (result.disabledReason) {
+        lines.push(`Aviso de Stripe: ${result.disabledReason}`);
+      }
+
+      const url = result.dashboardUrls?.payouts || result.dashboardUrls?.account || 'https://dashboard.stripe.com/settings/payouts';
+      lines.push('');
+      lines.push(`Abriendo Stripe en: ${url}`);
+      lines.push('En Stripe: "Bank accounts and scheduling" (cuenta bancaria, titular y calendario de pagos). Ahí eliges la cuenta donde quieres recibir el dinero y cada cuánto se te ingresa.');
+      setStripeMethodsInfo(lines.join('\n'));
+
+      await Linking.openURL(url);
+    } catch (error) {
+      setStripeMethodsError(error instanceof Error ? error.message : 'No se pudo abrir la configuración de Stripe.');
+    } finally {
+      setStripeAccountLoading(false);
+    }
+  };
 
   const checkStripePaymentMethods = async () => {
     if (!accessToken || !configuredDocumentApiUrl) {
@@ -3526,6 +3615,17 @@ export default function TpvScreen() {
               <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>
                 {tr('stripe.methodsSubtitle')}
               </Text>
+              <Pressable
+                style={[styles.primaryButton, { backgroundColor: '#0284c7', marginTop: 12 }]}
+                onPress={openStripeAccountSettings}
+                disabled={stripeAccountLoading}
+                accessibilityRole="button"
+                accessibilityLabel={tr('stripe.accountButton')}
+              >
+                <Text style={styles.primaryButtonText}>
+                  {stripeAccountLoading ? tr('stripe.accountLoading') : tr('stripe.accountButton')}
+                </Text>
+              </Pressable>
               <Pressable
                 style={[styles.secondaryButton, { marginTop: 8 }]}
                 onPress={checkStripePaymentMethods}

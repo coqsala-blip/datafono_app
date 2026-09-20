@@ -142,6 +142,54 @@ const createCheckoutSessionWithLocalMethodsFallback = async (params, requestedPa
   }
 };
 
+// Datos de la cuenta de Stripe + enlaces directos al Dashboard (test o live según la clave
+// configurada). Sirve para que el comercio configure desde la app DÓNDE recibe sus cobros:
+// cuenta bancaria y titular, calendario de pagos y estado de la cuenta.
+const buildStripeAccountSnapshot = async (stripeClient) => {
+  const account = await stripeClient.accounts.retrieve();
+  const secretKey = String(process.env.STRIPE_SECRET_KEY || '');
+  const livemode = typeof account?.livemode === 'boolean' ? account.livemode : secretKey.startsWith('sk_live');
+  const base = livemode ? 'https://dashboard.stripe.com' : 'https://dashboard.stripe.com/test';
+
+  let bankAccounts = [];
+  try {
+    const list = await stripeClient.accounts.listExternalAccounts(account.id, { object: 'bank_account', limit: 10 });
+    bankAccounts = (Array.isArray(list?.data) ? list.data : []).map((bank) => ({
+      id: bank.id,
+      bankName: bank.bank_name || null,
+      last4: bank.last4 || null,
+      country: bank.country || null,
+      currency: bank.currency || null,
+      status: bank.status || null,
+    }));
+  } catch (error) {
+    console.warn('No se pudieron leer las cuentas bancarias de Stripe:', error.message);
+  }
+
+  return {
+    livemode,
+    accountId: account?.id || null,
+    country: account?.country || null,
+    businessType: account?.business_type || null,
+    businessName: account?.business_profile?.name || account?.settings?.dashboard?.display_name || null,
+    defaultCurrency: account?.default_currency || null,
+    chargesEnabled: typeof account?.charges_enabled === 'boolean' ? account.charges_enabled : null,
+    payoutsEnabled: typeof account?.payouts_enabled === 'boolean' ? account.payouts_enabled : null,
+    detailsSubmitted: typeof account?.details_submitted === 'boolean' ? account.details_submitted : null,
+    payoutSchedule: account?.settings?.payouts?.schedule || null,
+    requirementsDue: Array.isArray(account?.requirements?.currently_due) ? account.requirements.currently_due : [],
+    disabledReason: account?.requirements?.disabled_reason || null,
+    bankAccounts,
+    dashboardUrls: {
+      account: `${base}/settings/account`,
+      payouts: `${base}/settings/payouts`,
+      paymentMethods: `${base}/settings/payment_methods`,
+      balances: `${base}/balance`,
+      overview: `${base}/dashboard`,
+    },
+  };
+};
+
 try {
   const publicApiUrl = new URL(PUBLIC_API_URL);
   if (NODE_ENV === 'production' && publicApiUrl.protocol !== 'https:') {
@@ -755,6 +803,20 @@ app.get('/api/stripe/payment-methods', requireAuth, async (req, res) => {
       warnings,
     });
   } catch (error) {
+    return res.status(502).json({ ok: false, error: `Stripe: ${error.message}` });
+  }
+});
+
+// Configuración de la cuenta de Stripe: país, estado de cobros/pagos y cuenta bancaria, junto con
+// los enlaces directos al Dashboard (test o live) donde el comercio configura DÓNDE recibe el
+// dinero. Se usa desde Config -> "Configurar tu cuenta de Stripe".
+app.get('/api/stripe/account', requireAuth, async (req, res) => {
+  try {
+    const stripeClient = requireStripe();
+    const snapshot = await buildStripeAccountSnapshot(stripeClient);
+    return res.json({ ok: true, ...snapshot });
+  } catch (error) {
+    console.error('Error consultando la cuenta de Stripe:', error.message);
     return res.status(502).json({ ok: false, error: `Stripe: ${error.message}` });
   }
 });
