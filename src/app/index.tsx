@@ -363,6 +363,8 @@ export default function TpvScreen() {
   const onlinePaymentConfirmedRef = useRef(false);
   // Idioma de la app: eleccion manual guardada en AsyncStorage; si no hay, el pais del movil.
   const [appLocale, setAppLocaleState] = useState<AppLocale>('es');
+  // Selector de idioma: se abre desde el boton de la cabecera (ya no vive en la pestaña Config).
+  const [languageModalVisible, setLanguageModalVisible] = useState(false);
   const tr = useCallback((key: string) => translateKey(appLocale, key), [appLocale]);
   // Al arrancar: idioma guardado > idioma del pais del dispositivo > espanol.
   // expo-localization es un modulo nativo: si el APK/cliente instalado es anterior a su
@@ -391,6 +393,7 @@ export default function TpvScreen() {
   }, []);
   const setAppLocale = async (locale: AppLocale) => {
     setAppLocaleState(locale);
+    setLanguageModalVisible(false);
     try {
       await AsyncStorage.setItem(APP_LOCALE_STORAGE_KEY, locale);
       Alert.alert(tr('lang.title'), tr('lang.saved'));
@@ -3155,6 +3158,14 @@ export default function TpvScreen() {
             ) : null}
           </View>
           <Pressable
+            style={{ marginLeft: 10, paddingVertical: 8, paddingHorizontal: 10, borderRadius: 6, backgroundColor: '#e0e7ff' }}
+            onPress={() => setLanguageModalVisible(true)}
+            accessibilityRole="button"
+            accessibilityLabel={tr('lang.title')}
+          >
+            <Text style={{ fontSize: 11, fontWeight: 'bold', color: '#0f172a' }}>🌍 {appLocale.toUpperCase()}</Text>
+          </Pressable>
+          <Pressable
             style={{ marginLeft: 10, paddingVertical: 8, paddingHorizontal: 10, borderRadius: 6, backgroundColor: userRole === 'principal' ? '#dcfce7' : '#dbeafe' }}
             onPress={() => { if (userRole === 'principal') setUserPermissionsModalVisible(true); }}
           >
@@ -3511,35 +3522,6 @@ export default function TpvScreen() {
             </View>
 
             <View style={styles.card}>
-              <Text style={styles.cardTitle}>🌍 {tr('lang.title').toUpperCase()}</Text>
-              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>{tr('lang.subtitle')}</Text>
-              {APP_LOCALES.map((option) => (
-                <Pressable
-                  key={option.code}
-                  style={{
-                    flexDirection: 'row',
-                    alignItems: 'center',
-                    paddingVertical: 10,
-                    paddingHorizontal: 12,
-                    borderRadius: 8,
-                    marginTop: 6,
-                    backgroundColor: appLocale === option.code ? '#ccfbf1' : '#f1f5f9',
-                    borderWidth: appLocale === option.code ? 2 : 0,
-                    borderColor: '#0f766e',
-                  }}
-                  onPress={() => void setAppLocale(option.code)}
-                  accessibilityRole="button"
-                  accessibilityLabel={option.label}
-                >
-                  <Text style={{ flex: 1, color: '#0f172a', fontSize: 14, fontWeight: appLocale === option.code ? 'bold' : 'normal' }}>
-                    {option.label}
-                  </Text>
-                  <Text style={{ color: '#64748b', fontSize: 11, textAlign: 'right' }}>{option.countries}</Text>
-                </Pressable>
-              ))}
-            </View>
-
-            <View style={styles.card}>
               <Text style={styles.cardTitle}>💳 {tr('stripe.methodsTitle')}</Text>
               <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>
                 {tr('stripe.methodsSubtitle')}
@@ -3746,6 +3728,45 @@ export default function TpvScreen() {
                 <Text style={styles.secondaryButtonText}>{tr('pay.back')}</Text>
               </Pressable>
             </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
+      {/* MODAL: IDIOMA DE LA APLICACIÓN (se abre desde el botón 🌍 de la cabecera) */}
+      <Modal visible={languageModalVisible} animationType="slide" transparent={true}>
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalContent, { maxHeight: '85%' }]}>
+            <ScrollView>
+              <Text style={styles.modalTitle}>🌍 {tr('lang.title').toUpperCase()}</Text>
+              <Text style={[styles.modalSubtitle, { textAlign: 'left' }]}>{tr('lang.subtitle')}</Text>
+              {APP_LOCALES.map((option) => (
+                <Pressable
+                  key={option.code}
+                  style={{
+                    flexDirection: 'row',
+                    alignItems: 'center',
+                    paddingVertical: 10,
+                    paddingHorizontal: 12,
+                    borderRadius: 8,
+                    marginTop: 6,
+                    backgroundColor: appLocale === option.code ? '#ccfbf1' : '#f1f5f9',
+                    borderWidth: appLocale === option.code ? 2 : 0,
+                    borderColor: '#0f766e',
+                  }}
+                  onPress={() => void setAppLocale(option.code)}
+                  accessibilityRole="button"
+                  accessibilityLabel={option.label}
+                >
+                  <Text style={{ flex: 1, color: '#0f172a', fontSize: 14, fontWeight: appLocale === option.code ? 'bold' : 'normal' }}>
+                    {option.label}
+                  </Text>
+                  <Text style={{ color: '#64748b', fontSize: 11, textAlign: 'right' }}>{option.countries}</Text>
+                </Pressable>
+              ))}
+            </ScrollView>
+            <Pressable style={[styles.secondaryButton, { marginTop: 12 }]} onPress={() => setLanguageModalVisible(false)}>
+              <Text style={styles.secondaryButtonText}>{tr('pay.back')}</Text>
+            </Pressable>
           </View>
         </View>
       </Modal>
