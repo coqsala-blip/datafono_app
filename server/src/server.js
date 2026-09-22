@@ -1046,14 +1046,29 @@ app.post('/api/documents', async (req, res) => {
     type,
   };
 
-  const { error } = await supabase.from('documents').insert({
+  // Asociar el documento al usuario que publica (para poder sincronizar el historial después).
+  let userId = null;
+  const authToken = getBearerToken(req);
+  if (authToken) {
+    try {
+      const { data: { user } } = await supabase.auth.getUser(authToken);
+      userId = user?.id || null;
+    } catch {
+      // Sin auth: se publica igual (modo anónimo), pero no se podrá sincronizar.
+    }
+  }
+
+  const insertPayload = {
     ticket_code: ticketCode,
     document_type: documentType,
     amount: document.amount,
     original_amount: document.originalAmount,
     document_data: document,
     public_token: token,
-  });
+  };
+  if (userId) insertPayload.user_id = userId;
+
+  const { error } = await supabase.from('documents').insert(insertPayload);
 
   if (error) {
     console.error('Error guardando documento en Supabase:', error.message);
@@ -1066,6 +1081,131 @@ app.post('/api/documents', async (req, res) => {
     publicUrl: `${PUBLIC_API_URL}/documents/${token}`,
   });
 });
+
+// Lista los documentos publicados por el usuario autenticado, para recuperar el historial
+// al borrar la app, cambiar de móvil o reinstalar.
+app.get('/api/documents', requireAuth, async (req, res) => {
+  const userId = req.user.id;
+  const limit = Math.max(1, Math.min(500, Number(req.query.limit) || 100));
+  const since = req.query.since ? new Date(req.query.since) : null;
+
+  const query = supabase
+    .from('documents')
+    .select('ticket_code,document_type,amount,original_amount,document_data,public_token,created_at,updated_at')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false })
+    .limit(limit);
+
+  const { data, error } = since
+    ? query.gte('created_at', since.toISOString())
+    : query;
+
+  if (error) {
+    console.error('Error listando documentos:', error.message);
+    return res.status(500).json({ ok: false, error: `Supabase: ${error.message}` });
+  }
+
+  res.json({
+    ok: true,
+    documents: (data || []).map((row) => ({
+      ...(row.document_data || {}),
+      publicUrl: row.public_token ? `${PUBLIC_API_URL}/documents/${row.public_token}` : undefined,
+      createdAt: row.created_at || row.document_data?.createdAt,
+    })),
+  });
+});
+
+// Sincroniza gastos puntuales desde la app. Recibe un array de gastos con id cliente y
+// actualiza o inserta (upsert) con based_on: 'client' para que cada móvil mantenga su propia
+// copia y nunca pierda la nube al reinstalar.
+app.post('/api/expenses/sync', requireAuth, async (req, res) => {
+  const expenses = Array.isArray(req.body?.expenses) ? req.body.expenses : [];
+  if (expenses.length === 0) {
+    return res.status(400).json({ ok: false, error: 'No se recibieron gastos para sincronizar.' });
+  }
+
+  const rows = expenses.map((gasto) => ({
+    user_id: req.user.id,
+    local_id: gasto.id,
+    based_on: 'client',
+    description: gasto.description || '',
+    amount: Number(gasto.amount) || 0,
+    date: gasto.date || null,
+    category: gasto.category || 'Otros',
+    synced_at: new Date().toISOString(),
+  }));
+
+  const { error } = await supabase.from('expenses').upsert(rows, {
+    onConflict: ['user_id', 'local_id', 'based_on'],
+  });
+
+  if (error) {
+    console.error('Error sincronizando gastos:', error.message);
+    return res.status(500).json({ ok: false, error: `Supabase: ${error.message}` });
+  }
+  res.json({ ok: true, count: rows.length });
+});
+
+// Lista los gastos sincronizados del usuario autenticado.
+app.get('/api/expenses', requireAuth, async (req, res) => {
+  const limit = Math.max(1, Math.min(500, Number(req.query.limit) || 100));
+  const { data, error } = await supabase
+    .from('expenses')
+    .select('local_id,description,amount,date,category,based_on,synced_at')
+    .eq('user_id', req.user.id)
+    .order('date', { ascending: false })
+    .limit(limit);
+
+  if (error) {
+    console.error('Error listando gastos:', error.message);
+    return res.status(500).json({ ok: false, error: `Supabase: ${error.message}` });
+  }
+  res.json({ ok: true, expenses: data || [] });
+});
+
+// Recupera todo el historial (documentos + gastos) en un solo llamado, para restaurar la app
+// tras borrar datos o instalarla en otro móvil.
+app.get('/api/documents/sync-all', requireAuth, async (req, res) => {
+  const limit = Math.max(1, Math.min(500, Number(req.query.limit) || 100));
+
+  const documentsPromise = supabase
+    .from('documents')
+    .select('ticket_code,document_type,amount,original_amount,document_data,public_token,created_at')
+    .eq('user_id', req.user.id)
+    .order('created_at', { ascending: false })
+    .limit(limit);
+
+  const expensesPromise = supabase
+    .from('expenses')
+    .select('local_id,description,amount,date,category,based_on,synced_at')
+    .eq('user_id', req.user.id)
+    .order('date', { ascending: false })
+    .limit(limit);
+
+  const [documentsResult, expensesResult] = await Promise.allSettled([
+    documentsPromise,
+    expensesPromise,
+  ]);
+
+  const documents = documentsResult.status === 'fulfilled' && !documentsResult.value.error
+    ? (documentsResult.value.data || []).map((row) => ({
+      ...(row.document_data || {}),
+      publicUrl: row.public_token ? `${PUBLIC_API_URL}/documents/${row.public_token}` : undefined,
+      createdAt: row.created_at || row.document_data?.createdAt,
+    }))
+    : [];
+
+  const expenses = expensesResult.status === 'fulfilled' && !expensesResult.value.error
+    ? (expensesResult.value.data || [])
+    : [];
+
+  if (documentsResult.status === 'rejected' || expensesResult.status === 'rejected') {
+    console.error('Error en sync-all:', documentsResult.reason || expensesResult.reason);
+  }
+
+  res.json({ ok: true, documents, expenses });
+});
+
 
 const escapeHtml = (value = '') => String(value)
   .replaceAll('&', '&amp;')
