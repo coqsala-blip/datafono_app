@@ -571,6 +571,23 @@ app.post('/api/auth/login', async (req, res) => {
   return res.json({ ok: true, user: data.user, session: data.session });
 });
 
+// Renueva la sesión del móvil con el refresh token guardado. Los access tokens de Supabase caducan
+// en ~1 hora: sin este refresco la app seguiría publicando documentos con un token caducado y los
+// tickets quedarían en la nube sin dueño (imposibles de recuperar con "Sincronizar historial").
+app.post('/api/auth/refresh', async (req, res) => {
+  const refreshToken = typeof req.body?.refreshToken === 'string' ? req.body.refreshToken.trim() : '';
+  if (!refreshToken) {
+    return res.status(400).json({ ok: false, error: 'Falta el refresh token de la sesión.' });
+  }
+
+  const { data, error } = await supabase.auth.refreshSession({ refresh_token: refreshToken });
+  if (error || !data?.session) {
+    return res.status(401).json({ ok: false, error: 'La sesión ha caducado. Vuelve a iniciar sesión.' });
+  }
+
+  return res.json({ ok: true, user: data.user, session: data.session });
+});
+
 app.get('/api/auth/me', requireAuth, async (req, res) => {
   // Sesión única por dispositivo: un token usado desde otro dispositivo se rechaza,
   // salvo que se pida expresamente trasladar la sesión (force), que reutiliza el token
@@ -1135,7 +1152,7 @@ app.get('/api/documents', requireAuth, async (req, res) => {
 
   const query = supabase
     .from('documents')
-    .select('ticket_code,document_type,amount,original_amount,document_data,public_token,created_at,updated_at')
+    .select('ticket_code,document_type,amount,original_amount,document_data,public_token,created_at')
     .eq('user_id', userId)
     .order('created_at', { ascending: false })
     .limit(limit);
@@ -1231,21 +1248,33 @@ app.get('/api/documents/sync-all', requireAuth, async (req, res) => {
     expensesPromise,
   ]);
 
-  const documents = documentsResult.status === 'fulfilled' && !documentsResult.value.error
-    ? (documentsResult.value.data || []).map((row) => ({
-      ...(row.document_data || {}),
-      publicUrl: row.public_token ? `${PUBLIC_API_URL}/documents/${row.public_token}` : undefined,
-      createdAt: row.created_at || row.document_data?.createdAt,
-    }))
-    : [];
+  const documentsError = documentsResult.status === 'rejected'
+    ? documentsResult.reason
+    : documentsResult.value.error;
+  const expensesError = expensesResult.status === 'rejected'
+    ? expensesResult.reason
+    : expensesResult.value.error;
 
-  const expenses = expensesResult.status === 'fulfilled' && !expensesResult.value.error
-    ? (expensesResult.value.data || [])
-    : [];
-
-  if (documentsResult.status === 'rejected' || expensesResult.status === 'rejected') {
-    console.error('Error en sync-all:', documentsResult.reason || expensesResult.reason);
+  if (documentsError || expensesError) {
+    // Nunca se oculta el fallo de la nube: si falta la columna user_id o los permisos de la tabla
+    // de gastos, la app debe avisar del motivo en vez de decir que "no hay historial guardado".
+    const details = [];
+    if (documentsError) details.push(`documentos: ${documentsError.message || documentsError}`);
+    if (expensesError) details.push(`gastos: ${expensesError.message || expensesError}`);
+    console.error('Error en sync-all:', details.join(' | '));
+    return res.status(500).json({
+      ok: false,
+      error: `No se pudo recuperar el historial (${details.join('; ')}).`,
+    });
   }
+
+  const documents = (documentsResult.value.data || []).map((row) => ({
+    ...(row.document_data || {}),
+    publicUrl: row.public_token ? `${PUBLIC_API_URL}/documents/${row.public_token}` : undefined,
+    createdAt: row.created_at || row.document_data?.createdAt,
+  }));
+
+  const expenses = expensesResult.value.data || [];
 
   res.json({ ok: true, documents, expenses });
 });

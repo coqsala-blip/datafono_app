@@ -34,6 +34,11 @@ npm run dev
 - `POST /api/billing/checkout`
 - `GET /api/billing/status`
 - `POST /api/stripe/webhook`
+- `POST /api/auth/refresh` (renueva la sesión del móvil con el refresh token y evita que los documentos se publiquen sin dueño)
+- `POST /api/documents` (publica el ticket/factura y lo asocia a la cuenta autenticada)
+- `GET /api/documents` (lista los documentos de la cuenta)
+- `GET /api/documents/sync-all` (recupera documentos + gastos en una llamada: "Sincronizar historial")
+- `POST /api/expenses/sync` / `GET /api/expenses` (guardar y listar los gastos de la cuenta)
 
 ### Plan actual
 
@@ -48,6 +53,28 @@ total_con_iva = total_neto * 1.21
 ```
 
 Los cobros online/QR y las suscripciones se crean con Stripe Checkout. El backend también expone tokens y PaymentIntents para Stripe Terminal si se añade el SDK nativo de Terminal en la app.
+
+### Sincronizar historial (recuperar tickets, facturas y gastos)
+
+La app guarda cada ticket/factura y cada gasto en la nube asociados a la cuenta que los emite, para
+poder recuperarlos con el botón **Sincronizar historial** (pestaña *Gastos/Facturación*) después de
+borrar los datos de la app, cambiar de móvil o sufrir una avería.
+
+Requisitos en Supabase (se asume que la tabla `documents` ya existe, creada al configurar el
+proyecto). Ejecuta estos archivos en **Dashboard → SQL Editor → pegar y Run**:
+
+1. `supabase-expenses.sql` — crea la tabla `expenses` con RLS y los permisos que necesita el backend.
+2. `supabase-history-sync.sql` — añade `documents.user_id` (el vínculo con la cuenta) y
+   `documents.updated_at`, concede los permisos del backend e incluye cómo adoptar (poner dueño a)
+   los documentos antiguos que se guardaron sin sesión.
+
+Si falta algún paso, el backend responde 500 y la app muestra el motivo exacto (por ejemplo
+`documentos: column documents.user_id does not exist` o
+`gastos: permission denied for table expenses`) en lugar de decir que no hay historial guardado.
+
+Los access tokens de Supabase caducan en 1 hora: la app los renueva en segundo plano con
+`POST /api/auth/refresh` (guardando el refresh token en el almacén seguro del móvil) para que los
+tickets y gastos no queden nunca en la nube sin dueño.
 
 ### Despliegue en Render
 

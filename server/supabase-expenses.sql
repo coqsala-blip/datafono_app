@@ -23,3 +23,10 @@ create policy "Users manage own expenses"
   for all
   using (auth.uid() = user_id)
   with check (auth.uid() = user_id);
+
+-- El backend guarda y lee los gastos con la clave secreta (rol service_role). Sin estos permisos
+-- Supabase responde 42501 "permission denied for table expenses" y el historial de gastos no
+-- se guarda ni se puede recuperar.
+grant usage on schema public to service_role;
+grant select, insert, update, delete on public.expenses to service_role;
+grant usage, select on sequence public.expenses_id_seq to service_role;
