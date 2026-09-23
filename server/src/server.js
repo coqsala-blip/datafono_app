@@ -530,6 +530,9 @@ app.post('/api/auth/employee-access-code', requireAuth, async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body || {};
   const normalizedEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+  // Sesión única por dispositivo: cada cuenta solo puede estar abierta en un móvil a la vez.
+  const deviceId = typeof req.body?.deviceId === 'string' ? req.body.deviceId.trim().slice(0, 64) : '';
+  const force = req.body?.force === true;
 
   if (!normalizedEmail || typeof password !== 'string' || password.length === 0) {
     return res.status(400).json({ ok: false, error: 'Indica email y contraseña.' });
@@ -544,10 +547,51 @@ app.post('/api/auth/login', async (req, res) => {
     return res.status(401).json({ ok: false, error: 'Email o contraseña incorrectos.' });
   }
 
+  const metadata = data.user.app_metadata || {};
+  const activeDevice = typeof metadata.active_device_id === 'string' ? metadata.active_device_id : null;
+
+  // Si la cuenta ya está abierta en otro dispositivo, se avisa y se bloquea (salvo traslado explícito).
+  if (deviceId && activeDevice && activeDevice !== deviceId && !force) {
+    return res.status(409).json({
+      ok: false,
+      code: 'device_conflict',
+      error: 'La sesión ya está abierta en otro dispositivo. Cierra la sesión allí o pulsa "Abrir en este dispositivo" para trasladarla (la sesión anterior se cerrará).',
+    });
+  }
+
+  // Registrar/trasladar el dispositivo activo de la cuenta.
+  if (deviceId && (activeDevice !== deviceId || force)) {
+    const { error: metaError } = await updateUserAppMetadata(data.user.id, { active_device_id: deviceId });
+    if (metaError) {
+      console.error('Error registrando el dispositivo activo:', metaError.message);
+      return res.status(500).json({ ok: false, error: 'No se pudo registrar el dispositivo.' });
+    }
+  }
+
   return res.json({ ok: true, user: data.user, session: data.session });
 });
 
-app.get('/api/auth/me', requireAuth, (req, res) => {
+app.get('/api/auth/me', requireAuth, async (req, res) => {
+  // Sesión única por dispositivo: un token usado desde otro dispositivo se rechaza,
+  // salvo que se pida expresamente trasladar la sesión (force), que reutiliza el token
+  // válido para reclamar el dispositivo sin volver a pedir la contraseña.
+  const deviceId = typeof req.headers['x-device-id'] === 'string' ? String(req.headers['x-device-id']).trim() : '';
+  const force = String(req.headers['x-device-force'] || '') === '1';
+  const activeDevice = typeof req.user.app_metadata?.active_device_id === 'string' ? req.user.app_metadata.active_device_id : null;
+  if (deviceId && activeDevice && deviceId !== activeDevice) {
+    if (!force) {
+      return res.status(409).json({
+        ok: false,
+        code: 'device_conflict',
+        error: 'La sesión ya está abierta en otro dispositivo.',
+      });
+    }
+    const { error: metaError } = await updateUserAppMetadata(req.user.id, { active_device_id: deviceId });
+    if (metaError) {
+      console.error('Error trasladando el dispositivo activo:', metaError.message);
+      return res.status(500).json({ ok: false, error: 'No se pudo trasladar la sesión a este dispositivo.' });
+    }
+  }
   res.json({ ok: true, user: req.user });
 });
 
