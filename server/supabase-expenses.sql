@@ -18,6 +18,10 @@ alter table public.expenses enable row level security;
 
 -- Cada usuario solo puede ver y gestionar sus propios gastos (el backend usa la clave service,
 -- que ignora RLS, pero la política protege el acceso directo desde clientes con anon key).
+-- Se elimina antes para que este script se pueda ejecutar más de una vez sin fallar con
+-- 'policy already exists' (PostgreSQL no admite if not exists en create policy).
+drop policy if exists "Users manage own expenses" on public.expenses;
+
 create policy "Users manage own expenses"
   on public.expenses
   for all
@@ -29,4 +33,6 @@ create policy "Users manage own expenses"
 -- se guarda ni se puede recuperar.
 grant usage on schema public to service_role;
 grant select, insert, update, delete on public.expenses to service_role;
-grant usage, select on sequence public.expenses_id_seq to service_role;
+grant usage, select on all sequences in schema public to service_role;
+-- Los permisos de secuencias con ALL cubren tambien la secuencia de expenses aunque se
+-- regenere: por eso se usa ALL en vez del nombre concreto (…_id_seq).

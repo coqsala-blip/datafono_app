@@ -66,10 +66,16 @@ const PAYMENT_METHOD_CONFIGURATION_TTL_MS = 10 * 60 * 1000;
 
 // Lee la configuración de métodos de pago de la cuenta. Si hay varias (p. ej. una personalizada
 // creada desde el Dashboard), usa SIEMPRE la por defecto, que es la que aplica el Checkout.
+// OJO: en la API de Stripe el campo se llama 'is_default' (no 'default'): al buscarlo mal se
+// cogia la primera configuracion de la lista, que puede NO ser la que aplica el Checkout; en ese
+// caso activar un metodo (Bizum) no surtia ningun efecto en el cobro.
 const readDefaultPaymentMethodConfiguration = async () => {
   const configurations = await requireStripe().paymentMethodConfigurations.list({ limit: 10 });
   const items = Array.isArray(configurations?.data) ? configurations.data : [];
-  return items.find((item) => item?.default === true) || items[0] || null;
+  return items.find((item) => item?.is_default === true)
+    || items.find((item) => item?.active !== false)
+    || items[0]
+    || null;
 };
 
 const getPaymentMethodConfiguration = async () => {
@@ -358,6 +364,37 @@ app.get('/health', (req, res) => {
   // RENDER_GIT_COMMIT lo inyecta Render automaticamente en cada despliegue: permite verificar
   // desde fuera que el backend servido corresponde exactamente al commit desplegado.
   res.json({ ok: true, service: 'TPV & GESTOR backend', commit: process.env.RENDER_GIT_COMMIT || null });
+});
+
+// Diagnóstico de la conexión con Supabase. NUNCA devuelve la clave: solo su tipo (prefijo) y si
+// realmente tiene acceso a las tablas. Sirve para distinguir "la clave de Render es de otro tipo"
+// de "faltan permisos en el SQL" sin tener que adivinar.
+app.get('/api/supabase-diagnostico', async (req, res) => {
+  const url = String(process.env.SUPABASE_URL || '');
+  const key = String(process.env.SUPABASE_SECRET_KEY || '');
+  const projectRef = (url.match(/\/\/([^.]+)\.supabase\./) || [])[1] || null;
+
+  // Clasifica la clave por prefijo. Las claves nuevas de Supabase (sb_secret_/sb_publishable_)
+  // no son JWT, así que no se puede leer el 'role' de dentro: solo el prefijo.
+  let keyKind = 'ausente';
+  if (key.startsWith('sb_secret_')) keyKind = 'sb_secret_ (clave secreta: la que da permisos)';
+  else if (key.startsWith('sb_publishable_')) keyKind = 'sb_publishable_ (CLAVE PÚBLICA: NO da permisos)';
+  else if (key.startsWith('eyJ')) keyKind = 'JWT (revisar que el rol sea service_role)';
+  else if (key) keyKind = 'formato desconocido';
+
+  const probe = async (table) => {
+    const { error } = await supabase.from(table).select('*').limit(1);
+    return error ? `ERROR: ${error.message || error}` : 'OK';
+  };
+
+  res.json({
+    ok: true,
+    proyecto: projectRef,
+    urlConfigurada: url || null,
+    tipoDeClave: keyKind,
+    longitudClave: key.length,
+    acceso: { documents: await probe('documents'), expenses: await probe('expenses') },
+  });
 });
 
 const getBearerToken = (req) => {
@@ -865,6 +902,8 @@ app.get('/api/stripe/payment-methods', requireAuth, async (req, res) => {
       accountInfo,
       configurationId: configuration?.id || null,
       configurationName: configuration?.name || null,
+      configurationIsDefault: configuration?.is_default === true,
+      configurationActive: configuration?.active !== false,
       dashboardUrl: livemode === true
         ? 'https://dashboard.stripe.com/settings/payment_methods'
         : 'https://dashboard.stripe.com/test/settings/payment_methods',
