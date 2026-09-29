@@ -259,6 +259,14 @@ const readSubscriptionSeats = (subscription) => {
 // Importe mensual (IVA incluido) del plan con esas plazas, igual que calcula el Checkout.
 const monthlyAmountCentsForSeats = (seats) => 1089 + (Math.max(0, Math.min(50, Math.floor(Number(seats) || 0))) * 303);
 
+// Stripe NO guarda los metodos de pago de redireccion (Bizum, iDEAL, MB WAY, Payconiq...) como
+// metodo reutilizable. Si el plan se contrato con uno de ellos, el cliente se queda sin tarjeta y el
+// prorrateo de las plazas no se puede cobrar: Stripe devuelve este error concreto.
+const errorNeedsPaymentMethod = (error) => {
+  const message = String(error?.message || '').toLowerCase();
+  return /no attached payment source|no default payment method/.test(message);
+};
+
 // Localiza la suscripcion del usuario: primero el id guardado en su metadata y, si falta, el
 // cliente de Stripe o la sesion de Checkout pendiente (cuentas antiguas sin id guardado).
 const resolveUserSubscription = async (stripeClient, userId) => {
@@ -1283,6 +1291,10 @@ app.post('/api/billing/seats', requireAuth, async (req, res) => {
       'card_declined', 'expired_card', 'insufficient_funds', 'authentication_required',
       'invoice_payment_failed', 'payment_intent_authentication_failure',
     ].includes(code) || /payment|invoice/i.test(message);
+    // Caso mas frecuente: el plan se contrato con Bizum/iDEAL/MB WAY (metodos de redireccion), que
+    // NO se guardan en Stripe. Sin tarjeta reusable no hay con que cobrar el prorrateo, asi que se
+    // responde con needsPaymentMethod para que la app ofrezca guardar una tarjeta y reintentar.
+    const needsPaymentMethod = errorNeedsPaymentMethod(error);
     console.error('Error ajustando las plazas de empleado:', message);
 
     // Se releen las plazas reales para que la app no se quede con un numero que Stripe no aplico.
@@ -1296,13 +1308,56 @@ app.post('/api/billing/seats', requireAuth, async (req, res) => {
       }
     }
 
-    return res.status(paymentFailed ? 402 : 502).json({
+    return res.status(paymentFailed || needsPaymentMethod ? 402 : 502).json({
       ok: false,
+      needsPaymentMethod,
       additionalUsers: seatsAfterFailure,
-      error: paymentFailed
-        ? `Stripe no pudo cobrar el ajuste de plazas: ${message}. No se ha aplicado el cambio; revisa el método de pago y vuelve a intentarlo.`
-        : `Stripe: ${message}`,
+      error: needsPaymentMethod
+        ? 'Tu suscripción se contrató con un método de pago de un solo uso (Bizum, iDEAL, MB WAY…), que Stripe no guarda. Necesitas una tarjeta guardada para poder cobrar las plazas de empleado.'
+        : (paymentFailed
+          ? `Stripe no pudo cobrar el ajuste de plazas: ${message}. No se ha aplicado el cambio; revisa el método de pago y vuelve a intentarlo.`
+          : `Stripe: ${message}`),
     });
+  }
+});
+
+// Crea una sesion de Checkout en modo 'setup' para GUARDAR UN METODO DE PAGO REUTILIZABLE (tarjeta)
+// en el cliente de Stripe. Necesario cuando el plan se contrato con Bizum, iDEAL, MB WAY... porque
+// esos metodos de redireccion no se guardan y el prorrateo de las plazas no tendria con que cobrar.
+app.post('/api/billing/payment-method-setup', requireAuth, async (req, res) => {
+  if (!isPrincipal(req.user)) {
+    return res.status(403).json({ ok: false, error: 'Solo el usuario principal puede gestionar el método de pago.' });
+  }
+
+  try {
+    const stripeClient = requireStripe();
+    const resolved = await resolveUserSubscription(stripeClient, req.user.id);
+    if (!resolved.subscription) {
+      return res.status(409).json({ ok: false, error: 'Todavía no hay una suscripción activa: contrátala primero.' });
+    }
+
+    const subscription = resolved.subscription;
+    const customerId = typeof subscription.customer === 'string' ? subscription.customer : subscription.customer?.id;
+    if (!customerId) {
+      return res.status(409).json({ ok: false, error: 'No se encontró tu ficha de cliente en Stripe.' });
+    }
+
+    const session = await stripeClient.checkout.sessions.create({
+      mode: 'setup',
+      customer: customerId,
+      // Solo tarjeta: es el metodo que Stripe puede reutilizar para las renovaciones y los prorrateos.
+      payment_method_types: ['card'],
+      success_url: `${PUBLIC_API_URL}/billing/payment-method?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${PUBLIC_API_URL}/billing/payment-method-cancelled`,
+      metadata: { supabase_user_id: req.user.id },
+    });
+
+    await updateUserMetadata(req.user.id, { stripe_payment_method_setup_at: new Date().toISOString() });
+
+    return res.status(201).json({ ok: true, url: session.url, checkoutUrl: session.url });
+  } catch (error) {
+    console.error('Error creando la sesión para guardar el método de pago:', error.message);
+    return res.status(502).json({ ok: false, error: `Stripe: ${error.message}` });
   }
 });
 
@@ -1312,6 +1367,14 @@ app.get('/billing/success', (req, res) => {
 
 app.get('/billing/cancelled', (req, res) => {
   res.type('html').send('<h1>Pago cancelado</h1><p>Puedes cerrar esta página y volver a la aplicación.</p>');
+});
+
+app.get('/billing/payment-method', (req, res) => {
+  res.type('html').send('<h1>Tarjeta guardada</h1><p>Vuelve a la aplicación y vuelve a introducir el número de empleados: ahora Stripe ya podrá cobrar el cambio.</p>');
+});
+
+app.get('/billing/payment-method-cancelled', (req, res) => {
+  res.type('html').send('<h1>No se guardó la tarjeta</h1><p>Puedes cerrar esta página. Para añadir empleados necesitarás una tarjeta guardada en Stripe.</p>');
 });
 
 app.post('/api/documents', async (req, res) => {

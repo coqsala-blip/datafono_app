@@ -34,6 +34,7 @@ npm run dev
 - `POST /api/billing/checkout` (primera contratación; con suscripción activa responde 409)
 - `POST /api/billing/seats` (ajusta las plazas de empleado y cobra el prorrateo al momento)
 - `GET /api/billing/status` (estado de la suscripción y plazas de empleado contratadas)
+- `POST /api/billing/payment-method-setup` (sesión de Stripe para guardar una tarjeta)
 - `POST /api/stripe/webhook`
 - `POST /api/auth/refresh` (renueva la sesión del móvil con el refresh token y evita que los documentos se publiquen sin dueño)
 - `POST /api/documents` (publica el ticket/factura y lo asocia a la cuenta autenticada)
@@ -137,6 +138,22 @@ llama a Stripe, para no generar facturas de 0 €.
 
 `POST /api/billing/checkout` sigue usándose para la **primera** contratación: si ya hay una
 suscripción activa responde 409, de modo que no se crea una segunda suscripción.
+
+#### Si el plan se contrató con Bizum, iDEAL o MB WAY
+
+Stripe **no guarda** los métodos de redirección, así que esa suscripción se queda sin tarjeta y el
+prorrateo de las plazas no tiene con qué cobrarse (Stripe responde *"This customer has no attached
+payment source or default payment method"*). El backend detecta ese caso concreto y responde
+`402` con `needsPaymentMethod: true`; la app entonces ofrece **guardar una tarjeta**:
+
+1. `POST /api/billing/payment-method-setup` crea una sesión de Checkout en modo `setup`
+   (`payment_method_types: ['card']`) sobre el cliente de la suscripción.
+2. La app la abre con `expo-web-browser` y, al volver, **reintenta sola** el cambio de plazas.
+
+Como la tarjeta queda guardada, las renovaciones y los próximos cambios de empleados ya se cobran
+sin intervención. Si el cliente prefiero pagar con Bizum, en Stripe
+(*Billing → Payment methods*) puede quitar la tarjeta y volver a usar el método de un solo uso,
+pero entonces no podrá añadir empleados desde la app.
 
 ### Cobrar con Bizum (cobros puntuales)
 
