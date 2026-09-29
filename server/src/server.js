@@ -249,6 +249,57 @@ const hashEmployeeAccessCode = (code, salt) => crypto.scryptSync(code, salt, 64)
 
 const isPrincipal = (user) => user.app_metadata?.role !== 'empleado';
 
+// Plazas de empleado (usuarios adicionales) contratadas. La fuente de verdad es el item de la
+// suscripcion con el precio STRIPE_ADDITIONAL_USER_PRICE_ID, no la copia en la metadata.
+const readSubscriptionSeats = (subscription) => {
+  const item = (subscription?.items?.data || []).find((entry) => entry?.price?.id === STRIPE_ADDITIONAL_USER_PRICE_ID);
+  return item ? Math.max(0, Math.floor(Number(item.quantity) || 0)) : 0;
+};
+
+// Importe mensual (IVA incluido) del plan con esas plazas, igual que calcula el Checkout.
+const monthlyAmountCentsForSeats = (seats) => 1089 + (Math.max(0, Math.min(50, Math.floor(Number(seats) || 0))) * 303);
+
+// Localiza la suscripcion del usuario: primero el id guardado en su metadata y, si falta, el
+// cliente de Stripe o la sesion de Checkout pendiente (cuentas antiguas sin id guardado).
+const resolveUserSubscription = async (stripeClient, userId) => {
+  const { data, error } = await supabase.auth.admin.getUserById(userId);
+  if (error || !data?.user) throw new Error('No se encontró la cuenta para consultar su suscripción.');
+  const user = data.user;
+  const expand = ['items.data.price', 'latest_invoice'];
+
+  const storedId = user.user_metadata?.stripe_subscription_id;
+  if (storedId) {
+    try {
+      const subscription = await stripeClient.subscriptions.retrieve(storedId, { expand });
+      return { user, subscription, subscriptionId: storedId };
+    } catch (retrieveError) {
+      console.warn('No se pudo leer la suscripción guardada en la cuenta:', retrieveError.message);
+    }
+  }
+
+  const customerId = user.user_metadata?.stripe_customer_id;
+  if (customerId) {
+    const list = await stripeClient.subscriptions.list({ customer: customerId, status: 'all', limit: 20 });
+    const preferred = list.data.find((entry) => ['active', 'trialing', 'past_due'].includes(entry.status)) || list.data[0];
+    if (preferred) {
+      const subscription = await stripeClient.subscriptions.retrieve(preferred.id, { expand });
+      return { user, subscription, subscriptionId: preferred.id };
+    }
+  }
+
+  const checkoutSessionId = user.user_metadata?.stripe_checkout_session_id;
+  if (checkoutSessionId) {
+    const session = await stripeClient.checkout.sessions.retrieve(checkoutSessionId);
+    const fromSession = typeof session.subscription === 'string' ? session.subscription : session.subscription?.id;
+    if (fromSession) {
+      const subscription = await stripeClient.subscriptions.retrieve(fromSession, { expand });
+      return { user, subscription, subscriptionId: fromSession };
+    }
+  }
+
+  return { user, subscription: null, subscriptionId: null };
+};
+
 const findPrincipalByEmployeeAccessCode = async (accessCode) => {
   let page = 1;
   while (true) {
@@ -429,13 +480,16 @@ app.get('/api/billing/status', requireAuth, async (req, res) => {
   }
 
   let status = accountOwner.user_metadata?.stripe_subscription_status || 'missing';
+  // Plazas de empleado: se leen de Stripe y, si no se pudiera, queda la metadata como respaldo.
+  let additionalUsers = Math.max(0, Math.floor(Number(accountOwner.user_metadata?.stripe_subscription_additional_users) || 0));
   let subscriptionId = accountOwner.user_metadata?.stripe_subscription_id || null;
   const checkoutSessionId = accountOwner.user_metadata?.stripe_checkout_session_id || null;
 
   try {
     if (stripe && subscriptionId) {
-      const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+      const subscription = await stripe.subscriptions.retrieve(subscriptionId, { expand: ['items.data.price'] });
       status = subscription.status || status;
+      additionalUsers = readSubscriptionSeats(subscription);
       await updateUserMetadata(accountOwner.id, {
         stripe_subscription_status: status,
         stripe_subscription_updated_at: new Date().toISOString(),
@@ -444,8 +498,9 @@ app.get('/api/billing/status', requireAuth, async (req, res) => {
       const session = await stripe.checkout.sessions.retrieve(checkoutSessionId);
       if (session.subscription) {
         subscriptionId = typeof session.subscription === 'string' ? session.subscription : session.subscription.id;
-        const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+        const subscription = await stripe.subscriptions.retrieve(subscriptionId, { expand: ['items.data.price'] });
         status = subscription.status || status;
+        additionalUsers = readSubscriptionSeats(subscription);
         await updateUserMetadata(accountOwner.id, {
           subscription_provider: 'stripe',
           stripe_customer_id: session.customer || null,
@@ -468,6 +523,8 @@ app.get('/api/billing/status', requireAuth, async (req, res) => {
     active: activeStatuses.has(status),
     status,
     subscriptionId,
+    additionalUsers,
+    totalMonthlyCents: monthlyAmountCentsForSeats(additionalUsers),
   });
 });
 
@@ -930,10 +987,12 @@ app.get('/api/stripe/account', requireAuth, async (req, res) => {
   }
 });
 
-// Activa Bizum en la configuración de métodos de pago por defecto de la cuenta, con un solo clic
-// desde la app (Config -> "Intentar activar Bizum"). Usa la misma clave de Stripe del backend y
-// devuelve el resultado real de la API. Nota: solo funciona si la cuenta ya puede usar Bizum
-// (ubicación de negocio en España y capacidad verificada); si no, se devuelve el motivo exacto.
+// Activa Bizum en la configuración de métodos de pago por defecto de la cuenta. Endpoint de API y
+// soporte: la app ya no lo llama desde Config (sus botones de Bizum se retiraron), porque con
+// métodos dinámicos basta con activar Bizum en Stripe (Settings -> Payment methods). Usa la misma
+// clave de Stripe del backend y devuelve el resultado real de la API. Nota: solo funciona si la
+// cuenta ya puede usar Bizum (ubicación de negocio en España y capacidad verificada); si no, se
+// devuelve el motivo exacto.
 app.post('/api/stripe/enable-bizum', requireAuth, async (req, res) => {
   try {
     const stripeClient = requireStripe();
@@ -1069,6 +1128,21 @@ app.post('/api/billing/checkout', requireAuth, async (req, res) => {
   }
 
   try {
+    // Si ya hay una suscripcion activa no se crea otra: el cambio de plazas se hace con
+    // POST /api/billing/seats, que actualiza la suscripcion existente con prorrateo.
+    try {
+      const existing = await resolveUserSubscription(requireStripe(), req.user.id);
+      if (existing.subscription && ['active', 'trialing', 'past_due'].includes(existing.subscription.status)) {
+        return res.status(409).json({
+          ok: false,
+          alreadySubscribed: true,
+          error: 'Ya tienes una suscripción activa. Cambia las plazas de empleado desde Config y el importe se ajusta con prorrateo.',
+        });
+      }
+    } catch (existingError) {
+      console.warn('No se pudo comprobar si ya había suscripción:', existingError.message);
+    }
+
     const session = await requireStripe().checkout.sessions.create({
       mode: 'subscription',
       customer_email: req.user.email,
@@ -1108,6 +1182,127 @@ app.post('/api/billing/checkout', requireAuth, async (req, res) => {
   } catch (error) {
     console.error('Error creando suscripción Stripe:', error.message);
     return res.status(502).json({ ok: false, error: `Stripe: ${error.message}` });
+  }
+});
+
+// Ajusta las plazas de empleado (usuarios adicionales) de la suscripcion ya activa. Cobra el
+// prorrateo en el acto (proration_behavior: 'always_invoice') y, si el cobro falla, Stripe no
+// aplica el cambio (payment_behavior: 'error_if_incomplete') para no dejar la cuenta en impago.
+app.post('/api/billing/seats', requireAuth, async (req, res) => {
+  if (!isPrincipal(req.user)) {
+    return res.status(403).json({ ok: false, error: 'Solo el usuario principal puede gestionar la suscripción.' });
+  }
+  if (!STRIPE_ADDITIONAL_USER_PRICE_ID) {
+    return res.status(500).json({ ok: false, error: 'STRIPE_ADDITIONAL_USER_PRICE_ID no está configurado en el backend.' });
+  }
+  const requestedSeats = Math.max(0, Math.min(50, Math.floor(Number(req.body?.additionalUsers) || 0)));
+  let subscriptionId = null;
+
+  try {
+    const stripeClient = requireStripe();
+    const resolved = await resolveUserSubscription(stripeClient, req.user.id);
+    subscriptionId = resolved.subscriptionId;
+    const subscription = resolved.subscription;
+
+    if (!subscription || !subscriptionId) {
+      return res.status(409).json({
+        ok: false,
+        needsCheckout: true,
+        error: 'Todavía no hay una suscripción activa: contrátala y las plazas de empleado se incluyen en el plan.',
+      });
+    }
+    if (['canceled', 'unpaid', 'incomplete_expired'].includes(subscription.status)) {
+      return res.status(409).json({
+        ok: false,
+        error: `La suscripción está en estado "${subscription.status}": reactívala antes de cambiar las plazas.`,
+        additionalUsers: readSubscriptionSeats(subscription),
+      });
+    }
+
+    const currentSeats = readSubscriptionSeats(subscription);
+    if (currentSeats === requestedSeats) {
+      // Sin cambios reales no se llama a Stripe: evita facturas de 0 € al repetir el mismo número.
+      return res.json({
+        ok: true,
+        changed: false,
+        additionalUsers: currentSeats,
+        totalMonthlyCents: monthlyAmountCentsForSeats(currentSeats),
+        status: subscription.status || null,
+        invoiceAmountCents: 0,
+      });
+    }
+
+    const additionalItem = (subscription.items?.data || [])
+      .find((entry) => entry.price?.id === STRIPE_ADDITIONAL_USER_PRICE_ID) || null;
+    // Stripe exige una operación distinta según el caso: actualizar, añadir o quitar el item.
+    const itemUpdate = requestedSeats === 0
+      ? { id: additionalItem.id, deleted: true }
+      : additionalItem
+        ? { id: additionalItem.id, quantity: requestedSeats }
+        : { price: STRIPE_ADDITIONAL_USER_PRICE_ID, quantity: requestedSeats };
+
+    const updated = await stripeClient.subscriptions.update(subscriptionId, {
+      items: [itemUpdate],
+      proration_behavior: 'always_invoice',
+      payment_behavior: 'error_if_incomplete',
+      expand: ['latest_invoice'],
+      metadata: {
+        additional_users: String(requestedSeats),
+        total_monthly_cents: String(monthlyAmountCentsForSeats(requestedSeats)),
+      },
+    });
+
+    const seats = readSubscriptionSeats(updated);
+    const amount = monthlyAmountCentsForSeats(seats);
+    const invoice = updated.latest_invoice && typeof updated.latest_invoice === 'object' ? updated.latest_invoice : null;
+    const invoiceAmountCents = invoice ? Number(invoice.total) || 0 : 0;
+
+    await updateUserMetadata(req.user.id, {
+      subscription_provider: 'stripe',
+      stripe_subscription_id: subscriptionId,
+      stripe_subscription_status: updated.status || 'active',
+      stripe_subscription_additional_users: String(seats),
+      stripe_subscription_amount_cents: String(amount),
+      stripe_subscription_updated_at: new Date().toISOString(),
+    });
+
+    return res.json({
+      ok: true,
+      changed: true,
+      additionalUsers: seats,
+      totalMonthlyCents: amount,
+      status: updated.status || null,
+      invoiceId: invoice?.id || null,
+      invoiceAmountCents,
+      invoiceUrl: invoice?.hosted_invoice_url || null,
+    });
+  } catch (error) {
+    const code = String(error?.code || '');
+    const message = String(error?.message || 'error desconocido de Stripe');
+    const paymentFailed = [
+      'card_declined', 'expired_card', 'insufficient_funds', 'authentication_required',
+      'invoice_payment_failed', 'payment_intent_authentication_failure',
+    ].includes(code) || /payment|invoice/i.test(message);
+    console.error('Error ajustando las plazas de empleado:', message);
+
+    // Se releen las plazas reales para que la app no se quede con un numero que Stripe no aplico.
+    let seatsAfterFailure = null;
+    if (subscriptionId) {
+      try {
+        const current = await requireStripe().subscriptions.retrieve(subscriptionId, { expand: ['items.data.price'] });
+        seatsAfterFailure = readSubscriptionSeats(current);
+      } catch (readError) {
+        console.warn('No se pudieron releer las plazas tras el fallo:', readError.message);
+      }
+    }
+
+    return res.status(paymentFailed ? 402 : 502).json({
+      ok: false,
+      additionalUsers: seatsAfterFailure,
+      error: paymentFailed
+        ? `Stripe no pudo cobrar el ajuste de plazas: ${message}. No se ha aplicado el cambio; revisa el método de pago y vuelve a intentarlo.`
+        : `Stripe: ${message}`,
+    });
   }
 });
 
@@ -1387,16 +1582,10 @@ app.post('/api/subscriptions/create', async (req, res) => {
   res.status(503).json({ ok: false, error: 'Usa /api/billing/checkout para crear suscripciones con Stripe.' });
 });
 
+// Endpoint heredado: el precio real de las plazas vive en la suscripcion de Stripe
+// (POST /api/billing/seats). Se mantiene solo para responder 503 a clientes antiguos.
 app.post('/api/companies/:companyId/users', async (req, res) => {
-  try {
-    const { totalUsers } = req.body;
-    const extraUsers = Math.max(0, Number(totalUsers) - 1);
-    const totalMonthly = 7 + (extraUsers * 2);
-
-    res.json({ ok: true, totalMonthly, extraUsers });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
-  }
+  res.status(503).json({ ok: false, error: 'Usa /api/billing/seats para cambiar las plazas de empleado.' });
 });
 
 app.listen(PORT, () => {

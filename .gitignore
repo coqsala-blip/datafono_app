@@ -47,6 +47,10 @@ yarn-error.*
 # typescript
 *.tsbuildinfo
 
+# informes locales de validacion (tsc/eslint) generados en el PC
+eslint_report.txt
+tsc_report.txt
+
 example
 
 # generated native folders

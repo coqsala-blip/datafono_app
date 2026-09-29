@@ -21,18 +21,19 @@ npm run dev
 ### Endpoints principales
 
 - `GET /health`
-- `POST /api/companies`
-- `POST /api/subscriptions/create`
-- `POST /api/companies/:companyId/users`
+- `POST /api/companies` (heredado, responde 503)
+- `POST /api/subscriptions/create` (heredado, responde 503)
+- `POST /api/companies/:companyId/users` (heredado, responde 503)
 - `POST /api/stripe/payment`
 - `GET /api/stripe/payment/:paymentId`
 - `GET /api/stripe/payment-methods` (diagnóstico de métodos; `?probe=1` comprueba el Checkout real)
 - `GET /api/stripe/account` (datos de la cuenta y enlaces al Dashboard: cobros, pagos y banco)
-- `POST /api/stripe/enable-bizum` (intenta activar Bizum en la configuración de la cuenta)
+- `POST /api/stripe/enable-bizum` (soporte/API: pone Bizum a "on" en la configuración de métodos de la cuenta)
 - `POST /api/stripe/terminal/connection-token`
 - `POST /api/stripe/payment-intent`
-- `POST /api/billing/checkout`
-- `GET /api/billing/status`
+- `POST /api/billing/checkout` (primera contratación; con suscripción activa responde 409)
+- `POST /api/billing/seats` (ajusta las plazas de empleado y cobra el prorrateo al momento)
+- `GET /api/billing/status` (estado de la suscripción y plazas de empleado contratadas)
 - `POST /api/stripe/webhook`
 - `POST /api/auth/refresh` (renueva la sesión del móvil con el refresh token y evita que los documentos se publiquen sin dueño)
 - `POST /api/documents` (publica el ticket/factura y lo asocia a la cuenta autenticada)
@@ -120,6 +121,23 @@ corresponde a la clave secreta configurada en el backend. Para cobrar de verdad:
 Los importes que muestra la app son solo informativos: lo que se cobra es el importe del `price_...`
 creado en Stripe, así que los precios reales deben coincidir con 10,89 € y 3,03 € (IVA incluido).
 
+### Plazas de empleado (usuarios adicionales)
+
+El número de plazas contratadas vive en la suscripción de Stripe (item con el precio
+`STRIPE_ADDITIONAL_USER_PRICE_ID`), no en el móvil. Al entrar, `GET /api/billing/status` devuelve
+`additionalUsers` leído de la suscripción, así que el dato sigue ahí aunque se borren los datos de
+la app o se cambie de móvil.
+
+Con la suscripción activa, cambiar el número en **Config → AÑADIR EMPLEADO** llama a
+`POST /api/billing/seats`, que actualiza el item con `proration_behavior: always_invoice` (Stripe
+emite y cobra la factura del prorrateo al momento) y `payment_behavior: error_if_incomplete` (si el
+cobro falla, el cambio no se aplica, la app avisa y vuelve al número anterior). Si se baja el
+número, la prorrata negativa queda como saldo a favor del cliente. Si el número no cambia, no se
+llama a Stripe, para no generar facturas de 0 €.
+
+`POST /api/billing/checkout` sigue usándose para la **primera** contratación: si ya hay una
+suscripción activa responde 409, de modo que no se crea una segunda suscripción.
+
 ### Cobrar con Bizum (cobros puntuales)
 
 Bizum se ofrece a través de **Stripe Checkout** en el cobro online con enlace/QR
@@ -153,8 +171,13 @@ sigue cobrándose con tarjeta.
 `GET /api/stripe/payment-methods` (requiere sesión) devuelve el estado real de la cuenta. Con
 `?probe=1` además crea un Checkout de 1,00 € que **caduca al momento** (no cobra nada) y devuelve
 los métodos que Stripe resuelve de verdad, junto con el modo (test/live), el país de la cuenta, el
-estado de cada método y un enlace al Dashboard para activarlos. En la app lo tienes en
-**Config → "Comprobar Bizum en Stripe"**, junto al botón "Abrir Stripe para activar Bizum".
+estado de cada método y un enlace al Dashboard para activarlos. Es un endpoint de **soporte y
+diagnóstico**: la app no lo llama desde Config.
+
+En Config solo queda el botón **"CONFIGURAR DÓNDE RECIBIR LOS COBROS"**: los botones "Comprobar
+Bizum en Stripe" e "Intentar activar Bizum automáticamente" se retiraron, porque con métodos
+dinámicos basta con activar Bizum en Stripe (*Settings → Payment methods*) y el Checkout lo
+ofrece al instante.
 
 `GET /api/stripe/account` (requiere sesión) devuelve el estado de la cuenta —modo test/live, país,
 cobros y pagos activados, calendario de pagos, requisitos pendientes y las **cuentas bancarias de
