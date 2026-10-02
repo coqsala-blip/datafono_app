@@ -1441,7 +1441,7 @@ app.post('/api/billing/seats', requireAuth, async (req, res) => {
       needsPaymentMethod,
       additionalUsers: seatsAfterFailure,
       error: needsPaymentMethod
-        ? 'Tu suscripción se contrató con un método de pago de un solo uso (Bizum, iDEAL, MB WAY…), que Stripe no guarda. Necesitas una tarjeta guardada para poder cobrar las plazas de empleado.'
+        ? 'No hay ninguna tarjeta guardada en Stripe. Guarda una tarjeta para poder cobrar las plazas de empleado.'
         : (paymentFailed
           ? `Stripe no pudo cobrar el ajuste de plazas: ${message}. No se ha aplicado el cambio; revisa el método de pago y vuelve a intentarlo.`
           : `Stripe: ${message}`),

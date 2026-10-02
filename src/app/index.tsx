@@ -258,12 +258,12 @@ export default function TpvScreen() {
   const [subscriptionDaysUntilLock, setSubscriptionDaysUntilLock] = useState<number | null>(null);
   const [subscriptionPastDueInvoiceUrl, setSubscriptionPastDueInvoiceUrl] = useState<string | null>(null);
   const [pastDuePaying, setPastDuePaying] = useState(false);
-  const [pastDueMessage, setPastDueMessage] = useState('');  // Último número de plazas confirmado por Stripe (evita llamadas y cobros innecesarios).
+  const [pastDueMessage, setPastDueMessage] = useState('');
+  // Ultimo numero de plazas confirmado por Stripe (evita llamadas y cobros innecesarios).
   const seatsSyncedRef = useRef(0);
   const seatsSyncInFlightRef = useRef(false);
-  // Evita ofrecer guardar la tarjeta en bucle: solo se propone una vez por este fallo.
-  const paymentMethodPromptedRef = useRef(false);
-  const seatsSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Alta de empleado: un unico boton que cobra las plazas y guarda el codigo del empleado.
+  const [employeeSaveLoading, setEmployeeSaveLoading] = useState(false);
   const [terminalError, setTerminalError] = useState('');
   const [terminalMessage, setTerminalMessage] = useState('Listo para cobrar con tarjeta o wallet contactless.');
 
@@ -510,11 +510,9 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     setIssuer((current) => (current.additionalUsers === seats ? current : { ...current, additionalUsers: seats }));
   };
 
-  // Abre Stripe en modo 'setup' para GUARDAR UNA TARJETA. Necesario cuando el plan se contrató con
-  // Bizum, iDEAL o MB WAY: esos métodos de redirección no se guardan y sin tarjeta no se puede cobrar
-  // el prorrateo de las plazas. Al terminar, se reintenta el cambio de plazas automáticamente.
-  const addSubscriptionPaymentMethod = async (pendingSeats: number | null) => {
-    if (!accessToken || !configuredDocumentApiUrl) return;
+// Abre Stripe en modo 'setup' para GUARDAR UNA TARJETA. Devuelve si se guardo correctamente.
+  const addSubscriptionPaymentMethod = async (): Promise<boolean> => {
+    if (!accessToken || !configuredDocumentApiUrl) return false;
     setSeatsSyncLoading(true);
 
     try {
@@ -525,29 +523,36 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       const result = await response.json() as { ok?: boolean; url?: string; checkoutUrl?: string; error?: string };
       const setupUrl = result.url || result.checkoutUrl;
       if (!response.ok || !result.ok || !setupUrl) {
-        throw new Error(result.error || 'No se pudo abrir la página de tarjeta de Stripe.');
+        throw new Error(result.error || 'No se pudo abrir la pagina de tarjeta de Stripe.');
       }
 
       await WebBrowser.openBrowserAsync(setupUrl);
-      // Al volver de Stripe se reintenta el cambio de plazas: ahora Stripe ya tiene con qué cobrar.
-      if (pendingSeats !== null && pendingSeats > 0) {
-        await syncAdditionalUsersWithStripe(pendingSeats);
-      }
+      return true;
     } catch (error) {
       const message = error instanceof Error ? error.message : 'No se pudo guardar la tarjeta.';
       setSeatsSyncMessage(message);
-      Alert.alert('Método de pago', message);
+      Alert.alert('Metodo de pago', message);
+      return false;
     } finally {
       setSeatsSyncLoading(false);
     }
   };
 
-  const syncAdditionalUsersWithStripe = async (requestedSeats: number) => {
+  // Aplica las plazas contratadas a la suscripcion de Stripe (POST /api/billing/seats), que cobra el
+  // prorrateo al momento. Devuelve como termino para que el alta de empleado encadene los pasos:
+  //   - 'noChanges': el numero ya era el mismo, no se llama a Stripe ni se cobra nada.
+  //   - 'needsPaymentMethod': no hay tarjeta guardada; hay que abrir Stripe y reintentar.
+  //   - 'needsCheckout': todavia no hay suscripcion, las plazas se cobran con el plan.
+  //   - 'error' / 'ok'.
+  const syncAdditionalUsersWithStripe = async (
+    requestedSeats: number,
+  ): Promise<'noChanges' | 'ok' | 'needsPaymentMethod' | 'needsCheckout' | 'error'> => {
     const seats = Math.max(0, Math.min(50, Math.floor(Number(requestedSeats) || 0)));
-    if (!accessToken || !configuredDocumentApiUrl) return;
-    if (userRole !== 'principal') return;
-    // Sin cambio real no se llama a Stripe: ni petición ni factura de 0 € por repetir el número.
-    if (seats === seatsSyncedRef.current || seatsSyncInFlightRef.current) return;
+    if (!accessToken || !configuredDocumentApiUrl) return 'error';
+    if (userRole !== 'principal') return 'error';
+    if (seatsSyncInFlightRef.current) return 'error';
+    // Sin cambio real no se llama a Stripe: ni peticion ni factura de 0 € por repetir el numero.
+    if (seats === seatsSyncedRef.current) return 'noChanges';
 
     seatsSyncInFlightRef.current = true;
     setSeatsSyncLoading(true);
@@ -573,29 +578,15 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       };
 
       if (!response.ok || !result.ok) {
-        // Si Stripe no aplicó el cambio se vuelve al número que sí está contratado.
+        // Si Stripe no aplico el cambio se vuelve al numero que si esta contratado.
         applySubscriptionSeats(result.additionalUsers);
-        const message = result.needsCheckout
-          ? 'Todavía no tienes suscripción activa: contrátala y las plazas se cobrarán con el plan.'
-          : (result.error || 'No se pudieron actualizar las plazas de empleado en Stripe.');
-        // El plan se contrato con Bizum, iDEAL o MB WAY: Stripe no guarda ese metodo, asi que no hay
-        // con que cobrar el prorrateo. Se ofrece guardar una tarjeta y, al volver, se reintenta solo.
-        if (result.needsPaymentMethod && !paymentMethodPromptedRef.current) {
-          paymentMethodPromptedRef.current = true;
-          setSeatsSyncMessage('Guarda una tarjeta para poder contratar empleados. Al terminar se reintenta solo.');
-          Alert.alert(
-            'Falta un metodo de pago en Stripe',
-            'Tu plan se contrato con un metodo de un solo uso (Bizum, iDEAL, MB WAY...) que Stripe no guarda, asi que no puede cobrar las plazas de empleado.\n\n\u00bfGuardamos una tarjeta ahora? Al hacerlo se reintentara el cambio automaticamente.',
-            [
-              { text: 'Ahora no', style: 'cancel' },
-              { text: 'Guardar tarjeta', onPress: () => { void addSubscriptionPaymentMethod(seats); } },
-            ],
-          );
-          return;
+        if (result.needsPaymentMethod) return 'needsPaymentMethod';
+        if (result.needsCheckout) {
+          setSeatsSyncMessage('Todavia no tienes suscripcion activa: contratala y las plazas se cobraran con el plan.');
+          return 'needsCheckout';
         }
-        setSeatsSyncMessage(message);
-        Alert.alert('Plazas de empleado', message);
-        return;
+        setSeatsSyncMessage(result.error || 'No se pudieron actualizar las plazas de empleado en Stripe.');
+        return 'error';
       }
 
       applySubscriptionSeats(result.additionalUsers ?? seats);
@@ -608,29 +599,85 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       } else {
         setSeatsSyncMessage('Plazas de empleado actualizadas en Stripe.');
       }
+      return 'ok';
     } catch (error) {
       setSeatsSyncMessage(error instanceof Error ? error.message : 'No se pudieron actualizar las plazas de empleado.');
+      return 'error';
     } finally {
       seatsSyncInFlightRef.current = false;
       setSeatsSyncLoading(false);
     }
   };
 
-  // Se lanza al terminar de escribir (no en cada pulsación) y con una pequeña espera para no
-  // disparar dos cobros seguidos si el teclado envía varios eventos.
-  const scheduleAdditionalUsersSync = (requestedSeats: number) => {
-    if (userRole !== 'principal' || !hasActiveSubscription) return;
-    if (seatsSyncTimerRef.current) clearTimeout(seatsSyncTimerRef.current);
-    seatsSyncTimerRef.current = setTimeout(() => {
-      seatsSyncTimerRef.current = null;
-      void syncAdditionalUsersWithStripe(requestedSeats);
-    }, 600);
-  };
+// Alta de empleado: cobrar las plazas y guardar el codigo, todo desde un solo boton.
+  //   1. Se cobran las plazas con la tarjeta ya guardada en Stripe.
+  //   2. Si no hay ninguna guardada, se manda a Stripe a guardar una y se reintenta al volver.
+  //   3. Solo cuando las plazas estan contratadas se guarda el codigo del empleado.
+  const saveEmployeeWithSeats = async () => {
+    if (!accessToken || !configuredDocumentApiUrl) return;
+    const code = employeeAccessCode.trim();
+    if (code.length < 8) {
+      Alert.alert('Código demasiado corto', 'Usa un código de al menos 8 caracteres. No es el PIN del jefe.');
+      return;
+    }
 
-  // Al salir de la pantalla no se deja ningún temporizador vivo.
-  useEffect(() => () => {
-    if (seatsSyncTimerRef.current) clearTimeout(seatsSyncTimerRef.current);
-  }, []);
+    const seats = Math.max(0, Math.floor(Number(issuer.additionalUsers) || 0));
+    setEmployeeSaveLoading(true);
+
+    try {
+      let outcome = await syncAdditionalUsersWithStripe(seats);
+
+      // Sin tarjeta guardada: se abre Stripe y, al volver, se reintenta el cobro de las plazas.
+      if (outcome === 'needsPaymentMethod') {
+        setSeatsSyncMessage('Guardando tarjeta en Stripe...');
+        const saved = await addSubscriptionPaymentMethod();
+        if (!saved) {
+          setSeatsSyncMessage('No se pudo guardar la tarjeta. Intentalo de nuevo.');
+          return;
+        }
+        outcome = await syncAdditionalUsersWithStripe(seats);
+      }
+
+      if (outcome === 'needsCheckout') {
+        Alert.alert('Sin suscripcion activa', 'Contrata el plan y las plazas se cobraran junto con el.');
+        return;
+      }
+
+      // Las plazas deben estar contratadas antes de dar de alta al empleado.
+      if (outcome === 'error') {
+        Alert.alert('No se pudieron contratar las plazas', 'No se han podido cobrar las plazas de empleado. Intentalo de nuevo.');
+        return;
+      }
+
+      const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/auth/employee-access-code`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify({ accessCode: code }),
+      }, 10000);
+      const responseText = await response.text();
+      let result: { error?: string } = {};
+      try {
+        result = JSON.parse(responseText) as { error?: string };
+      } catch {
+        throw new Error('El servidor todavia no tiene disponible la funcion de empleados. Despliega la ultima version del backend en Render.');
+      }
+      if (!response.ok) throw new Error(result.error || 'No se pudo guardar el código.');
+
+      setEmployeeAccessCode('');
+      applySubscriptionSeats(seats);
+      Alert.alert(
+        'Empleado añadido',
+        `Se han contratado ${seats} plaza(s) de empleado${seats === 1 ? '' : 's'} y el código de acceso esta listo.\n\nCompartelo solo con quien deba acceder al TPV.`,
+      );
+    } catch (error) {
+      Alert.alert('No se pudo añadir el empleado', error instanceof Error ? error.message : 'Intentalo de nuevo.');
+    } finally {
+      setEmployeeSaveLoading(false);
+    }
+  };
 
   // --- IMPAGO ---
   // Se llama desde el aviso rojo y desde la pantalla de bloqueo. Primero intenta cobrar la factura
@@ -660,7 +707,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
           { text: 'Ahora no', style: 'cancel' },
           {
             text: tr('sub.updateCard'),
-            onPress: () => { void addSubscriptionPaymentMethod(null); },
+            onPress: () => { void addSubscriptionPaymentMethod(); },
           },
         ]);
         return;
@@ -992,35 +1039,6 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     return () => clearTimeout(timer);
   }, [accessToken, tokenExpiresAt]);
 
-  const saveEmployeeAccessCode = async () => {
-    if (!accessToken || !configuredDocumentApiUrl) return;
-    if (employeeAccessCode.trim().length < 8) {
-      Alert.alert('Código demasiado corto', 'Usa un código de al menos 8 caracteres. No es el PIN del jefe.');
-      return;
-    }
-    try {
-      const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/auth/employee-access-code`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${accessToken}`,
-        },
-        body: JSON.stringify({ accessCode: employeeAccessCode }),
-      }, 10000);
-      const responseText = await response.text();
-      let result: { error?: string } = {};
-      try {
-        result = JSON.parse(responseText) as { error?: string };
-      } catch {
-        throw new Error('El servidor todavía no tiene disponible la función de empleados. Despliega la última versión del backend en Render.');
-      }
-      if (!response.ok) throw new Error(result.error || 'No se pudo guardar el código.');
-      setEmployeeAccessCode('');
-      Alert.alert('Código de empleado guardado', 'Compártelo solo con los empleados que deban acceder al TPV.');
-    } catch (error) {
-      Alert.alert('No se pudo guardar el código', error instanceof Error ? error.message : 'Inténtalo de nuevo.');
-    }
-  };
 
   const startSubscriptionCheckout = async () => {
     if (!accessToken || !configuredDocumentApiUrl) {
@@ -4168,28 +4186,26 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                 <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 10 }}>{stripeMethodsError}</Text>
               ) : null}
             </View>
-<View style={styles.card}>
-              <Text style={styles.cardTitle}>👥 AÑADIR EMPLEADO</Text>
-              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>Añade una plaza, contrátala con la suscripción y crea un código de un solo uso para el nuevo empleado. Con la suscripción activa, al cambiar el
-número Stripe cobra al momento la parte proporcional.</Text>
-              <TextInput
+              <View style={styles.card}>
+                <Text style={styles.cardTitle}>👥 AÑADIR EMPLEADO</Text>
+                <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>
+                Escribe cuántas plazas de empleado quieres tener y un código distinto del PIN del jefe para él.
+                </Text>
+                <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>
+                Al guardar, las plazas se cobran con la tarjeta de la suscripción. Si no hay ninguna guardada,
+                </Text>
+                <Text style={[styles.modalSubtitle, { textAlign: 'left' }]}>
+                se abrirá Stripe para guardarla y el cobro se hará al volver. El empleado usará el código una sola vez.
+                </Text>
+                <TextInput
                 style={styles.input}
                 placeholder="Número de empleados adicionales"
                 placeholderTextColor="#94a3b8"
                 keyboardType="numeric"
                 value={String(issuer.additionalUsers || 0)}
                 onChangeText={(t) => setIssuer(i => ({ ...i, additionalUsers: Number(t.replace(/[^0-9]/g, '')) || 0 }))}
-                // Al terminar de escribir, el número se aplica a la suscripción de Stripe.
-                onEndEditing={() => scheduleAdditionalUsersSync(Number(issuer.additionalUsers || 0))}
-              />
-              {seatsSyncLoading ? (
-                <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 6, color: '#0284c7' }]}>Aplicando el cambio de plazas en Stripe...</Text>
-              ) : null}
-              {seatsSyncMessage ? (
-                <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 6, color: '#0f172a' }]}>{seatsSyncMessage}</Text>
-              ) : null}
-              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 8 }]}>Después de añadir plazas de empleado, crea un código distinto del PIN. Cada empleado lo usará una sola vez al registrarse en su móvil.</Text>
-              <TextInput
+                />
+                <TextInput
                 style={styles.input}
                 placeholder="Código para empleados (mínimo 8 caracteres)"
                 placeholderTextColor="#94a3b8"
@@ -4197,12 +4213,27 @@ número Stripe cobra al momento la parte proporcional.</Text>
                 secureTextEntry
                 value={employeeAccessCode}
                 onChangeText={setEmployeeAccessCode}
-              />
-              <Pressable style={[styles.secondaryButton, { marginTop: 2 }]} onPress={() => void saveEmployeeAccessCode()}>
-                <Text style={styles.secondaryButtonText}>Guardar código de empleado</Text>
-              </Pressable>
-            </View>
-
+                />
+                <Pressable
+                style={[styles.secondaryButton, { marginTop: 4 }]}
+                onPress={() => void saveEmployeeWithSeats()}
+                disabled={employeeSaveLoading}
+                >
+                <Text style={styles.secondaryButtonText}>
+                {employeeSaveLoading
+                ? 'Guardando...'
+                : Number(issuer.additionalUsers || 0) > 0
+                ? `Cobrar ${formatCurrency(subscriptionAdditionalUserCents * Number(issuer.additionalUsers || 0))} y generar el código`
+                : 'Generar el código del empleado'}
+                </Text>
+                </Pressable>
+                {seatsSyncLoading ? (
+                <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 6, color: '#0284c7' }]}>Aplicando el cambio de plazas en Stripe...</Text>
+                ) : null}
+                {seatsSyncMessage ? (
+                <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 6, color: '#0f172a' }]}>{seatsSyncMessage}</Text>
+                ) : null}
+                </View>
             <View style={styles.card}>
               <Text style={styles.cardTitle}>⚙️ DATOS DEL NEGOCIO</Text>
               <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>La aplicación organiza tus facturas y gastos para facilitar su revisión por tu gestoría.</Text>

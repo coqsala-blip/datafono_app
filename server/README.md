@@ -130,12 +130,22 @@ El número de plazas contratadas vive en la suscripción de Stripe (item con el 
 `additionalUsers` leído de la suscripción, así que el dato sigue ahí aunque se borren los datos de
 la app o se cambie de móvil.
 
-Con la suscripción activa, cambiar el número en **Config → AÑADIR EMPLEADO** llama a
-`POST /api/billing/seats`, que actualiza el item con `proration_behavior: always_invoice` (Stripe
-emite y cobra la factura del prorrateo al momento) y `payment_behavior: error_if_incomplete` (si el
-cobro falla, el cambio no se aplica, la app avisa y vuelve al número anterior). Si se baja el
-número, la prorrata negativa queda como saldo a favor del cliente. Si el número no cambia, no se
-llama a Stripe, para no generar facturas de 0 €.
+Con la suscripción activa, el alta de empleado de **Config → AÑADIR EMPLEADO** la resuelve un
+único botón, encadenando tres pasos:
+
+1. Se llama a `POST /api/billing/seats`, que actualiza el item con
+   `proration_behavior: always_invoice` (Stripe emite y cobra la factura del prorrateo al momento) y
+   `payment_behavior: error_if_incomplete` (si el cobro falla, el cambio **no** se aplica, la app avisa
+   y vuelve al número anterior). Si se baja el número, la prorrata negativa queda como saldo a favor
+   del cliente. Si el número no cambia, no se llama a Stripe, para no generar facturas de 0 €.
+2. Si Stripe responde `402 needsPaymentMethod` (no hay ninguna tarjeta guardada), la app llama a
+   `POST /api/billing/payment-method-setup` para abrir Stripe en modo `setup`, y **al volver reintenta
+   el cobro de las plazas sin que el usuario tenga que reintroducir nada**.
+3. Solo cuando las plazas están contratadas de verdad se guarda el código con
+   `POST /api/auth/employee-access-code`, y se confirma con el número contratado.
+
+El texto de la interfaz se limita a *Cobrar {importe} y generar el código*: si el número es 0, solo
+genera el código sin tocar Stripe.
 
 `POST /api/billing/checkout` sigue usándose para la **primera** contratación: si ya hay una
 suscripción activa responde 409, de modo que no se crea una segunda suscripción.
