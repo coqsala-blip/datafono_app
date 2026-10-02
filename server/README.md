@@ -190,10 +190,21 @@ Con esos datos la app hace dos cosas:
 
 1. **Aviso rojo** sobre y bajo las pestañas, con los días que quedan y los botones *Pagar ahora*
    (cobro directo) y *Actualizar tarjeta* (abre la factura en Stripe).
-2. **Bloqueo total a los 3 días**, solo para el usuario principal: los empleados no se quedan sin
-   poder trabajar por un cobro. El botón *Pagar ahora* llama a `POST /api/billing/resolve-invoice`,
-   que cobra la factura vencida con la tarjeta guardada (o responde `402 needsPaymentMethod` si no
-   hay ninguna). Tras el cobro se relee el estado de Stripe, así que la app se reabre sola.
+2. **Bloqueo total a los 3 días**, para **toda la cuenta**: se bloquea tanto al usuario principal como
+   a los empleados, porque la suscripción está a nombre del principal y, si no se paga, el negocio
+   no puede operar. Los empleados ven el mismo aviso de bloqueo, pero **sin botones de pago** (el
+   backend exige `isPrincipal` en `/api/billing/resolve-invoice`): su pantalla les pide que avisen al
+   titular. El botón *Pagar ahora* del principal llama a `POST /api/billing/resolve-invoice`, que
+   cobra la factura vencida con la tarjeta guardada (o responde `402 needsPaymentMethod` si no hay
+   ninguna). Tras el cobro se relee el estado de Stripe, así que la app se reabre sola.
+
+   El bloqueo **solo oculta la interfaz**: no borra ni una línea del historial. Los tickets, gastos y
+   documentos viven en el servidor y en la base local del móvil, así que al pagar y desbloquearse la
+   cuenta aparece todo exactamente como estaba. Durante los 3 días de margen la app se sigue usando
+   con normalidad, con el aviso rojo como único aviso.
+
+   Los empleados reciben el mismo `pastDue` / `locked` porque `GET /api/billing/status` resuelve
+   siempre al titular de la cuenta (`company_owner_id`), sea quien sea quien llame.
 
 ### Cobrar con Bizum (cobros puntuales)
 

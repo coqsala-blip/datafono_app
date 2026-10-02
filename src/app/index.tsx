@@ -1252,6 +1252,10 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   const requireSubscription = (feature: string) => {
     if (hasActiveSubscription) return true;
 
+    // Impago dentro del plazo de cortesia: la app sigue funcionando y lo que hay es el aviso
+    // rojo. No se bloquea el uso hasta que se cumplen los dias de margen.
+    if (subscriptionPastDue && !subscriptionLocked) return true;
+
     Alert.alert(
       'Suscripción necesaria',
       `Activa la suscripción para ${feature}. Puedes seguir explorando la aplicación antes de contratarla.`,
@@ -3629,7 +3633,11 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
 
   // Botones del aviso de impago: cobrar la factura vencida con la tarjeta guardada y, si no hay
   // ninguna, abrir Stripe para guardarla. Al volver, el estado se relee solo.
-  const renderPastDueActions = () => (
+  const renderPastDueActions = () => {
+    // Solo el usuario principal puede pagar: el backend rechaza (/api/billing/resolve-invoice
+    // exige isPrincipal). A los empleados se les informa, pero el cobro le toca al titular.
+    if (userRole !== 'principal') return null;
+    return (
     <View style={{ flexDirection: 'row', marginTop: 8 }}>
       <Pressable
         style={[styles.primaryButton, { flex: 1, opacity: pastDuePaying ? 0.6 : 1 }]}
@@ -3651,8 +3659,9 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
           <Text style={styles.secondaryButtonText}>{tr('sub.updateCard')}</Text>
         </Pressable>
       ) : null}
-    </View>
-  );
+      </View>
+    );
+  };
 
   // Aviso de impago. Se pinta en DOS sitios a proposito: encima de las pestanas y debajo de
   // ellas. Asi el recuadro rojo queda siempre a la vista, se este en la pestana que se este.
@@ -3685,10 +3694,11 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     );
   };
 
-  // Bloqueo total por impago. Solo el usuario principal ve esta pantalla, porque es quien tiene
-  // la suscripcion: los empleados no pueden quedarse sin poder trabajar por un cobro. Al pagar
-  // se relee el estado de Stripe, de modo que la app se reabre sola.
-  if (subscriptionLocked && userRole === 'principal') {
+  // Bloqueo total por impago. Afecta a TODOS los que usan la cuenta (principal y empleados):
+  // la suscripcion esta a nombre del principal, asi que si no se paga, nadie puede trabajar. Al
+  // pagar se relee el estado de Stripe y la app se reabre sola, conservando todo el historial: el
+  // bloqueo solo oculta la interfaz, nunca borra tickets, gastos ni documentos.
+  if (subscriptionLocked) {
     return (
       <SafeAreaView style={styles.safeArea}>
         <ScrollView contentContainerStyle={{ flexGrow: 1, justifyContent: 'center', padding: 24 }}>
@@ -3697,7 +3707,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
               {tr('sub.pastDueTitle')}
             </Text>
             <Text style={[styles.modalSubtitle, { marginTop: 8 }]}>
-              {tr('sub.pastDueLocked')}
+              {userRole === 'principal' ? tr('sub.pastDueLocked') : tr('sub.lockedEmployee')}
             </Text>
             {pastDueMessage ? (
               <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 10 }}>{pastDueMessage}</Text>
