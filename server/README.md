@@ -32,7 +32,7 @@ npm run dev
 - `POST /api/stripe/terminal/connection-token`
 - `POST /api/stripe/payment-intent`
 - `POST /api/billing/checkout` (primera contratación; con suscripción activa responde 409)
-- `POST /api/billing/seats` (ajusta las plazas de empleado y cobra el prorrateo al momento)
+- `POST /api/billing/seats` (ajusta las plazas de empleado y cobra el prorrateo al momento; si el cliente no tiene ninguna tarjeta guardada responde `402 needsPaymentMethod` **antes** de tocar la suscripción, para que la app abra directamente la página de tarjeta de Stripe)
 - `GET /api/billing/status` (estado de la suscripción y plazas de empleado contratadas)
 - `POST /api/billing/payment-method-setup` (sesión de Stripe para guardar una tarjeta)
 - `POST /api/billing/resolve-invoice` (cobra la factura vencida de la suscripción con la tarjeta guardada)

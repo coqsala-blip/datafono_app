@@ -274,6 +274,25 @@ const monthlyAmountCentsForSeats = (seats) => 1089 + (Math.max(0, Math.min(50, M
 // Stripe NO guarda los metodos de pago de redireccion (Bizum, iDEAL, MB WAY, Payconiq...) como
 // metodo reutilizable. Si el plan se contrato con uno de ellos, el cliente se queda sin tarjeta y el
 // prorrateo de las plazas no se puede cobrar: Stripe devuelve este error concreto.
+// Indica si el cliente de Stripe tiene ya una tarjeta guardada. Los metodos de redireccion (Bizum,
+// iDEAL, MB WAY...) NO se guardan, asi que un plan contratado con ellos se queda sin nada con que
+// cobrar las renovaciones y los pro-rrateos.
+const customerHasReusableCard = async (stripeClient, customerId) => {
+  if (!customerId) return false;
+  try {
+    const methods = await stripeClient.paymentMethods.list({
+      customer: typeof customerId === 'string' ? customerId : customerId.id,
+      type: 'card',
+      limit: 1,
+    });
+    if (methods?.data?.length) return true;
+  } catch (error) {
+    // Si la API falla no se bloquea el alta: el propio cobro dira si falta la tarjeta.
+    console.warn('No se pudieron listar las tarjetas del cliente:', error.message);
+    return true;
+  }
+  return false;
+};
 const errorNeedsPaymentMethod = (error) => {
   const message = String(error?.message || '').toLowerCase();
   return /no attached payment source|no default payment method/.test(message);
@@ -1365,6 +1384,21 @@ app.post('/api/billing/seats', requireAuth, async (req, res) => {
         totalMonthlyCents: monthlyAmountCentsForSeats(currentSeats),
         status: subscription.status || null,
         invoiceAmountCents: 0,
+      });
+    }
+
+    // Si el plan se contracted con Bizum/iDEAL/MB WAY no hay ninguna tarjeta guardada. Se comprueba
+    // ANTES de tocar la suscripcion para devolver needsPaymentMethod y que la app mande al usuario
+    // directamente a la pagina de tarjeta, en vez de depender del error que Stripe decida devolver.
+    const customerId = typeof subscription.customer === 'string'
+      ? subscription.customer
+      : subscription.customer?.id || null;
+    if (!(await customerHasReusableCard(stripeClient, customerId))) {
+      return res.status(402).json({
+        ok: false,
+        needsPaymentMethod: true,
+        additionalUsers: currentSeats,
+        error: 'No hay ninguna tarjeta guardada en Stripe.',
       });
     }
 

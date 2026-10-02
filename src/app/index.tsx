@@ -580,7 +580,13 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       if (!response.ok || !result.ok) {
         // Si Stripe no aplico el cambio se vuelve al numero que si esta contratado.
         applySubscriptionSeats(result.additionalUsers);
-        if (result.needsPaymentMethod) return 'needsPaymentMethod';
+        // Se detecta la falta de tarjeta por la bandera del backend y, como red de seguridad, por el
+        // texto del mensaje. Asi, si el backend no marca el caso, la app abre igualmente Stripe en
+        // lugar de dejar al usuario con un aviso que no le deja hacer nada.
+        const errorText = String(result.error || '');
+        const faltaTarjeta = Boolean(result.needsPaymentMethod)
+          || /tarjeta|metodo de pago|method of payment|payment method|card/i.test(errorText);
+        if (faltaTarjeta) return 'needsPaymentMethod';
         if (result.needsCheckout) {
           setSeatsSyncMessage('Todavia no tienes suscripcion activa: contratala y las plazas se cobraran con el plan.');
           return 'needsCheckout';
