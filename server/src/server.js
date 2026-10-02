@@ -589,14 +589,17 @@ app.get('/api/billing/status', requireAuth, async (req, res) => {
 // Stripe a mano. La factura se recupera del propio campo latest_invoice de la suscripcion, nunca de
 // un dato del cliente.
 app.post('/api/billing/resolve-invoice', requireAuth, async (req, res) => {
-  if (!isPrincipal(req.user)) {
-    return res.status(403).json({ ok: false, error: 'Solo el usuario principal puede gestionar la suscripción.' });
-  }
+  // Lo puede cobrar cualquier usuario de la cuenta, no solo el principal: si la app esta
+  // bloqueada por impago, cualquiera que entre debe poder pagar la factura pendiente. La
+  // suscripcion que se cobra es siempre la del titular (resolveUserSubscription de mas abajo).
 
   try {
     const stripeClient = requireStripe();
     const resolved = await resolveUserSubscription(stripeClient, req.user.id);
     const subscription = resolved.subscription;
+    // Los cambios de estado se guardan en la metadata del TITULAR: si los guardasemos en la del
+    // empleado que paga, el aviso de impago seguiria activo en la cuenta y la app no se desbloquearia.
+    const ownerUserId = resolved.user?.id || req.user.id;
     if (!subscription) {
       return res.status(409).json({ ok: false, error: 'Todavía no hay una suscripción activa.' });
     }
@@ -609,7 +612,7 @@ app.post('/api/billing/resolve-invoice', requireAuth, async (req, res) => {
       : null;
 
     if (!invoice || invoice.status === 'paid' || invoice.status === 'void') {
-      await updateUserMetadata(req.user.id, { stripe_subscription_status: updated.status || 'active' });
+      await updateUserMetadata(ownerUserId, { stripe_subscription_status: updated.status || 'active' });
       return res.json({ ok: true, alreadyPaid: true, status: updated.status || 'active' });
     }
 
@@ -630,7 +633,7 @@ app.post('/api/billing/resolve-invoice', requireAuth, async (req, res) => {
     });
     const subscriptionAfter = await stripeClient.subscriptions.retrieve(resolved.subscriptionId);
 
-    await updateUserMetadata(req.user.id, {
+    await updateUserMetadata(ownerUserId, {
       stripe_subscription_status: subscriptionAfter.status || 'active',
       stripe_past_due_since: null,
       stripe_subscription_updated_at: new Date().toISOString(),
@@ -1450,13 +1453,15 @@ app.post('/api/billing/seats', requireAuth, async (req, res) => {
 // en el cliente de Stripe. Necesario cuando el plan se contrato con Bizum, iDEAL, MB WAY... porque
 // esos metodos de redireccion no se guardan y el prorrateo de las plazas no tendria con que cobrar.
 app.post('/api/billing/payment-method-setup', requireAuth, async (req, res) => {
-  if (!isPrincipal(req.user)) {
-    return res.status(403).json({ ok: false, error: 'Solo el usuario principal puede gestionar el método de pago.' });
-  }
+  // Cualquier usuario de la cuenta puede guardar la tarjeta que se usara para las renovaciones y
+  // los prorrateos. La sesion se crea sobre el cliente de Stripe del titular.
 
   try {
     const stripeClient = requireStripe();
     const resolved = await resolveUserSubscription(stripeClient, req.user.id);
+    // Los cambios de estado se guardan en la metadata del TITULAR: si se guardaran en la del
+    // empleado, el aviso de impago seguiria activo y la app no se desbloquearia.
+    const ownerUserId = resolved.user?.id || req.user.id;
     if (!resolved.subscription) {
       return res.status(409).json({ ok: false, error: 'Todavía no hay una suscripción activa: contrátala primero.' });
     }
@@ -1477,7 +1482,7 @@ app.post('/api/billing/payment-method-setup', requireAuth, async (req, res) => {
       metadata: { supabase_user_id: req.user.id },
     });
 
-    await updateUserMetadata(req.user.id, {
+    await updateUserMetadata(ownerUserId, {
       stripe_payment_method_setup_at: new Date().toISOString(),
       // Se guarda el identificador de la sesion para poder reutilizar despues la tarjeta que el
       // usuario guarde y cobrar con ella la factura vencida (POST /api/billing/resolve-invoice).

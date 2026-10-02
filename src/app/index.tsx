@@ -3634,9 +3634,8 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   // Botones del aviso de impago: cobrar la factura vencida con la tarjeta guardada y, si no hay
   // ninguna, abrir Stripe para guardarla. Al volver, el estado se relee solo.
   const renderPastDueActions = () => {
-    // Solo el usuario principal puede pagar: el backend rechaza (/api/billing/resolve-invoice
-    // exige isPrincipal). A los empleados se les informa, pero el cobro le toca al titular.
-    if (userRole !== 'principal') return null;
+    // Cualquier usuario de la cuenta puede pagar: el backend resuelve la suscripcion del titular,
+    // asi que un empleado que pague descuenta la cuenta de su empresa y no la suya.
     return (
     <View style={{ flexDirection: 'row', marginTop: 8 }}>
       <Pressable
@@ -3707,7 +3706,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
               {tr('sub.pastDueTitle')}
             </Text>
             <Text style={[styles.modalSubtitle, { marginTop: 8 }]}>
-              {userRole === 'principal' ? tr('sub.pastDueLocked') : tr('sub.lockedEmployee')}
+              {tr('sub.pastDueLocked')}
             </Text>
             {pastDueMessage ? (
               <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 10 }}>{pastDueMessage}</Text>

@@ -191,12 +191,16 @@ Con esos datos la app hace dos cosas:
 1. **Aviso rojo** sobre y bajo las pestañas, con los días que quedan y los botones *Pagar ahora*
    (cobro directo) y *Actualizar tarjeta* (abre la factura en Stripe).
 2. **Bloqueo total a los 3 días**, para **toda la cuenta**: se bloquea tanto al usuario principal como
-   a los empleados, porque la suscripción está a nombre del principal y, si no se paga, el negocio
-   no puede operar. Los empleados ven el mismo aviso de bloqueo, pero **sin botones de pago** (el
-   backend exige `isPrincipal` en `/api/billing/resolve-invoice`): su pantalla les pide que avisen al
-   titular. El botón *Pagar ahora* del principal llama a `POST /api/billing/resolve-invoice`, que
-   cobra la factura vencida con la tarjeta guardada (o responde `402 needsPaymentMethod` si no hay
-   ninguna). Tras el cobro se relee el estado de Stripe, así que la app se reabre sola.
+   a los empleados, porque la suscripción está a nombre del titular y, si no se paga, el negocio
+   no puede operar. **Cualquier usuario de la cuenta (principal o empleado) puede pagar**: el botón
+   *Pagar ahora* llama a `POST /api/billing/resolve-invoice`, que cobra la factura vencida con la
+   tarjeta guardada (o responde `402 needsPaymentMethod` si no hay ninguna). Es seguro que lo pague un
+   empleado porque `resolveUserSubscription` localiza siempre la suscripción del **titular**, y los
+   cambios de estado se guardan en su metadata (no en la del empleado que paga), así que un solo pago
+   desbloquea a todos. Tras el cobro se relee el estado de Stripe, así que la app se reabre sola.
+
+   Lo mismo aplica a `POST /api/billing/payment-method-setup`: cualquier usuario puede guardar la
+   tarjeta de la cuenta, porque la sesión de Stripe se crea sobre el cliente del titular.
 
    El bloqueo **solo oculta la interfaz**: no borra ni una línea del historial. Los tickets, gastos y
    documentos viven en el servidor y en la base local del móvil, así que al pagar y desbloquearse la
