@@ -119,6 +119,14 @@ const es: Dict = {
   'sub.statusUnpaid': 'Suscripción impagada',
   'sub.statusTrialing': 'Suscripción en periodo de prueba',
   'sub.errorTitle': 'Aviso de suscripción',
+  'sub.pastDueTitle': 'Pago pendiente: no se ha podido cobrar la suscripción.',
+  'sub.pastDueBody': 'La app se bloqueará en {days} días. Actualiza tu tarjeta para seguir usándola.',
+  'sub.pastDueLocked': 'La app se ha bloqueado por impago. Paga la suscripción para volver a usarla.',
+  'sub.pastDueOverdue': 'Se han agotado los días acordados. Paga cuanto antes para no perder el servicio.',
+  'sub.payNow': 'Pagar ahora',
+  'sub.updateCard': 'Actualizar tarjeta',
+  'sub.checkingPayment': 'Comprobando el pago...',
+  'sub.paid': 'Pago realizado. La app vuelve a estar disponible.',
   'lang.title': 'Idioma de la aplicación',
   'lang.subtitle': 'Al instalarse, la app elige el idioma del país del móvil. Puedes cambiarlo aquí cuando quieras.',
   'lang.saved': 'Idioma guardado.',
@@ -187,6 +195,14 @@ const en: Dict = {
   'sub.statusUnpaid': 'Subscription unpaid',
   'sub.statusTrialing': 'Subscription in trial period',
   'sub.errorTitle': 'Subscription notice',
+  'sub.pastDueTitle': 'Payment pending: the subscription could not be charged.',
+  'sub.pastDueBody': 'The app will be locked in {days} days. Update your card to keep using it.',
+  'sub.pastDueLocked': 'The app has been locked due to non-payment. Pay the subscription to use it again.',
+  'sub.pastDueOverdue': 'The agreed days have run out. Please pay as soon as possible to avoid losing the service.',
+  'sub.payNow': 'Pay now',
+  'sub.updateCard': 'Update card',
+  'sub.checkingPayment': 'Checking the payment...',
+  'sub.paid': 'Payment made. The app is available again.',
   'lang.title': 'App language',
   'lang.subtitle': 'On install, the app picks the language of the phone country. You can change it here at any time.',
   'lang.saved': 'Language saved.',
@@ -269,6 +285,14 @@ const fr: Dict = {
   'sub.statusUnpaid': 'Abonnement impayé',
   'sub.statusTrialing': 'Abonnement en période d’essai',
   'sub.errorTitle': 'Avis d’abonnement',
+  'sub.pastDueTitle': 'Paiement en attente : l’abonnement n’a pas pu être débité.',
+  'sub.pastDueBody': 'L’app sera bloquée dans {days} jours. Mettez à jour votre carte pour continuer à l’utiliser.',
+  'sub.pastDueLocked': 'L’app a été bloquée pour impayé. Réglez l’abonnement pour pouvoir l’utiliser à nouveau.',
+  'sub.pastDueOverdue': 'Les jours convenus sont écoulés. Merci de régler rapidement afin de ne pas perdre le service.',
+  'sub.payNow': 'Payer maintenant',
+  'sub.updateCard': 'Mettre à jour la carte',
+  'sub.checkingPayment': 'Vérification du paiement...',
+  'sub.paid': 'Paiement effectué. L’app est de nouveau disponible.',
 };
 
 const de: Dict = {
@@ -337,6 +361,14 @@ const de: Dict = {
   'sub.statusUnpaid': 'Abo nicht bezahlt',
   'sub.statusTrialing': 'Abo in der Testphase',
   'sub.errorTitle': 'Abo-Hinweis',
+  'sub.pastDueTitle': 'Zahlung ausstehend: das Abo konnte nicht abgebucht werden.',
+  'sub.pastDueBody': 'Die App wird in {days} Tagen gesperrt. Aktualisieren Sie Ihre Karte, um sie weiter zu nutzen.',
+  'sub.pastDueLocked': 'Die App wurde wegen Nichtzahlung gesperrt. Bezahlen Sie das Abo, um sie wieder nutzen zu können.',
+  'sub.pastDueOverdue': 'Die vereinbarte Frist ist abgelaufen. Bitte bezahlen Sie zeitnah, um den Dienst nicht zu verlieren.',
+  'sub.payNow': 'Jetzt bezahlen',
+  'sub.updateCard': 'Karte aktualisieren',
+  'sub.checkingPayment': 'Zahlung wird geprüft...',
+  'sub.paid': 'Zahlung erfolgt. Die App ist wieder verfügbar.',
 };
 
 const it: Dict = {
@@ -405,6 +437,14 @@ const it: Dict = {
   'sub.statusUnpaid': 'Abbonamento non pagato',
   'sub.statusTrialing': 'Abbonamento in periodo di prova',
   'sub.errorTitle': 'Avviso abbonamento',
+  'sub.pastDueTitle': 'Pagamento in sospeso: non è stato possibile addebitare l’abbonamento.',
+  'sub.pastDueBody': 'L’app verrà bloccata tra {days} giorni. Aggiorna la carta per continuare a usarla.',
+  'sub.pastDueLocked': 'L’app è stata bloccata per mancato pagamento. Paga l’abbonamento per usarla di nuovo.',
+  'sub.pastDueOverdue': 'Sono trascorsi più giorni di quanto concordato. Paga al più presto per non perdere il servizio.',
+  'sub.payNow': 'Paga ora',
+  'sub.updateCard': 'Aggiorna carta',
+  'sub.checkingPayment': 'Verifica del pagamento in corso...',
+  'sub.paid': 'Pagamento effettuato. L’app è di nuovo disponibile.',
 };
 
 const pt: Dict = {
@@ -473,6 +513,14 @@ const pt: Dict = {
   'sub.statusUnpaid': 'Subscrição não paga',
   'sub.statusTrialing': 'Subscrição em período de teste',
   'sub.errorTitle': 'Aviso de subscrição',
+  'sub.pastDueTitle': 'Pagamento pendente: não foi possível cobrar a subscrição.',
+  'sub.pastDueBody': 'A app será bloqueada dentro de {days} dias. Atualize o seu cartão para continuar a usá-la.',
+  'sub.pastDueLocked': 'A app foi bloqueada por falta de pagamento. Pague a subscrição para voltar a usá-la.',
+  'sub.pastDueOverdue': 'Já passaram os dias acordados. Pague o quanto antes para não perder o serviço.',
+  'sub.payNow': 'Pagar agora',
+  'sub.updateCard': 'Atualizar cartão',
+  'sub.checkingPayment': 'A verificar o pagamento...',
+  'sub.paid': 'Pagamento efetuado. A app está disponível novamente.',
 };
 
 const nl: Dict = {
@@ -541,6 +589,14 @@ const nl: Dict = {
   'sub.statusUnpaid': 'Abonnement onbetaald',
   'sub.statusTrialing': 'Abonnement in proefperiode',
   'sub.errorTitle': 'Abonnementsmelding',
+  'sub.pastDueTitle': 'Betaling openstaand: de abonnement kon niet worden afgeschreven.',
+  'sub.pastDueBody': 'De app wordt over {days} dagen geblokkeerd. Werk je kaart bij om hem te blijven gebruiken.',
+  'sub.pastDueLocked': 'De app is geblokkeerd wegens niet-betaling. Betaal het abonnement om hem weer te gebruiken.',
+  'sub.pastDueOverdue': 'De afgesproken dagen zijn verstreken. Betaal zo snel mogelijk om de dienst niet te verliezen.',
+  'sub.payNow': 'Nu betalen',
+  'sub.updateCard': 'Kaart bijwerken',
+  'sub.checkingPayment': 'Betaling controleren...',
+  'sub.paid': 'Betaling uitgevoerd. De app is weer beschikbaar.',
 };
 
 const pl: Dict = {
@@ -609,6 +665,14 @@ const pl: Dict = {
   'sub.statusUnpaid': 'Subskrypcja nieopłacona',
   'sub.statusTrialing': 'Subskrypcja w okresie próbnym',
   'sub.errorTitle': 'Uwaga dotycząca subskrypcji',
+  'sub.pastDueTitle': 'Płatność w toku: nie udało się pobrać należności za subskrypcję.',
+  'sub.pastDueBody': 'Aplikacja zostanie zablokowana za {days} dni. Zaktualizuj kartę, aby móc z niej dalej korzystać.',
+  'sub.pastDueLocked': 'Aplikacja została zablokowana z powodu braku płatności. Opłać subskrypcję, aby móc z niej korzystać.',
+  'sub.pastDueOverdue': 'Minęły uzgodnione dni. Prosimy o szybką płatność, aby nie utracić usługi.',
+  'sub.payNow': 'Opłać teraz',
+  'sub.updateCard': 'Zaktualizuj kartę',
+  'sub.checkingPayment': 'Sprawdzanie płatności...',
+  'sub.paid': 'Płatność zrealizowana. Aplikacja jest znowu dostępna.',
 };
 
 const ALL: Record<AppLocale, Dict> = { es, en, fr, de, it, pt, nl, pl };

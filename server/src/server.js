@@ -25,6 +25,11 @@ const stripeCurrency = 'eur';
 // Si prefieres limitarlo a mano, define STRIPE_PAYMENT_METHOD_TYPES con tu lista, p. ej.
 // 'card,bizum': en ese caso los métodos no activados se retiran solos con reintentos acotados.
 // Referencia: https://docs.stripe.com/payments/payment-methods/dynamic-payment-methods
+// Dias de margen desde que la suscripcion entra en impago antes de bloquear la app. Durante ese
+// plazo el usuario ve un aviso rojo; al cumplirse, la app queda bloqueada hasta que pague.
+const SUBSCRIPTION_LOCK_DAYS = 3;
+const SUBSCRIPTION_PAST_DUE_STATES = new Set(['past_due', 'unpaid']);
+
 const EUR_LOCAL_PAYMENT_METHODS = ['bizum', 'mb_way', 'bancontact', 'eps', 'ideal', 'wero'];
 const stripePaymentMethodTypesSetting = String(process.env.STRIPE_PAYMENT_METHOD_TYPES || 'auto').trim().toLowerCase();
 const stripeDynamicPaymentMethods = stripePaymentMethodTypesSetting === '' || stripePaymentMethodTypesSetting === 'auto';
@@ -251,6 +256,13 @@ const isPrincipal = (user) => user.app_metadata?.role !== 'empleado';
 
 // Plazas de empleado (usuarios adicionales) contratadas. La fuente de verdad es el item de la
 // suscripcion con el precio STRIPE_ADDITIONAL_USER_PRICE_ID, no la copia en la metadata.
+// Devuelve el objeto latest_invoice si viene expandido, o null si Stripe devuelve solo el id.
+const latestInvoiceObject = (subscription) => (
+  subscription?.latest_invoice && typeof subscription.latest_invoice === 'object'
+    ? subscription.latest_invoice
+    : null
+);
+
 const readSubscriptionSeats = (subscription) => {
   const item = (subscription?.items?.data || []).find((entry) => entry?.price?.id === STRIPE_ADDITIONAL_USER_PRICE_ID);
   return item ? Math.max(0, Math.floor(Number(item.quantity) || 0)) : 0;
@@ -492,28 +504,40 @@ app.get('/api/billing/status', requireAuth, async (req, res) => {
   let additionalUsers = Math.max(0, Math.floor(Number(accountOwner.user_metadata?.stripe_subscription_additional_users) || 0));
   let subscriptionId = accountOwner.user_metadata?.stripe_subscription_id || null;
   const checkoutSessionId = accountOwner.user_metadata?.stripe_checkout_session_id || null;
+  // Momento en que la suscripcion entro en impago. Se guarda en la metadata del usuario la PRIMERA
+  // vez que se detecta, para que el plazo de cortesia se cuente igual aunque la app se cierre, se le
+  // borren los datos o se cambie de movil. Se limpia en cuanto la suscripcion vuelve a estar al dia.
+  let pastDueSince = accountOwner.user_metadata?.stripe_past_due_since || null;
+  // Enlace a la factura vencida, para poder pagarla desde el aviso de la propia app.
+  let pastDueInvoiceUrl = accountOwner.user_metadata?.stripe_past_due_invoice_url || null;
 
   try {
     if (stripe && subscriptionId) {
-      const subscription = await stripe.subscriptions.retrieve(subscriptionId, { expand: ['items.data.price'] });
+      const subscription = await stripe.subscriptions.retrieve(subscriptionId, { expand: ['items.data.price', 'latest_invoice'] });
       status = subscription.status || status;
       additionalUsers = readSubscriptionSeats(subscription);
+      const currentInvoice = latestInvoiceObject(subscription);
+      if (currentInvoice?.hosted_invoice_url) pastDueInvoiceUrl = currentInvoice.hosted_invoice_url;
       await updateUserMetadata(accountOwner.id, {
         stripe_subscription_status: status,
+        stripe_past_due_invoice_url: pastDueInvoiceUrl,
         stripe_subscription_updated_at: new Date().toISOString(),
       });
     } else if (stripe && checkoutSessionId) {
       const session = await stripe.checkout.sessions.retrieve(checkoutSessionId);
       if (session.subscription) {
         subscriptionId = typeof session.subscription === 'string' ? session.subscription : session.subscription.id;
-        const subscription = await stripe.subscriptions.retrieve(subscriptionId, { expand: ['items.data.price'] });
+        const subscription = await stripe.subscriptions.retrieve(subscriptionId, { expand: ['items.data.price', 'latest_invoice'] });
         status = subscription.status || status;
         additionalUsers = readSubscriptionSeats(subscription);
+        const currentInvoice = latestInvoiceObject(subscription);
+        if (currentInvoice?.hosted_invoice_url) pastDueInvoiceUrl = currentInvoice.hosted_invoice_url;
         await updateUserMetadata(accountOwner.id, {
           subscription_provider: 'stripe',
           stripe_customer_id: session.customer || null,
           stripe_subscription_id: subscriptionId,
           stripe_subscription_status: status,
+          stripe_past_due_invoice_url: pastDueInvoiceUrl,
           stripe_subscription_updated_at: new Date().toISOString(),
         });
       } else {
@@ -525,6 +549,23 @@ app.get('/api/billing/status', requireAuth, async (req, res) => {
   }
 
   const activeStatuses = new Set(['active', 'trialing']);
+
+  // Estado de impago y dias de margen que quedan antes de bloquear la app. Al entrar en impago se
+  // guarda la fecha de forma permanente; al ponerse al dia se limpia, de modo que un impago futuro
+  // vuelva a contar los 3 dias completos desde el principio.
+  const isPastDue = SUBSCRIPTION_PAST_DUE_STATES.has(status);
+  if (isPastDue && !pastDueSince) {
+    pastDueSince = new Date().toISOString();
+    await updateUserMetadata(accountOwner.id, { stripe_past_due_since: pastDueSince });
+  } else if (!isPastDue && pastDueSince) {
+    pastDueSince = null;
+    await updateUserMetadata(accountOwner.id, { stripe_past_due_since: null });
+  }
+  const daysPastDue = isPastDue && pastDueSince
+    ? Math.max(0, Math.floor((Date.now() - new Date(pastDueSince).getTime()) / 86400000))
+    : 0;
+  const daysUntilLock = isPastDue ? Math.max(0, SUBSCRIPTION_LOCK_DAYS - daysPastDue) : null;
+
   return res.json({
     ok: true,
     provider: 'stripe',
@@ -533,7 +574,85 @@ app.get('/api/billing/status', requireAuth, async (req, res) => {
     subscriptionId,
     additionalUsers,
     totalMonthlyCents: monthlyAmountCentsForSeats(additionalUsers),
+    pastDue: isPastDue,
+    pastDueSince,
+    daysPastDue,
+    daysUntilLock,
+    locked: isPastDue && daysPastDue >= SUBSCRIPTION_LOCK_DAYS,
+    lockAfterDays: SUBSCRIPTION_LOCK_DAYS,
+    pastDueInvoiceUrl,
   });
+});
+
+// Cobra la factura VENCIDA de la suscripcion con la tarjeta que el usuario acaba de guardar.
+// Se usa cuando la app lleva el aviso de impago: sin esto, el usuario tendria que entrar al panel de
+// Stripe a mano. La factura se recupera del propio campo latest_invoice de la suscripcion, nunca de
+// un dato del cliente.
+app.post('/api/billing/resolve-invoice', requireAuth, async (req, res) => {
+  if (!isPrincipal(req.user)) {
+    return res.status(403).json({ ok: false, error: 'Solo el usuario principal puede gestionar la suscripción.' });
+  }
+
+  try {
+    const stripeClient = requireStripe();
+    const resolved = await resolveUserSubscription(stripeClient, req.user.id);
+    const subscription = resolved.subscription;
+    if (!subscription) {
+      return res.status(409).json({ ok: false, error: 'Todavía no hay una suscripción activa.' });
+    }
+
+    const updated = await stripeClient.subscriptions.retrieve(resolved.subscriptionId, {
+      expand: ['latest_invoice', 'latest_invoice.payment_intent', 'default_payment_method'],
+    });
+    const invoice = updated.latest_invoice && typeof updated.latest_invoice === 'object'
+      ? updated.latest_invoice
+      : null;
+
+    if (!invoice || invoice.status === 'paid' || invoice.status === 'void') {
+      await updateUserMetadata(req.user.id, { stripe_subscription_status: updated.status || 'active' });
+      return res.json({ ok: true, alreadyPaid: true, status: updated.status || 'active' });
+    }
+
+    // Sin tarjeta guardada no hay nada con que cobrar: se pide una antes de reintentar.
+    const defaultMethod = updated.default_payment_method && typeof updated.default_payment_method === 'object'
+      ? updated.default_payment_method
+      : null;
+    if (!defaultMethod) {
+      return res.status(402).json({
+        ok: false,
+        needsPaymentMethod: true,
+        error: 'No hay ninguna tarjeta guardada en Stripe. Guarda una tarjeta para poder pagar la factura pendiente.',
+      });
+    }
+
+    const paid = await stripeClient.invoices.pay(invoice.id, {
+      payment_method: defaultMethod.id,
+    });
+    const subscriptionAfter = await stripeClient.subscriptions.retrieve(resolved.subscriptionId);
+
+    await updateUserMetadata(req.user.id, {
+      stripe_subscription_status: subscriptionAfter.status || 'active',
+      stripe_past_due_since: null,
+      stripe_subscription_updated_at: new Date().toISOString(),
+    });
+
+    return res.json({
+      ok: true,
+      alreadyPaid: false,
+      status: subscriptionAfter.status || 'active',
+      amountPaidCents: Number(paid.amount_paid) || Number(paid.total) || 0,
+    });
+  } catch (error) {
+    const needsPaymentMethod = errorNeedsPaymentMethod(error);
+    console.error('Error cobrando la factura pendiente:', error.message);
+    return res.status(needsPaymentMethod ? 402 : 502).json({
+      ok: false,
+      needsPaymentMethod,
+      error: needsPaymentMethod
+        ? 'No hay ninguna tarjeta guardada en Stripe. Guarda una tarjeta para poder pagar la factura pendiente.'
+        : `Stripe no pudo cobrar la factura pendiente: ${error.message}`,
+    });
+  }
 });
 
 app.post('/api/auth/register', async (req, res) => {
@@ -1155,6 +1274,12 @@ app.post('/api/billing/checkout', requireAuth, async (req, res) => {
       mode: 'subscription',
       customer_email: req.user.email,
       line_items: lineItems,
+      // La suscripcion se contrata SOLO con tarjeta bancaria. Bizum, iDEAL, MB WAY... son metodos de
+      // redireccion de un solo uso que NO admiten suscripciones: el primer cobro entraria bien, pero la
+      // renovacion del mes siguiente fallaria al no quedar nada guardado con que cobrar. Stripe guarda
+      // la tarjeta automaticamente, de modo que las renovaciones y las plazas de empleado se cobran de
+      // esa misma tarjeta sin que el usuario tenga que hacer nada.
+      payment_method_types: ['card'],
       metadata: {
         supabase_user_id: req.user.id,
         additional_users: String(additionalUsers),
@@ -1352,7 +1477,12 @@ app.post('/api/billing/payment-method-setup', requireAuth, async (req, res) => {
       metadata: { supabase_user_id: req.user.id },
     });
 
-    await updateUserMetadata(req.user.id, { stripe_payment_method_setup_at: new Date().toISOString() });
+    await updateUserMetadata(req.user.id, {
+      stripe_payment_method_setup_at: new Date().toISOString(),
+      // Se guarda el identificador de la sesion para poder reutilizar despues la tarjeta que el
+      // usuario guarde y cobrar con ella la factura vencida (POST /api/billing/resolve-invoice).
+      stripe_payment_method_setup_session: session.id,
+    });
 
     return res.status(201).json({ ok: true, url: session.url, checkoutUrl: session.url });
   } catch (error) {

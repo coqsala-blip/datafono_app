@@ -128,6 +128,23 @@ interface Transaction {
   publicUrl?: string;
 }
 
+// Estado de la suscripción que devuelve GET /api/billing/status, incluidos los datos de impago
+// (plazo de cortesía y bloqueo) que calcula el backend.
+type SubscriptionStatusResult = {
+  active?: boolean;
+  status?: string;
+  additionalUsers?: number;
+  totalMonthlyCents?: number;
+  pastDue?: boolean;
+  pastDueSince?: string | null;
+  daysPastDue?: number;
+  daysUntilLock?: number | null;
+  locked?: boolean;
+  lockAfterDays?: number;
+  pastDueInvoiceUrl?: string | null;
+  error?: string;
+};
+
 interface CashInvoiceDraft extends Transaction {
   documentType: 'FACTURA';
 }
@@ -233,7 +250,15 @@ export default function TpvScreen() {
   // Plazas de empleado (usuarios adicionales) de la suscripción: se ajustan contra Stripe.
   const [seatsSyncLoading, setSeatsSyncLoading] = useState(false);
   const [seatsSyncMessage, setSeatsSyncMessage] = useState('');
-  // Último número de plazas confirmado por Stripe (evita llamadas y cobros innecesarios).
+
+  // Impago: 'pastDue' muestra el aviso rojo, 'locked' bloquea la app por completo. El plazo de 3 dias
+  // lo cuenta el backend (GET /api/billing/status) y se guarda alli, no en el movil.
+  const [subscriptionPastDue, setSubscriptionPastDue] = useState(false);
+  const [subscriptionLocked, setSubscriptionLocked] = useState(false);
+  const [subscriptionDaysUntilLock, setSubscriptionDaysUntilLock] = useState<number | null>(null);
+  const [subscriptionPastDueInvoiceUrl, setSubscriptionPastDueInvoiceUrl] = useState<string | null>(null);
+  const [pastDuePaying, setPastDuePaying] = useState(false);
+  const [pastDueMessage, setPastDueMessage] = useState('');  // Último número de plazas confirmado por Stripe (evita llamadas y cobros innecesarios).
   const seatsSyncedRef = useRef(0);
   const seatsSyncInFlightRef = useRef(false);
   // Evita ofrecer guardar la tarjeta en bucle: solo se propone una vez por este fallo.
@@ -349,6 +374,8 @@ export default function TpvScreen() {
   // efectos sin depender de cierres obsoletas y sin volver a lanzar los efectos en cada
   // render (lo que provocaria bucles y peticiones de red innecesarias).
   const refreshUserSessionRef = useRef<() => Promise<string | null>>(() => Promise.resolve(null));
+// Permite reler GET /api/billing/status (estado de pago y bloqueo) sin repetir el efecto completo.
+const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.resolve());
   const registerTransactionDocumentRef = useRef<(transaction: Transaction) => Promise<Transaction>>(
     () => Promise.reject(new Error('No hay una URL de backend configurada en la aplicación.')),
   );
@@ -554,17 +581,17 @@ export default function TpvScreen() {
         // El plan se contrato con Bizum, iDEAL o MB WAY: Stripe no guarda ese metodo, asi que no hay
         // con que cobrar el prorrateo. Se ofrece guardar una tarjeta y, al volver, se reintenta solo.
         if (result.needsPaymentMethod && !paymentMethodPromptedRef.current) {
-        paymentMethodPromptedRef.current = true;
-        setSeatsSyncMessage('Guarda una tarjeta para poder contratar empleados. Al terminar se reintenta solo.');
-        Alert.alert(
-          'Falta un metodo de pago en Stripe',
-          'Tu plan se contrato con un metodo de un solo uso (Bizum, iDEAL, MB WAY...) que Stripe no guarda, asi que no puede cobrar las plazas de empleado.\n\n\u00bfGuardamos una tarjeta ahora? Al hacerlo se reintentara el cambio automaticamente.',
-          [
-            { text: 'Ahora no', style: 'cancel' },
-            { text: 'Guardar tarjeta', onPress: () => { void addSubscriptionPaymentMethod(seats); } },
-          ],
-        );
-        return;
+          paymentMethodPromptedRef.current = true;
+          setSeatsSyncMessage('Guarda una tarjeta para poder contratar empleados. Al terminar se reintenta solo.');
+          Alert.alert(
+            'Falta un metodo de pago en Stripe',
+            'Tu plan se contrato con un metodo de un solo uso (Bizum, iDEAL, MB WAY...) que Stripe no guarda, asi que no puede cobrar las plazas de empleado.\n\n\u00bfGuardamos una tarjeta ahora? Al hacerlo se reintentara el cambio automaticamente.',
+            [
+              { text: 'Ahora no', style: 'cancel' },
+              { text: 'Guardar tarjeta', onPress: () => { void addSubscriptionPaymentMethod(seats); } },
+            ],
+          );
+          return;
         }
         setSeatsSyncMessage(message);
         Alert.alert('Plazas de empleado', message);
@@ -605,18 +632,69 @@ export default function TpvScreen() {
     if (seatsSyncTimerRef.current) clearTimeout(seatsSyncTimerRef.current);
   }, []);
 
+  // --- IMPAGO ---
+  // Se llama desde el aviso rojo y desde la pantalla de bloqueo. Primero intenta cobrar la factura
+  // vencida con la tarjeta ya guardada en Stripe; si no hay ninguna, abre Stripe para guardarla y
+  // reintenta al volver. En ambos casos se vuelve a leer el estado real de la suscripción.
+  const payPastDueInvoice = async () => {
+    if (!accessToken || !configuredDocumentApiUrl || pastDuePaying) return;
+    setPastDuePaying(true);
+    setPastDueMessage('');
+
+    try {
+      const headers = { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' };
+      const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/billing/resolve-invoice`, {
+        method: 'POST',
+        headers,
+      }, 30000);
+      const result = await response.json().catch(() => ({})) as {
+        ok?: boolean;
+        needsPaymentMethod?: boolean;
+        alreadyPaid?: boolean;
+        error?: string;
+      };
+
+      if (result.needsPaymentMethod) {
+        // No hay tarjeta: se ofrece guardarla. Al volver se reintenta el cobro solo.
+        Alert.alert(tr('sub.pastDueTitle'), tr('sub.updateCard'), [
+          { text: 'Ahora no', style: 'cancel' },
+          {
+            text: tr('sub.updateCard'),
+            onPress: () => { void addSubscriptionPaymentMethod(null); },
+          },
+        ]);
+        return;
+      }
+
+      if (!response.ok || !result.ok) {
+        setPastDueMessage(result.error || tr('sub.pastDueTitle'));
+        return;
+      }
+
+      setPastDueMessage(tr('sub.paid'));
+      setSubscriptionPastDue(false);
+      setSubscriptionLocked(false);
+    } catch (error) {
+      setPastDueMessage(error instanceof Error ? error.message : tr('sub.pastDueTitle'));
+    } finally {
+      setPastDuePaying(false);
+      // El estado de Stripe es la fuente de verdad: se vuelve a leer en cualquier caso.
+      await refreshSubscriptionStatusRef.current();
+    }
+  };
+
   useEffect(() => {
     // Se espera a tener cargados los datos guardados para que las plazas de Stripe no las
     // sobrescriba el número que hubiera en el móvil.
     if (!isLoaded || !accessToken || !configuredDocumentApiUrl) return;
 
-    (async () => {
+    const runStatusCheck = async () => {
       setSubscriptionLoading(true);
       try {
         const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/billing/status`, {
           headers: { Authorization: `Bearer ${accessToken}` },
         }, 10000);
-        const result = await response.json() as { active?: boolean; status?: string; additionalUsers?: number; error?: string };
+        const result = await response.json() as SubscriptionStatusResult;
         if (response.status === 401) {
           // El token caducó mientras la app estaba abierta: se renueva para no cortar la sesión.
           const renewed = await refreshUserSessionRef.current();
@@ -625,6 +703,12 @@ export default function TpvScreen() {
         }
         setHasActiveSubscription(Boolean(result.active));
         setSubscriptionStatus(result.status || 'missing');
+        // Impago: con aviso rojo los primeros 3 días y bloqueo total al cumplirlos.
+        setSubscriptionPastDue(Boolean(result.pastDue));
+        setSubscriptionLocked(Boolean(result.locked));
+        setSubscriptionDaysUntilLock(typeof result.daysUntilLock === 'number' ? result.daysUntilLock : null);
+        setSubscriptionPastDueInvoiceUrl(result.pastDueInvoiceUrl || null);
+        if (!result.pastDue) setPastDueMessage('');
         // Las plazas de empleado contratadas se leen de Stripe: siguen ahí tras borrar los datos.
         applySubscriptionSeats(result.additionalUsers);
         setSubscriptionError(response.ok ? '' : (result.error || 'No se pudo consultar la suscripción.'));
@@ -633,7 +717,12 @@ export default function TpvScreen() {
       } finally {
         setSubscriptionLoading(false);
       }
-    })();
+    };
+
+    // Se guarda en el ref para poder releer el estado desde el aviso de impago y desde la
+    // pantalla de bloqueo, sin depender del momento en que se monte el efecto.
+    refreshSubscriptionStatusRef.current = runStatusCheck;
+    void runStatusCheck();
   }, [accessToken, isLoaded]);
 
   useEffect(() => {
@@ -3538,6 +3627,93 @@ export default function TpvScreen() {
     );
   }
 
+  // Botones del aviso de impago: cobrar la factura vencida con la tarjeta guardada y, si no hay
+  // ninguna, abrir Stripe para guardarla. Al volver, el estado se relee solo.
+  const renderPastDueActions = () => (
+    <View style={{ flexDirection: 'row', marginTop: 8 }}>
+      <Pressable
+        style={[styles.primaryButton, { flex: 1, opacity: pastDuePaying ? 0.6 : 1 }]}
+        onPress={() => { void payPastDueInvoice(); }}
+        accessibilityRole="button"
+        accessibilityLabel={tr('sub.payNow')}
+      >
+        <Text style={styles.primaryButtonText}>
+          {pastDuePaying ? tr('sub.checkingPayment') : tr('sub.payNow')}
+        </Text>
+      </Pressable>
+      {subscriptionPastDueInvoiceUrl ? (
+        <Pressable
+          style={[styles.secondaryButton, { flex: 1, marginLeft: 8 }]}
+          onPress={() => { void WebBrowser.openBrowserAsync(subscriptionPastDueInvoiceUrl); }}
+          accessibilityRole="button"
+          accessibilityLabel={tr('sub.updateCard')}
+        >
+          <Text style={styles.secondaryButtonText}>{tr('sub.updateCard')}</Text>
+        </Pressable>
+      ) : null}
+    </View>
+  );
+
+  // Aviso de impago. Se pinta en DOS sitios a proposito: encima de las pestanas y debajo de
+  // ellas. Asi el recuadro rojo queda siempre a la vista, se este en la pestana que se este.
+  const renderPastDueBanner = () => {
+    if (!subscriptionPastDue || subscriptionLocked) return null;
+    const days = subscriptionDaysUntilLock ?? 0;
+    return (
+      <View
+        style={{
+          backgroundColor: '#fee2e2',
+          borderColor: '#b91c1c',
+          borderWidth: 2,
+          borderRadius: 8,
+          marginHorizontal: 10,
+          marginTop: 8,
+          padding: 12,
+        }}
+      >
+        <Text style={{ color: '#b91c1c', fontWeight: 'bold', fontSize: 13 }}>
+          ⚠️ {tr('sub.pastDueTitle')}
+        </Text>
+        <Text style={{ color: '#7f1d1d', fontSize: 12, marginTop: 4 }}>
+          {days > 0 ? tr('sub.pastDueBody').replace('{days}', String(days)) : tr('sub.pastDueOverdue')}
+        </Text>
+        {pastDueMessage ? (
+          <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 4 }}>{pastDueMessage}</Text>
+        ) : null}
+        {renderPastDueActions()}
+      </View>
+    );
+  };
+
+  // Bloqueo total por impago. Solo el usuario principal ve esta pantalla, porque es quien tiene
+  // la suscripcion: los empleados no pueden quedarse sin poder trabajar por un cobro. Al pagar
+  // se relee el estado de Stripe, de modo que la app se reabre sola.
+  if (subscriptionLocked && userRole === 'principal') {
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <ScrollView contentContainerStyle={{ flexGrow: 1, justifyContent: 'center', padding: 24 }}>
+          <View style={[styles.card, { padding: 20, borderWidth: 2, borderColor: '#b91c1c' }]}>
+            <Text style={[styles.modalTitle, { color: '#b91c1c' }]}>
+              {tr('sub.pastDueTitle')}
+            </Text>
+            <Text style={[styles.modalSubtitle, { marginTop: 8 }]}>
+              {tr('sub.pastDueLocked')}
+            </Text>
+            {pastDueMessage ? (
+              <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 10 }}>{pastDueMessage}</Text>
+            ) : null}
+            {renderPastDueActions()}
+            <Pressable style={{ marginTop: 16 }} onPress={confirmSignOut} accessibilityRole="button">
+              <Text style={{ color: '#475569', fontSize: 12, textAlign: 'center' }}>
+                {tr('auth.signOut')}
+              </Text>
+            </Pressable>
+          </View>
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
   return (
     <SafeAreaView style={styles.safeArea}>
       <View style={styles.header}>
@@ -3591,6 +3767,9 @@ export default function TpvScreen() {
         </View>
       </View>
 
+      {/* AVISO DE IMPAGO (encima de las pestañas) */}
+      {renderPastDueBanner()}
+
       {/* PESTAÑAS DE NAVEGACIÓN */}
       <ScrollView
         horizontal
@@ -3620,6 +3799,9 @@ export default function TpvScreen() {
           </>
         )}
       </ScrollView>
+
+      {/* AVISO DE IMPAGO (debajo de las pestañas) */}
+      {renderPastDueBanner()}
 
       <View style={styles.content}>
         {/* PESTAÑA: GASTOS Y FACTURACIÓN */}

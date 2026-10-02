@@ -35,6 +35,7 @@ npm run dev
 - `POST /api/billing/seats` (ajusta las plazas de empleado y cobra el prorrateo al momento)
 - `GET /api/billing/status` (estado de la suscripción y plazas de empleado contratadas)
 - `POST /api/billing/payment-method-setup` (sesión de Stripe para guardar una tarjeta)
+- `POST /api/billing/resolve-invoice` (cobra la factura vencida de la suscripción con la tarjeta guardada)
 - `POST /api/stripe/webhook`
 - `POST /api/auth/refresh` (renueva la sesión del móvil con el refresh token y evita que los documentos se publiquen sin dueño)
 - `POST /api/documents` (publica el ticket/factura y lo asocia a la cuenta autenticada)
@@ -139,6 +140,16 @@ llama a Stripe, para no generar facturas de 0 €.
 `POST /api/billing/checkout` sigue usándose para la **primera** contratación: si ya hay una
 suscripción activa responde 409, de modo que no se crea una segunda suscripción.
 
+#### La suscripción se contrata solo con tarjeta
+
+El Checkout de `POST /api/billing/checkout` se crea con `payment_method_types: ['card']`. Bizum,
+iDEAL, MB WAY, Bancontact, EPS y Wero son métodos de redirección de un solo uso que **no admiten
+suscripciones**: el primer cobro entraría bien, pero la renovación del mes siguiente fallaría porque
+no queda nada guardado con que cobrar. Stripe guarda la tarjeta automáticamente, así que las
+renovaciones mensuales y las plazas de empleado se cobran de esa misma tarjeta sin que el usuario
+tenga que hacer nada. (Los cobros puntuales del TPV entre tu negocio y su cliente siguen siendo
+independientes y sí admiten Bizum: ver la sección siguiente.)
+
 #### Si el plan se contrató con Bizum, iDEAL o MB WAY
 
 Stripe **no guarda** los métodos de redirección, así que esa suscripción se queda sin tarjeta y el
@@ -154,6 +165,35 @@ Como la tarjeta queda guardada, las renovaciones y los próximos cambios de empl
 sin intervención. Si el cliente prefiero pagar con Bizum, en Stripe
 (*Billing → Payment methods*) puede quitar la tarjeta y volver a usar el método de un solo uso,
 pero entonces no podrá añadir empleados desde la app.
+
+#### Aviso de impago y bloqueo a los 3 días
+
+Cuando la renovación falla, Stripe deja la suscripción en `past_due` (o `unpaid`). `GET
+/api/billing/status` lo traduce a datos que la app usa directamente:
+
+| Campo | Significado |
+|---|---|
+| `pastDue` | La suscripción está en impago |
+| `pastDueSince` | Fecha en la que se detectó por primera vez |
+| `daysPastDue` | Días transcurridos desde entonces |
+| `daysUntilLock` | Días que quedan antes del bloqueo (`null` si está al día) |
+| `locked` | `true` al cumplirse los 3 días |
+| `lockAfterDays` | Días de margen configurados (`SUBSCRIPTION_LOCK_DAYS`, por defecto 3) |
+| `pastDueInvoiceUrl` | Enlace a la factura vencida, por si se quiere abrir en Stripe |
+
+`pastDueSince` se guarda en la **metadata del usuario** la primera vez que se detecta y se limpia en
+cuanto la suscripción vuelve a estar al día. Esto es importante: el plazo se cuenta igual aunque el
+usuario cierre la app, borre sus datos o cambie de móvil, y un impago futuro vuelve a contar los 3
+días completos.
+
+Con esos datos la app hace dos cosas:
+
+1. **Aviso rojo** sobre y bajo las pestañas, con los días que quedan y los botones *Pagar ahora*
+   (cobro directo) y *Actualizar tarjeta* (abre la factura en Stripe).
+2. **Bloqueo total a los 3 días**, solo para el usuario principal: los empleados no se quedan sin
+   poder trabajar por un cobro. El botón *Pagar ahora* llama a `POST /api/billing/resolve-invoice`,
+   que cobra la factura vencida con la tarjeta guardada (o responde `402 needsPaymentMethod` si no
+   hay ninguna). Tras el cobro se relee el estado de Stripe, así que la app se reabre sola.
 
 ### Cobrar con Bizum (cobros puntuales)
 
