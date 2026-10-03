@@ -250,6 +250,9 @@ export default function TpvScreen() {
   // Plazas de empleado (usuarios adicionales) de la suscripción: se ajustan contra Stripe.
   const [seatsSyncLoading, setSeatsSyncLoading] = useState(false);
   const [seatsSyncMessage, setSeatsSyncMessage] = useState('');
+  // Cuando el backend avisa de que no hay tarjeta guardada se muestra un boton explicito para abrir
+  // Stripe. Se muestra siempre en la tarjeta, pero solo se resalta cuando hace falta de verdad.
+  const [seatsCardMissing, setSeatsCardMissing] = useState(false);
 
   // Impago: 'pastDue' muestra el aviso rojo, 'locked' bloquea la app por completo. El plazo de 3 dias
   // lo cuenta el backend (GET /api/billing/status) y se guarda alli, no en el movil.
@@ -586,7 +589,12 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         const errorText = String(result.error || '');
         const faltaTarjeta = Boolean(result.needsPaymentMethod)
           || /tarjeta|metodo de pago|method of payment|payment method|card/i.test(errorText);
-        if (faltaTarjeta) return 'needsPaymentMethod';
+        // Se marca para que aparezca el boton de "Añadir tarjeta" en la tarjeta de empleados.
+        setSeatsCardMissing(faltaTarjeta);
+        if (faltaTarjeta) {
+          setSeatsSyncMessage('No hay ninguna tarjeta guardada en Stripe. Añade una para poder cobrar las plazas de empleado.');
+          return 'needsPaymentMethod';
+        }
         if (result.needsCheckout) {
           setSeatsSyncMessage('Todavia no tienes suscripcion activa: contratala y las plazas se cobraran con el plan.');
           return 'needsCheckout';
@@ -605,6 +613,8 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       } else {
         setSeatsSyncMessage('Plazas de empleado actualizadas en Stripe.');
       }
+      // La tarjeta quedo guardada: el aviso y su boton ya no hacen falta.
+      setSeatsCardMissing(false);
       return 'ok';
     } catch (error) {
       setSeatsSyncMessage(error instanceof Error ? error.message : 'No se pudieron actualizar las plazas de empleado.');
@@ -4238,6 +4248,17 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                 ) : null}
                 {seatsSyncMessage ? (
                 <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 6, color: '#0f172a' }]}>{seatsSyncMessage}</Text>
+                ) : null}
+                {seatsCardMissing ? (
+                  <Pressable
+                    style={[styles.secondaryButton, { marginTop: 6 }]}
+                    onPress={() => void addSubscriptionPaymentMethod()}
+                    disabled={seatsSyncLoading}
+                  >
+                    <Text style={styles.secondaryButtonText}>
+                      {seatsSyncLoading ? 'Abriendo Stripe...' : 'ANADIR TARJETA'}
+                    </Text>
+                  </Pressable>
                 ) : null}
                 </View>
             <View style={styles.card}>
