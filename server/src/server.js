@@ -1551,7 +1551,14 @@ app.get('/billing/cancelled', (req, res) => {
 });
 
 app.get('/billing/payment-method', (req, res) => {
-  res.type('html').send('<h1>Tarjeta guardada</h1><p>Vuelve a la aplicación y vuelve a introducir el número de empleados: ahora Stripe ya podrá cobrar el cambio.</p>');
+  const deepLink = 'tpvapp://pago-completado?flow=payment-method-setup';
+  res.type('html').send(`<!doctype html>
+<html lang="es">
+  <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Tarjeta guardada</title>
+  <script>window.location.replace(${JSON.stringify(deepLink)});</script>
+  </head>
+  <body><h1>Tarjeta guardada</h1><p>Volviendo a la aplicación para completar el cobro.</p><a href="${deepLink}">Volver a la aplicación</a></body>
+</html>`);
 });
 
 app.get('/billing/payment-method-cancelled', (req, res) => {

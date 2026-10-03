@@ -4,7 +4,6 @@ import { Camera, CameraView } from 'expo-camera';
 import * as FileSystemLegacy from 'expo-file-system/legacy';
 import * as ImagePicker from 'expo-image-picker';
 import * as MailComposer from 'expo-mail-composer';
-import { APP_LOCALES, APP_LOCALE_STORAGE_KEY, detectDeviceLocale, isAppLocale, t as translateKey, type AppLocale } from '../i18n';
 import * as Print from 'expo-print';
 import * as SecureStore from 'expo-secure-store';
 import * as Sharing from 'expo-sharing';
@@ -24,6 +23,7 @@ import {
   View
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { APP_LOCALES, APP_LOCALE_STORAGE_KEY, detectDeviceLocale, isAppLocale, t as translateKey, type AppLocale } from '../i18n';
 
 type DocumentType = 'TICKET DE VENTA' | 'FACTURA SIMPLIFICADA' | 'FACTURA COMPLETA' | 'TICKET DE DEVOLUCIÓN' | 'COMPRA/DEVOLUCIONES' | 'PRESUPUESTO' | 'FACTURA';
 type TransactionType = 'COBRO' | 'DEVOLUCIÓN';
@@ -532,7 +532,11 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         throw new Error(result.error || 'No se pudo abrir la pagina de tarjeta de Stripe.');
       }
 
-      await WebBrowser.openBrowserAsync(setupUrl);
+      const browserResult = await WebBrowser.openAuthSessionAsync(setupUrl, ONLINE_PAYMENT_REDIRECT_URL);
+      if (browserResult.type !== 'success') {
+        setSeatsSyncMessage('No se confirmó el regreso desde Stripe. Vuelve a la app e inténtalo otra vez.');
+        return false;
+      }
       return true;
     } catch (error) {
       const message = error instanceof Error ? error.message : 'No se pudo guardar la tarjeta.';
@@ -655,6 +659,10 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
           return;
         }
         outcome = await syncAdditionalUsersWithStripe(seats);
+        if (outcome === 'needsPaymentMethod') {
+          Alert.alert('No se pudo cobrar', 'Stripe todavía no confirma una tarjeta guardada. No se ha añadido el usuario.');
+          return;
+        }
       }
 
       if (outcome === 'needsCheckout') {
@@ -4239,7 +4247,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                         {employeeSaveLoading
                         ? 'Guardando...'
                         : Number(issuer.additionalUsers || 0) > 0
-                        ? `Cobrar ${formatCurrency(subscriptionAdditionalUserCents * Number(issuer.additionalUsers || 0))} y generar el código`
+                        ? `Cobrar ${formatCurrency((subscriptionAdditionalUserCents * Number(issuer.additionalUsers || 0)) / 100)} y generar el código`
                         : 'Generar el código del usuario'}
                       </Text>
                     </Pressable>
