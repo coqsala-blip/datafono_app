@@ -253,6 +253,9 @@ export default function TpvScreen() {
   // Cuando el backend avisa de que no hay tarjeta guardada se muestra un boton explicito para abrir
   // Stripe. Se muestra siempre en la tarjeta, pero solo se resalta cuando hace falta de verdad.
   const [seatsCardMissing, setSeatsCardMissing] = useState(false);
+// El bloque de usuarios adicionales va plegado por defecto: al entrar en Config solo se ve el
+// titulo y se despliega al pulsarlo, para que la pantalla no sea un muro de explicaciones.
+const [seatsPanelOpen, setSeatsPanelOpen] = useState(false);
 
   // Impago: 'pastDue' muestra el aviso rojo, 'locked' bloquea la app por completo. El plazo de 3 dias
   // lo cuenta el backend (GET /api/billing/status) y se guarda alli, no en el movil.
@@ -4165,13 +4168,12 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
           <ScrollView contentContainerStyle={styles.scrollContent}>
             <View style={styles.card}>
               <Text style={styles.cardTitle}>📦 PLAN TPV & GESTOR</Text>
-              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 6 }]}>La aplicación te ayuda a organizar la información de tu negocio y prepararla para revisión profesional. No sustituye a un asesor fiscal ni a una gestoría.</Text>
               <View style={styles.statRow}>
-                <Text style={styles.statLabel}>Usuario principal (base):</Text>
+                <Text style={styles.statLabel}>Usuario principal:</Text>
                 <Text style={[styles.statValue, { color: '#0f172a', fontWeight: 'bold' }]}>9,00 € + 21% IVA ({formatCurrency(10.89)})</Text>
               </View>
               <View style={styles.statRow}>
-                <Text style={styles.statLabel}>Usuario adicional (empleado):</Text>
+                <Text style={styles.statLabel}>Usuario adicional:</Text>
                 <Text style={[styles.statValue, { color: '#0f172a' }]}>2,50 € + 21% IVA ({formatCurrency(3.03)})</Text>
               </View>
               <View style={[styles.statRow, { borderTopWidth: 1, borderColor: '#cbd5e1', paddingTop: 8, marginTop: 4 }]}>
@@ -4181,10 +4183,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
             </View>
 
             <View style={styles.card}>
-              <Text style={styles.cardTitle}>💳 {tr('stripe.methodsTitle')}</Text>
-              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>
-                {tr('stripe.methodsSubtitle')}
-              </Text>
+              <Text style={styles.cardTitle}>💳 {tr('stripe.cardTitle')}</Text>
               <Pressable
                 style={[styles.secondaryButton, { marginTop: 8 }]}
                 onPress={openStripeAccountSettings}
@@ -4203,67 +4202,69 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
               ) : null}
             </View>
               <View style={styles.card}>
-                <Text style={styles.cardTitle}>👥 AÑADIR EMPLEADO</Text>
-                <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>
-                Escribe cuántas plazas de empleado quieres tener y un código distinto del PIN del jefe para él.
-                </Text>
-                <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>
-                Al guardar, las plazas se cobran con la tarjeta de la suscripción. Si no hay ninguna guardada,
-                </Text>
-                <Text style={[styles.modalSubtitle, { textAlign: 'left' }]}>
-                se abrirá Stripe para guardarla y el cobro se hará al volver. El empleado usará el código una sola vez.
-                </Text>
-                <TextInput
-                style={styles.input}
-                placeholder="Número de empleados adicionales"
-                placeholderTextColor="#94a3b8"
-                keyboardType="numeric"
-                value={String(issuer.additionalUsers || 0)}
-                onChangeText={(t) => setIssuer(i => ({ ...i, additionalUsers: Number(t.replace(/[^0-9]/g, '')) || 0 }))}
-                />
-                <TextInput
-                style={styles.input}
-                placeholder="Código para empleados (mínimo 8 caracteres)"
-                placeholderTextColor="#94a3b8"
-                autoCapitalize="characters"
-                secureTextEntry
-                value={employeeAccessCode}
-                onChangeText={setEmployeeAccessCode}
-                />
                 <Pressable
-                style={[styles.secondaryButton, { marginTop: 4 }]}
-                onPress={() => void saveEmployeeWithSeats()}
-                disabled={employeeSaveLoading}
+                  onPress={() => setSeatsPanelOpen((open) => !open)}
+                  accessibilityRole="button"
+                  accessibilityLabel="Añadir usuario adicional"
+                  style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}
                 >
-                <Text style={styles.secondaryButtonText}>
-                {employeeSaveLoading
-                ? 'Guardando...'
-                : Number(issuer.additionalUsers || 0) > 0
-                ? `Cobrar ${formatCurrency(subscriptionAdditionalUserCents * Number(issuer.additionalUsers || 0))} y generar el código`
-                : 'Generar el código del empleado'}
-                </Text>
+                  <Text style={styles.cardTitle}>👥 AÑADIR USUARIO ADICIONAL</Text>
+                  <Text style={{ color: '#0f172a', fontSize: 18, fontWeight: 'bold' }}>{seatsPanelOpen ? '−' : '+'}</Text>
                 </Pressable>
-                {seatsSyncLoading ? (
-                <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 6, color: '#0284c7' }]}>Aplicando el cambio de plazas en Stripe...</Text>
+                {seatsPanelOpen ? (
+                  <View>
+                    <TextInput
+                      style={styles.input}
+                      placeholder="Número de usuarios adicionales"
+                      placeholderTextColor="#94a3b8"
+                      keyboardType="numeric"
+                      value={String(issuer.additionalUsers || 0)}
+                      onChangeText={(t) => setIssuer(i => ({ ...i, additionalUsers: Number(t.replace(/[^0-9]/g, '')) || 0 }))}
+                    />
+                    <TextInput
+                      style={styles.input}
+                      placeholder="Código de acceso (mínimo 8 caracteres)"
+                      placeholderTextColor="#94a3b8"
+                      autoCapitalize="characters"
+                      secureTextEntry
+                      value={employeeAccessCode}
+                      onChangeText={setEmployeeAccessCode}
+                    />
+                    <Pressable
+                      style={[styles.secondaryButton, { marginTop: 4 }]}
+                      onPress={() => void saveEmployeeWithSeats()}
+                      disabled={employeeSaveLoading}
+                    >
+                      <Text style={styles.secondaryButtonText}>
+                        {employeeSaveLoading
+                        ? 'Guardando...'
+                        : Number(issuer.additionalUsers || 0) > 0
+                        ? `Cobrar ${formatCurrency(subscriptionAdditionalUserCents * Number(issuer.additionalUsers || 0))} y generar el código`
+                        : 'Generar el código del usuario'}
+                      </Text>
+                    </Pressable>
+                    {seatsSyncLoading ? (
+                      <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 6, color: '#0284c7' }]}>Aplicando el cambio de plazas en Stripe...</Text>
+                    ) : null}
+                    {seatsSyncMessage ? (
+                      <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 6, color: '#0f172a' }]}>{seatsSyncMessage}</Text>
+                    ) : null}
+                    {seatsCardMissing ? (
+                      <Pressable
+                        style={[styles.secondaryButton, { marginTop: 6 }]}
+                        onPress={() => void addSubscriptionPaymentMethod()}
+                        disabled={seatsSyncLoading}
+                      >
+                        <Text style={styles.secondaryButtonText}>
+                          {seatsSyncLoading ? 'Abriendo Stripe...' : 'AÑADIR TARJETA'}
+                        </Text>
+                      </Pressable>
+                    ) : null}
+                  </View>
                 ) : null}
-                {seatsSyncMessage ? (
-                <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 6, color: '#0f172a' }]}>{seatsSyncMessage}</Text>
-                ) : null}
-                {seatsCardMissing ? (
-                  <Pressable
-                    style={[styles.secondaryButton, { marginTop: 6 }]}
-                    onPress={() => void addSubscriptionPaymentMethod()}
-                    disabled={seatsSyncLoading}
-                  >
-                    <Text style={styles.secondaryButtonText}>
-                      {seatsSyncLoading ? 'Abriendo Stripe...' : 'ANADIR TARJETA'}
-                    </Text>
-                  </Pressable>
-                ) : null}
-                </View>
+              </View>
             <View style={styles.card}>
               <Text style={styles.cardTitle}>⚙️ DATOS DEL NEGOCIO</Text>
-              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>La aplicación organiza tus facturas y gastos para facilitar su revisión por tu gestoría.</Text>
               <TextInput style={styles.input} placeholder="Nombre Comercial / Razón Social" placeholderTextColor="#94a3b8" value={issuer.name} onChangeText={(t) => setIssuer(i => ({ ...i, name: t }))} />
               <TextInput style={styles.input} placeholder="NIF / CIF" placeholderTextColor="#94a3b8" value={issuer.nif} onChangeText={(t) => setIssuer(i => ({ ...i, nif: t }))} />
               <TextInput style={styles.input} placeholder="Dirección del negocio" placeholderTextColor="#94a3b8" value={issuer.address} onChangeText={(t) => setIssuer(i => ({ ...i, address: t }))} />
