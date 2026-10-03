@@ -219,7 +219,19 @@ try {
   throw new Error(`PUBLIC_API_URL no es válida: ${error.message}`);
 }
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
+const supabaseAuthOptions = {
+  auth: { persistSession: false, autoRefreshToken: false },
+};
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SECRET_KEY,
+  supabaseAuthOptions,
+);
+const supabaseAuth = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SECRET_KEY,
+  supabaseAuthOptions,
+);
 
 const requireStripe = () => {
   if (!stripe) {
@@ -781,7 +793,7 @@ app.post('/api/auth/login', async (req, res) => {
     return res.status(400).json({ ok: false, error: 'Indica email y contraseña.' });
   }
 
-  const { data, error } = await supabase.auth.signInWithPassword({
+  const { data, error } = await supabaseAuth.auth.signInWithPassword({
     email: normalizedEmail,
     password,
   });
