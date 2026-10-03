@@ -5,8 +5,9 @@ import { Text, View } from 'react-native';
 // Pantalla de retorno tras pagar con el enlace o el QR: Stripe Checkout redirige aqui con el
 // esquema de la app y volvemos al TPV, donde el cobro ya se confirma y se muestra el ticket.
 export default function PagoCompletado() {
-  const { flow } = useLocalSearchParams<{ flow?: string }>();
+  const { flow, result } = useLocalSearchParams<{ flow?: string; result?: string }>();
   const isPaymentMethodSetup = flow === 'payment-method-setup';
+  const paymentMethodSaved = isPaymentMethodSetup && result === 'success';
 
   useEffect(() => {
     const timeout = setTimeout(() => {
@@ -22,11 +23,15 @@ export default function PagoCompletado() {
   return (
     <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#f1f5f9', padding: 24 }}>
       <Text style={{ fontSize: 18, fontWeight: 'bold', color: '#0f172a', textAlign: 'center' }}>
-        {isPaymentMethodSetup ? 'Tarjeta guardada' : 'Pago recibido'}
+        {isPaymentMethodSetup
+          ? paymentMethodSaved ? 'Tarjeta guardada' : 'No se confirmó la tarjeta'
+          : 'Pago recibido'}
       </Text>
       <Text style={{ fontSize: 13, color: '#475569', marginTop: 10, textAlign: 'center' }}>
         {isPaymentMethodSetup
-          ? 'Volviendo para completar el cobro de las plazas...'
+          ? paymentMethodSaved
+            ? 'Volviendo para completar el cobro de las plazas...'
+            : 'Vuelve a Configuración para intentarlo de nuevo. No se ha añadido el usuario.'
           : 'Volviendo a la aplicación para mostrar el ticket...'}
       </Text>
     </View>

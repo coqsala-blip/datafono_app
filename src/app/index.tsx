@@ -3,6 +3,7 @@ import { requestNeededAndroidPermissions, useStripeTerminal } from '@stripe/stri
 import { Camera, CameraView } from 'expo-camera';
 import * as FileSystemLegacy from 'expo-file-system/legacy';
 import * as ImagePicker from 'expo-image-picker';
+import * as ExpoLinking from 'expo-linking';
 import * as MailComposer from 'expo-mail-composer';
 import * as Print from 'expo-print';
 import * as SecureStore from 'expo-secure-store';
@@ -533,9 +534,13 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       }
 
       const browserResult = await WebBrowser.openAuthSessionAsync(setupUrl, ONLINE_PAYMENT_REDIRECT_URL);
-      if (browserResult.type !== 'success') {
+      if (browserResult.type !== 'success' || !browserResult.url) {
         setSeatsSyncMessage('No se confirmó el regreso desde Stripe. Vuelve a la app e inténtalo otra vez.');
         return false;
+      }
+      const setupResult = ExpoLinking.parse(browserResult.url).queryParams?.result;
+      if (setupResult !== 'success') {
+        throw new Error('Stripe no confirmó la tarjeta como método predeterminado. No se ha cobrado ni añadido el usuario.');
       }
       return true;
     } catch (error) {

@@ -1550,14 +1550,63 @@ app.get('/billing/cancelled', (req, res) => {
   res.type('html').send('<h1>Pago cancelado</h1><p>Puedes cerrar esta página y volver a la aplicación.</p>');
 });
 
-app.get('/billing/payment-method', (req, res) => {
-  const deepLink = 'tpvapp://pago-completado?flow=payment-method-setup';
+app.get('/billing/payment-method', async (req, res) => {
+  let deepLink = 'tpvapp://pago-completado?flow=payment-method-setup&result=error';
+
+  try {
+    const sessionId = typeof req.query.session_id === 'string' ? req.query.session_id : '';
+    if (!sessionId) throw new Error('Falta la sesión de Stripe.');
+
+    const stripeClient = requireStripe();
+    const session = await stripeClient.checkout.sessions.retrieve(sessionId, { expand: ['setup_intent'] });
+    if (session.mode !== 'setup' || session.status !== 'complete') {
+      throw new Error('Stripe no confirmó que se guardara la tarjeta.');
+    }
+
+    const setupIntent = session.setup_intent && typeof session.setup_intent === 'object'
+      ? session.setup_intent
+      : await stripeClient.setupIntents.retrieve(String(session.setup_intent || ''));
+    if (setupIntent.status !== 'succeeded') {
+      throw new Error('Stripe aún no confirmó la tarjeta.');
+    }
+
+    const customerId = typeof session.customer === 'string' ? session.customer : session.customer?.id;
+    const paymentMethodId = typeof setupIntent.payment_method === 'string'
+      ? setupIntent.payment_method
+      : setupIntent.payment_method?.id;
+    if (!customerId || !paymentMethodId) {
+      throw new Error('Stripe no devolvió el cliente o la tarjeta guardada.');
+    }
+
+    // Setup Checkout adjunta la tarjeta, pero no necesariamente la convierte en método
+    // predeterminado para las facturas que cobra el cambio de plazas.
+    await stripeClient.customers.update(customerId, {
+      invoice_settings: { default_payment_method: paymentMethodId },
+    });
+
+    const subscriptions = await stripeClient.subscriptions.list({
+      customer: customerId,
+      status: 'all',
+      limit: 100,
+    });
+    const billableStatuses = new Set(['active', 'trialing', 'past_due', 'unpaid']);
+    await Promise.all(subscriptions.data
+      .filter((subscription) => billableStatuses.has(subscription.status))
+      .map((subscription) => stripeClient.subscriptions.update(subscription.id, {
+        default_payment_method: paymentMethodId,
+      })));
+
+    deepLink = 'tpvapp://pago-completado?flow=payment-method-setup&result=success';
+  } catch (error) {
+    console.error('Error confirmando la tarjeta de Stripe:', error.message);
+  }
+
   res.type('html').send(`<!doctype html>
 <html lang="es">
   <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Tarjeta guardada</title>
   <script>window.location.replace(${JSON.stringify(deepLink)});</script>
   </head>
-  <body><h1>Tarjeta guardada</h1><p>Volviendo a la aplicación para completar el cobro.</p><a href="${deepLink}">Volver a la aplicación</a></body>
+  <body><h1>Tarjeta procesada</h1><p>Volviendo a la aplicación para continuar.</p><a href="${deepLink}">Volver a la aplicación</a></body>
 </html>`);
 });
 
