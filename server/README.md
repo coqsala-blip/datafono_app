@@ -38,6 +38,8 @@ npm run dev
 - `POST /api/billing/resolve-invoice` (cobra la factura vencida de la suscripción con la tarjeta guardada)
 - `POST /api/stripe/webhook`
 - `POST /api/auth/refresh` (renueva la sesión del móvil con el refresh token y evita que los documentos se publiquen sin dueño)
+- `POST /api/auth/employee-login` (nombre completo, `companyEmail`, `employeeAccessCode` y `deviceId`; no recibe contraseña)
+- `POST /api/auth/employee-access-code` (solo principal; genera un código si no se envía `accessCode` y devuelve el código y correo que debe compartir)
 - `POST /api/documents` (publica el ticket/factura y lo asocia a la cuenta autenticada)
 - `GET /api/documents` (lista los documentos de la cuenta)
 - `GET /api/documents/sync-all` (recupera documentos + gastos en una llamada: "Sincronizar historial")
@@ -59,9 +61,33 @@ Los cobros online/QR y las suscripciones se crean con Stripe Checkout. El backen
 
 ### Sincronizar historial (recuperar tickets, facturas y gastos)
 
-La app guarda cada ticket/factura y cada gasto en la nube asociados a la cuenta que los emite, para
+La app guarda cada ticket/factura y cada gasto en la nube asociados al usuario principal de la empresa, para
 poder recuperarlos con el botón **Sincronizar historial** (pestaña *Gastos/Facturación*) después de
 borrar los datos de la app, cambiar de móvil o sufrir una avería.
+
+### Acceso por empresa
+
+Al entrar sin sesión, la app ofrece usuario principal o adicional. El principal mantiene correo y
+contraseña (y registro si es nuevo). El adicional introduce nombre completo, el correo registrado
+del principal y su código. El servidor valida ambos juntos, crea una identidad independiente por
+empresa y dispositivo y guarda `company_owner_id` en metadata administrada por el servidor.
+El código se puede reutilizar hasta que el principal lo cambie. Los intentos están limitados por IP
+en este proceso y las sesiones adicionales no pueden superar las plazas contratadas.
+
+Los documentos y gastos nuevos usan el identificador del principal; las consultas también incluyen
+registros antiguos de sus empleados vinculados. Las operaciones Stripe guardan el principal y el
+operador por separado, y el estado de un pago solo se devuelve a su empresa. Esto no cambia el
+destino de los fondos Stripe ni configura cuentas bancarias independientes.
+
+La app actualiza el historial al abrir la sesión, al volver a primer plano y cada minuto mientras
+está activa y la suscripción está vigente. La caché local se separa por empresa y cuenta, incluido
+el PIN. La caché global antigua se conserva pero no se migra automáticamente porque no identifica
+al propietario; los documentos de la nube se recuperan mediante la sincronización.
+
+Este flujo requiere desplegar este backend y distribuir una compilación actualizada de la app.
+Los bloqueos de cuenta y límites de intentos son locales a un proceso; varias instancias requieren
+coordinación compartida. No hace falta una migración SQL adicional si las tablas de historial ya
+están configuradas según los pasos siguientes.
 
 Requisitos en Supabase (se asume que la tabla `documents` ya existe, creada al configurar el
 proyecto). Ejecuta estos archivos en **Dashboard → SQL Editor → pegar y Run**:

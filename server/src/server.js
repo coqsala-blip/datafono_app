@@ -370,7 +370,7 @@ const resolveUserSubscription = async (stripeClient, userId) => {
   return { user, subscription: null, subscriptionId: null };
 };
 
-const findPrincipalByEmployeeAccessCode = async (accessCode) => {
+const findPrincipalByEmployeeAccessCode = async (accessCode, companyEmail) => {
   const candidates = employeeAccessCodeCandidates(accessCode);
   let page = 1;
   while (true) {
@@ -379,7 +379,7 @@ const findPrincipalByEmployeeAccessCode = async (accessCode) => {
 
     const users = data?.users || [];
     for (const user of users) {
-      if (employeeAccessCodeMatches(user.app_metadata, candidates)) return user;
+      if ((!companyEmail || user.email?.toLowerCase() === companyEmail) && employeeAccessCodeMatches(user.app_metadata, candidates)) return user;
     }
 
     if (users.length < 1000) return null;
@@ -791,6 +791,89 @@ const revokeSession = async (accessToken) => {
   }
 };
 
+const employeeLoginAttempts = new Map();
+
+app.post('/api/auth/employee-login', async (req, res) => {
+  const companyEmail = typeof req.body?.companyEmail === 'string' ? req.body.companyEmail.trim().toLowerCase() : '';
+  const fullName = typeof req.body?.fullName === 'string' ? req.body.fullName.trim().slice(0, 120) : '';
+  const deviceId = normalizeDeviceId(req.body?.deviceId);
+  const accessCode = req.body?.employeeAccessCode;
+  if (!deviceId) return res.status(400).json({ ok: false, code: 'device_required', error: 'Reinicia la app para identificar este dispositivo.' });
+  if (!/^[^\s@]+@[^\s@]+$/.test(companyEmail) || !fullName || normalizeEmployeeAccessCode(accessCode).length < 8) {
+    return res.status(400).json({ ok: false, error: 'Indica tu nombre completo, el correo del usuario principal y su código de acceso.' });
+  }
+  const now = Date.now();
+  for (const [key, attempt] of employeeLoginAttempts) {
+    if (attempt.until <= now) employeeLoginAttempts.delete(key);
+  }
+  const attemptKey = req.ip || req.socket?.remoteAddress || 'unknown';
+  const attempt = employeeLoginAttempts.get(attemptKey) || { count: 0, until: now + 15 * 60 * 1000 };
+  if (attempt.count >= 10) return res.status(429).json({ ok: false, error: 'Demasiados intentos. Vuelve a intentarlo en 15 minutos.' });
+  attempt.count += 1;
+  employeeLoginAttempts.set(attemptKey, attempt);
+  try {
+    const principal = await findPrincipalByEmployeeAccessCode(accessCode, companyEmail);
+    if (!principal) return res.status(401).json({ ok: false, error: 'El correo de la empresa o el código no son correctos.' });
+    return await withAccountLock(principal.id, async () => {
+      const owner = await fetchAuthoritativeUser(principal.id);
+      if (!owner || owner.email?.toLowerCase() !== companyEmail || !employeeAccessCodeMatches(owner.app_metadata, employeeAccessCodeCandidates(accessCode))) {
+        return res.status(401).json({ ok: false, error: 'El correo de la empresa o el código no son correctos.' });
+      }
+      const identity = crypto.createHash('sha256').update(`${owner.id}:${deviceId}`).digest('hex');
+      const email = `${identity}@employees.tpv.invalid`;
+      let employee = null;
+      let occupiedSeats = 0;
+      for (let page = 1; ; page += 1) {
+        const { data, error } = await supabase.auth.admin.listUsers({ page, perPage: 1000 });
+        if (error) throw error;
+        const users = data?.users || [];
+        employee ||= users.find((user) => user.email === email);
+        occupiedSeats += users.filter((user) => user.app_metadata?.company_owner_id === owner.id &&
+          Boolean(user.app_metadata?.active_session_id || user.app_metadata?.active_device_id)).length;
+        if (users.length < 1000) break;
+      }
+      if (employee && (employee.app_metadata?.role !== 'empleado' || employee.app_metadata?.company_owner_id !== owner.id)) {
+        return res.status(403).json({ ok: false, error: 'No se pudo verificar la vinculación con la empresa.' });
+      }
+      let seats = Math.max(0, Math.floor(Number(owner.user_metadata?.stripe_subscription_additional_users) || 0));
+      if (stripe) {
+        const resolved = await resolveUserSubscription(stripe, owner.id);
+        seats = resolved.subscription ? readSubscriptionSeats(resolved.subscription) : 0;
+      }
+      const alreadyActive = Boolean(employee?.app_metadata?.active_session_id || employee?.app_metadata?.active_device_id);
+      if (seats === 0 || (!alreadyActive && occupiedSeats >= seats)) {
+        return res.status(403).json({ ok: false, error: 'No hay plazas adicionales disponibles. El usuario principal debe ampliar las plazas o cerrar otra sesión adicional.' });
+      }
+      const password = crypto.randomBytes(32).toString('hex');
+      const attributes = {
+        password,
+        user_metadata: { full_name: fullName, company_name: owner.user_metadata?.company_name || '' },
+        app_metadata: { role: 'empleado', company_owner_id: owner.id, active_device_id: deviceId },
+      };
+      const saved = employee
+        ? await supabase.auth.admin.updateUserById(employee.id, attributes)
+        : await supabase.auth.admin.createUser({ ...attributes, email, email_confirm: true });
+      if (saved.error || !saved.data?.user) throw saved.error || new Error('No se pudo crear el acceso adicional.');
+      const { data, error } = await supabaseAuth.auth.signInWithPassword({ email, password });
+      if (error || !data?.session?.access_token) throw error || new Error('No se pudo iniciar la sesión.');
+      const verified = await verifyAccessToken(data.session.access_token);
+      if (!verified || verified.user.id !== saved.data.user.id) {
+        await revokeSession(data.session.access_token);
+        throw new Error('No se pudo verificar la sesión adicional.');
+      }
+      const linked = await updateUserAppMetadata(saved.data.user.id, { active_session_id: verified.sessionId });
+      if (linked.error || !linked.data?.user) {
+        await revokeSession(data.session.access_token);
+        throw linked.error || new Error('No se pudo guardar la sesión adicional.');
+      }
+      employeeLoginAttempts.delete(attemptKey);
+      return res.json({ ok: true, user: linked.data.user, session: data.session });
+    });
+  } catch {
+    return res.status(500).json({ ok: false, error: 'No se pudo iniciar el acceso adicional. Inténtalo de nuevo.' });
+  }
+});
+
 app.post('/api/auth/register', async (req, res) => {
   const { email, password, fullName, companyName, role, employeeAccessCode } = req.body || {};
   const normalizedEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
@@ -916,7 +999,7 @@ app.post('/api/auth/employee-access-code', requireAuth, async (req, res) => {
     return res.status(403).json({ ok: false, error: 'Solo el usuario principal puede crear códigos de empleado.' });
   }
 
-  const accessCode = normalizeEmployeeAccessCode(req.body?.accessCode);
+  const accessCode = normalizeEmployeeAccessCode(req.body?.accessCode) || crypto.randomBytes(8).toString('hex').toUpperCase();
   if (accessCode.length < 8) {
     return res.status(400).json({ ok: false, error: 'El código debe tener al menos 8 caracteres.' });
   }
@@ -931,7 +1014,7 @@ app.post('/api/auth/employee-access-code', requireAuth, async (req, res) => {
     return res.status(500).json({ ok: false, error: 'No se pudo guardar el código de empleado.' });
   }
 
-  return res.json({ ok: true });
+  return res.json({ ok: true, accessCode, companyEmail: req.user.email });
 });
 
 app.post('/api/auth/login', async (req, res) => {
@@ -1101,7 +1184,8 @@ app.post('/api/stripe/payment-intent', requireAuth, async (req, res) => {
       payment_method_types: ['card_present'],
       capture_method: 'automatic',
       metadata: {
-        supabase_user_id: req.user.id,
+        supabase_user_id: req.user.app_metadata?.company_owner_id || req.user.id,
+        operator_user_id: req.user.id,
         order_id: orderId,
       },
     });
@@ -1146,12 +1230,14 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
         },
       ],
       metadata: {
-        supabase_user_id: req.user.id,
+        supabase_user_id: req.user.app_metadata?.company_owner_id || req.user.id,
+        operator_user_id: req.user.id,
         order_id: orderId,
       },
       payment_intent_data: {
         metadata: {
-          supabase_user_id: req.user.id,
+          supabase_user_id: req.user.app_metadata?.company_owner_id || req.user.id,
+          operator_user_id: req.user.id,
           order_id: orderId,
         },
       },
@@ -1190,6 +1276,12 @@ app.get('/api/stripe/payment/:paymentId', requireAuth, async (req, res) => {
     const session = await requireStripe().checkout.sessions.retrieve(req.params.paymentId, {
       expand: ['payment_intent.payment_method', 'payment_intent.last_payment_error.payment_method'],
     });
+    const ownerId = req.user.app_metadata?.company_owner_id || req.user.id;
+    const paymentUserId = session.metadata?.supabase_user_id;
+    const paymentUser = paymentUserId && paymentUserId !== ownerId ? await fetchAuthoritativeUser(paymentUserId) : null;
+    if (paymentUserId !== ownerId && paymentUser?.app_metadata?.company_owner_id !== ownerId) {
+      return res.status(403).json({ ok: false, error: 'Este pago no pertenece a tu empresa.' });
+    }
     return res.json({
       ok: true,
       paymentId: session.id,
@@ -1820,7 +1912,28 @@ app.get('/billing/payment-method-cancelled', (req, res) => {
   res.type('html').send('<h1>No se guardó la tarjeta</h1><p>Puedes cerrar esta página. Para añadir empleados necesitarás una tarjeta guardada en Stripe.</p>');
 });
 
-app.post('/api/documents', async (req, res) => {
+const companyHistoryUserIds = async (req, res) => {
+  const ownerId = req.user.app_metadata?.company_owner_id || req.user.id;
+  const userIds = new Set([ownerId]);
+  try {
+    for (let page = 1; ; page += 1) {
+      const { data, error } = await supabase.auth.admin.listUsers({ page, perPage: 1000 });
+      if (error) throw error;
+      if (!Array.isArray(data?.users)) throw new Error('Respuesta de usuarios no valida.');
+      for (const user of data.users) {
+        if (user.app_metadata?.company_owner_id === ownerId) userIds.add(user.id);
+      }
+      if (data.users.length < 1000) break;
+    }
+    return [...userIds];
+  } catch (error) {
+    console.error('Error resolviendo usuarios del historial de empresa:', error.message);
+    res.status(500).json({ ok: false, error: 'No se pudo recuperar el historial de la empresa.' });
+    return null;
+  }
+};
+
+app.post('/api/documents', requireAuth, async (req, res) => {
   const { id, ticketCode, documentType, amount, originalAmount, relatedTicketCode, refundHistory, isRefunded, createdAt, issuer, client, items, subtotal, iva, ivaRateApplied, type } = req.body;
 
   if (!id || !ticketCode || !documentType || !Number.isFinite(Number(amount))) {
@@ -1847,23 +1960,8 @@ app.post('/api/documents', async (req, res) => {
     type,
   };
 
-  // Asociar el documento al usuario que publica (para poder sincronizar el historial después).
-  let userId = null;
-  const authToken = getBearerToken(req);
-  if (authToken) {
-    let verified = null;
-    try {
-      verified = await verifyAccessToken(authToken);
-    } catch {
-      // Sin auth: se publica igual (modo anónimo), pero no se podrá sincronizar.
-    }
-    // Una sesión trasladada a otro dispositivo no puede publicar a nombre de la cuenta.
-    const binding = verified ? sessionBindingState(verified.user, verified.sessionId) : null;
-    if (binding === 'conflict') return deviceConflict(res);
-    if (binding === 'ok') userId = verified.user.id;
-  }
-
   const insertPayload = {
+    user_id: req.user.app_metadata?.company_owner_id || req.user.id,
     ticket_code: ticketCode,
     document_type: documentType,
     amount: document.amount,
@@ -1871,8 +1969,6 @@ app.post('/api/documents', async (req, res) => {
     document_data: document,
     public_token: token,
   };
-  if (userId) insertPayload.user_id = userId;
-
   const { error } = await supabase.from('documents').insert(insertPayload);
 
   if (error) {
@@ -1890,20 +1986,21 @@ app.post('/api/documents', async (req, res) => {
 // Lista los documentos publicados por el usuario autenticado, para recuperar el historial
 // al borrar la app, cambiar de móvil o reinstalar.
 app.get('/api/documents', requireAuth, async (req, res) => {
-  const userId = req.user.id;
+  const userIds = await companyHistoryUserIds(req, res);
+  if (!userIds) return;
   const limit = Math.max(1, Math.min(500, Number(req.query.limit) || 100));
   const since = req.query.since ? new Date(req.query.since) : null;
 
   const query = supabase
     .from('documents')
     .select('ticket_code,document_type,amount,original_amount,document_data,public_token,created_at')
-    .eq('user_id', userId)
+    .in('user_id', userIds)
     .order('created_at', { ascending: false })
     .limit(limit);
 
-  const { data, error } = since
+  const { data, error } = await (since
     ? query.gte('created_at', since.toISOString())
-    : query;
+    : query);
 
   if (error) {
     console.error('Error listando documentos:', error.message);
@@ -1930,7 +2027,7 @@ app.post('/api/expenses/sync', requireAuth, async (req, res) => {
   }
 
   const rows = expenses.map((gasto) => ({
-    user_id: req.user.id,
+    user_id: req.user.app_metadata?.company_owner_id || req.user.id,
     local_id: gasto.id,
     based_on: 'client',
     description: gasto.description || '',
@@ -1953,11 +2050,13 @@ app.post('/api/expenses/sync', requireAuth, async (req, res) => {
 
 // Lista los gastos sincronizados del usuario autenticado.
 app.get('/api/expenses', requireAuth, async (req, res) => {
+  const userIds = await companyHistoryUserIds(req, res);
+  if (!userIds) return;
   const limit = Math.max(1, Math.min(500, Number(req.query.limit) || 100));
   const { data, error } = await supabase
     .from('expenses')
     .select('local_id,description,amount,date,category,based_on,synced_at')
-    .eq('user_id', req.user.id)
+    .in('user_id', userIds)
     .order('date', { ascending: false })
     .limit(limit);
 
@@ -1971,19 +2070,21 @@ app.get('/api/expenses', requireAuth, async (req, res) => {
 // Recupera todo el historial (documentos + gastos) en un solo llamado, para restaurar la app
 // tras borrar datos o instalarla en otro móvil.
 app.get('/api/documents/sync-all', requireAuth, async (req, res) => {
+  const userIds = await companyHistoryUserIds(req, res);
+  if (!userIds) return;
   const limit = Math.max(1, Math.min(500, Number(req.query.limit) || 100));
 
   const documentsPromise = supabase
     .from('documents')
     .select('ticket_code,document_type,amount,original_amount,document_data,public_token,created_at')
-    .eq('user_id', req.user.id)
+    .in('user_id', userIds)
     .order('created_at', { ascending: false })
     .limit(limit);
 
   const expensesPromise = supabase
     .from('expenses')
     .select('local_id,description,amount,date,category,based_on,synced_at')
-    .eq('user_id', req.user.id)
+    .in('user_id', userIds)
     .order('date', { ascending: false })
     .limit(limit);
 
