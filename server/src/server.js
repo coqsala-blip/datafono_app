@@ -264,6 +264,25 @@ const updateUserAppMetadata = async (userId, metadata) => {
 
 const hashEmployeeAccessCode = (code, salt) => crypto.scryptSync(code, salt, 64).toString('hex');
 
+// Los códigos nuevos se guardan en NFKC y mayúsculas. Para los ya guardados se prueba también el
+// texto tal cual y en minúsculas (el teclado puede haber cambiado las mayúsculas al escribirlo).
+const normalizeEmployeeAccessCode = (code) => (typeof code === 'string' ? code.normalize('NFKC').trim().toUpperCase() : '');
+const employeeAccessCodeCandidates = (code) => {
+  const raw = typeof code === 'string' ? code.trim() : '';
+  const normalized = normalizeEmployeeAccessCode(code);
+  return [...new Set([raw, normalized, normalized.toLowerCase()].filter(Boolean))];
+};
+const employeeAccessCodeMatches = (metadata, candidates) => {
+  if (!metadata || metadata.role === 'empleado') return false;
+  const { employee_access_code_salt: salt, employee_access_code_hash: storedHash } = metadata;
+  if (typeof salt !== 'string' || typeof storedHash !== 'string' || !salt || !storedHash) return false;
+  const stored = Buffer.from(storedHash, 'hex');
+  return candidates.some((candidate) => {
+    const candidateHash = Buffer.from(hashEmployeeAccessCode(candidate, salt), 'hex');
+    return candidateHash.length === stored.length && crypto.timingSafeEqual(candidateHash, stored);
+  });
+};
+
 const isPrincipal = (user) => user.app_metadata?.role !== 'empleado';
 
 // Plazas de empleado (usuarios adicionales) contratadas. La fuente de verdad es el item de la
@@ -352,6 +371,7 @@ const resolveUserSubscription = async (stripeClient, userId) => {
 };
 
 const findPrincipalByEmployeeAccessCode = async (accessCode) => {
+  const candidates = employeeAccessCodeCandidates(accessCode);
   let page = 1;
   while (true) {
     const { data, error } = await supabase.auth.admin.listUsers({ page, perPage: 1000 });
@@ -359,12 +379,7 @@ const findPrincipalByEmployeeAccessCode = async (accessCode) => {
 
     const users = data?.users || [];
     for (const user of users) {
-      const metadata = user.app_metadata || {};
-      if (metadata.role === 'empleado' || !metadata.employee_access_code_salt || !metadata.employee_access_code_hash) continue;
-      const candidateHash = hashEmployeeAccessCode(accessCode, metadata.employee_access_code_salt);
-      if (crypto.timingSafeEqual(Buffer.from(candidateHash, 'hex'), Buffer.from(metadata.employee_access_code_hash, 'hex'))) {
-        return user;
-      }
+      if (employeeAccessCodeMatches(user.app_metadata, candidates)) return user;
     }
 
     if (users.length < 1000) return null;
@@ -504,20 +519,98 @@ const getBearerToken = (req) => {
   return authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : null;
 };
 
-const requireAuth = async (req, res, next) => {
+// --- SESIÓN ÚNICA POR CUENTA ---
+// Cada cuenta (principal o empleado) solo puede operar desde un terminal: app_metadata guarda el
+// dispositivo (active_device_id) y la sesión de Supabase (active_session_id) autorizados. Solo el
+// servidor escribe app_metadata; el cliente no puede modificarla.
+const DEVICE_ID_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
+const DEVICE_CONFLICT_MESSAGE = 'La sesión ya está abierta en otro dispositivo. Cierra la sesión allí o pulsa "Abrir en este dispositivo" para trasladarla (la sesión anterior se cerrará).';
+
+const normalizeDeviceId = (value) => {
+  const deviceId = typeof value === 'string' ? value.trim() : '';
+  return DEVICE_ID_PATTERN.test(deviceId) ? deviceId : '';
+};
+
+const deviceConflict = (res) => res.status(409).json({ ok: false, code: 'device_conflict', error: DEVICE_CONFLICT_MESSAGE });
+
+// Lee session_id del JWT. SOLO se llama después de que Supabase haya validado el token con getUser.
+const readVerifiedSessionId = (verifiedToken) => {
+  try {
+    const payload = JSON.parse(Buffer.from(String(verifiedToken).split('.')[1] || '', 'base64url').toString('utf8'));
+    return typeof payload?.session_id === 'string' && payload.session_id ? payload.session_id : null;
+  } catch {
+    return null;
+  }
+};
+
+// Valida el token contra Supabase (firma, caducidad, sesión no revocada) y devuelve el usuario
+// leído de la base de datos de Auth (app_metadata actual, no las claims del token).
+const verifyAccessToken = async (token) => {
+  if (!token) return null;
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data?.user) return null;
+  const sessionId = readVerifiedSessionId(token);
+  return sessionId ? { user: data.user, sessionId } : null;
+};
+
+const sessionBindingState = (user, sessionId) => {
+  const activeSession = user?.app_metadata?.active_session_id;
+  if (typeof activeSession !== 'string' || !activeSession) return 'unbound';
+  return activeSession === sessionId ? 'ok' : 'conflict';
+};
+
+// Serializa login/registro/traslado por cuenta dentro de ESTE proceso. No protege entre varias
+// instancias del backend (hoy solo hay una).
+const accountLocks = new Map();
+const withAccountLock = async (key, task) => {
+  const previous = accountLocks.get(key) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => { release = resolve; });
+  const tail = previous.then(() => current);
+  accountLocks.set(key, tail);
+  await previous;
+  try {
+    return await task();
+  } finally {
+    release();
+    if (accountLocks.get(key) === tail) accountLocks.delete(key);
+  }
+};
+
+const fetchAuthoritativeUser = async (userId) => {
+  const { data, error } = await supabase.auth.admin.getUserById(userId);
+  if (error || !data?.user) return null;
+  return data.user;
+};
+
+// Solo verifica el token. Únicamente /api/auth/me la usa directamente, porque es quien decide el
+// enlace o el traslado explícito de la sesión.
+const requireVerifiedToken = async (req, res, next) => {
   const token = getBearerToken(req);
   if (!token) {
     return res.status(401).json({ ok: false, error: 'Se requiere autenticación.' });
   }
 
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data.user) {
+  const verified = await verifyAccessToken(token);
+  if (!verified) {
     return res.status(401).json({ ok: false, error: 'La sesión no es válida o ha caducado.' });
   }
 
-  req.user = data.user;
+  req.user = verified.user;
+  req.authSessionId = verified.sessionId;
+  req.authToken = token;
   return next();
 };
+
+const requireAuth = (req, res, next) => requireVerifiedToken(req, res, () => {
+  const state = sessionBindingState(req.user, req.authSessionId);
+  if (state === 'conflict') return deviceConflict(res);
+  if (state === 'unbound') {
+    // Sesiones anteriores a este control: /api/auth/me las enlaza al arrancar la app.
+    return res.status(409).json({ ok: false, code: 'session_unbound', error: 'Vuelve a abrir la app para verificar la sesión en este dispositivo.' });
+  }
+  return next();
+});
 
 app.get('/api/billing/status', requireAuth, async (req, res) => {
   let accountOwner = req.user;
@@ -689,23 +782,43 @@ app.post('/api/billing/resolve-invoice', requireAuth, async (req, res) => {
   }
 });
 
+// Cierra en Supabase una sesión recién creada que no se va a usar (best effort).
+const revokeSession = async (accessToken) => {
+  try {
+    await supabase.auth.admin.signOut(accessToken, 'local');
+  } catch (error) {
+    console.warn('No se pudo revocar la sesión:', error.message);
+  }
+};
+
 app.post('/api/auth/register', async (req, res) => {
   const { email, password, fullName, companyName, role, employeeAccessCode } = req.body || {};
   const normalizedEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
   const requestedRole = role === 'empleado' ? 'empleado' : 'principal';
-  const normalizedAccessCode = typeof employeeAccessCode === 'string' ? employeeAccessCode.trim() : '';
+  const normalizedFullName = typeof fullName === 'string' ? fullName.trim().slice(0, 120) : '';
+  const normalizedCompanyName = typeof companyName === 'string' ? companyName.trim().slice(0, 160) : '';
+  const deviceId = normalizeDeviceId(req.body?.deviceId);
 
   if (!normalizedEmail || typeof password !== 'string' || password.length < 8) {
     return res.status(400).json({ ok: false, error: 'Indica un email válido y una contraseña de al menos 8 caracteres.' });
   }
+  if (!deviceId) {
+    return res.status(400).json({ ok: false, code: 'device_required', error: 'Falta el identificador de este dispositivo. Reinicia la app e inténtalo de nuevo.' });
+  }
+  if (!normalizedFullName) {
+    return res.status(400).json({ ok: false, error: 'Indica tu nombre completo.' });
+  }
+  if (requestedRole === 'principal' && !normalizedCompanyName) {
+    return res.status(400).json({ ok: false, error: 'Indica el nombre de la empresa.' });
+  }
 
   let principal = null;
   if (requestedRole === 'empleado') {
-    if (normalizedAccessCode.length < 8) {
+    if (normalizeEmployeeAccessCode(employeeAccessCode).length < 8) {
       return res.status(400).json({ ok: false, error: 'Introduce el código de acceso que te ha dado el principal.' });
     }
     try {
-      principal = await findPrincipalByEmployeeAccessCode(normalizedAccessCode);
+      principal = await findPrincipalByEmployeeAccessCode(employeeAccessCode);
     } catch (error) {
       console.error('Error buscando el código de empleado:', error.message);
       return res.status(500).json({ ok: false, error: 'No se pudo validar el código de empleado.' });
@@ -715,48 +828,87 @@ app.post('/api/auth/register', async (req, res) => {
     }
   }
 
-  const { data, error } = await supabase.auth.signUp({
-    email: normalizedEmail,
-    password,
-    options: {
-      data: {
-        full_name: typeof fullName === 'string' ? fullName.trim() : '',
-        company_name: typeof companyName === 'string' ? companyName.trim() : '',
-        role: requestedRole,
+  const registerAccount = async () => {
+    // Bajo el bloqueo del principal se vuelve a comprobar el código: si otro alta lo acaba de
+    // consumir, este registro no debe usarlo.
+    let owner = null;
+    if (principal) {
+      owner = await fetchAuthoritativeUser(principal.id);
+      if (!owner || !employeeAccessCodeMatches(owner.app_metadata, employeeAccessCodeCandidates(employeeAccessCode))) {
+        return res.status(400).json({ ok: false, error: 'El código de empleado no es válido.' });
+      }
+    }
+    // El empleado hereda la empresa del principal: no se le pide.
+    const resolvedCompanyName = owner
+      ? String(owner.user_metadata?.company_name || '').trim()
+      : normalizedCompanyName;
+
+    const { data, error } = await supabaseAuth.auth.signUp({
+      email: normalizedEmail,
+      password,
+      options: {
+        data: {
+          full_name: normalizedFullName,
+          company_name: resolvedCompanyName,
+        },
       },
-    },
-  });
-
-  if (error) {
-    return res.status(400).json({ ok: false, error: error.message });
-  }
-
-  if (data.user) {
-    const { data: updatedUser, error: metadataError } = await updateUserAppMetadata(data.user.id, {
-      role: requestedRole,
-      ...(principal ? { company_owner_id: principal.id } : {}),
     });
-    if (metadataError) {
-      console.error('Error asignando el rol de la cuenta:', metadataError.message);
+
+    if (error) {
+      return res.status(400).json({ ok: false, error: error.message });
+    }
+
+    // Email ya registrado: Supabase devuelve un usuario ofuscado sin identidades (o uno real ya
+    // configurado). Nunca se toca esa cuenta ni se consume el código; respuesta neutra.
+    const identities = data?.user?.identities;
+    const created = data?.user && Array.isArray(identities) && identities.length > 0
+      ? await fetchAuthoritativeUser(data.user.id)
+      : null;
+    if (!created || created.app_metadata?.role) {
+      return res.status(201).json({ ok: true, user: null, session: null, requiresEmailConfirmation: true });
+    }
+
+    let sessionId = null;
+    if (data.session?.access_token) {
+      const verified = await verifyAccessToken(data.session.access_token);
+      if (!verified || verified.user.id !== created.id) {
+        await supabase.auth.admin.deleteUser(created.id).catch(() => undefined);
+        return res.status(502).json({ ok: false, error: 'No se pudo verificar la sesión de la cuenta nueva.' });
+      }
+      sessionId = verified.sessionId;
+    }
+
+    const { data: updatedUser, error: metadataError } = await updateUserAppMetadata(created.id, {
+      role: requestedRole,
+      ...(owner ? { company_owner_id: owner.id } : {}),
+      active_device_id: deviceId,
+      // Sin sesión (email por confirmar) se enlaza al iniciar sesión desde este mismo dispositivo.
+      ...(sessionId ? { active_session_id: sessionId } : {}),
+    });
+    if (metadataError || !updatedUser?.user) {
+      console.error('Error asignando el rol de la cuenta:', metadataError?.message);
+      // Sin rol la cuenta se trataría como principal: se elimina la cuenta recién creada.
+      await supabase.auth.admin.deleteUser(created.id).catch(() => undefined);
       return res.status(500).json({ ok: false, error: 'No se pudo asignar el acceso de la cuenta.' });
     }
-    data.user = updatedUser.user;
 
-    if (principal) {
-      const { error: codeError } = await updateUserAppMetadata(principal.id, {
+    if (owner) {
+      const { error: codeError } = await updateUserAppMetadata(owner.id, {
         employee_access_code_salt: null,
         employee_access_code_hash: null,
       });
       if (codeError) console.error('Error invalidando el código de empleado:', codeError.message);
     }
-  }
 
-  return res.status(201).json({
-    ok: true,
-    user: data.user,
-    session: data.session,
-    requiresEmailConfirmation: !data.session,
-  });
+    return res.status(201).json({
+      ok: true,
+      user: updatedUser.user,
+      session: data.session,
+      requiresEmailConfirmation: !data.session,
+    });
+  };
+
+  return principal ? withAccountLock(principal.id, registerAccount) : registerAccount();
 });
 
 app.post('/api/auth/employee-access-code', requireAuth, async (req, res) => {
@@ -764,7 +916,7 @@ app.post('/api/auth/employee-access-code', requireAuth, async (req, res) => {
     return res.status(403).json({ ok: false, error: 'Solo el usuario principal puede crear códigos de empleado.' });
   }
 
-  const accessCode = typeof req.body?.accessCode === 'string' ? req.body.accessCode.trim() : '';
+  const accessCode = normalizeEmployeeAccessCode(req.body?.accessCode);
   if (accessCode.length < 8) {
     return res.status(400).json({ ok: false, error: 'El código debe tener al menos 8 caracteres.' });
   }
@@ -785,12 +937,15 @@ app.post('/api/auth/employee-access-code', requireAuth, async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body || {};
   const normalizedEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
-  // Sesión única por dispositivo: cada cuenta solo puede estar abierta en un móvil a la vez.
-  const deviceId = typeof req.body?.deviceId === 'string' ? req.body.deviceId.trim().slice(0, 64) : '';
+  // Sesión única: cada cuenta solo puede estar abierta en un dispositivo a la vez.
+  const deviceId = normalizeDeviceId(req.body?.deviceId);
   const force = req.body?.force === true;
 
   if (!normalizedEmail || typeof password !== 'string' || password.length === 0) {
     return res.status(400).json({ ok: false, error: 'Indica email y contraseña.' });
+  }
+  if (!deviceId) {
+    return res.status(400).json({ ok: false, code: 'device_required', error: 'Falta el identificador de este dispositivo. Reinicia la app e inténtalo de nuevo.' });
   }
 
   const { data, error } = await supabaseAuth.auth.signInWithPassword({
@@ -798,32 +953,44 @@ app.post('/api/auth/login', async (req, res) => {
     password,
   });
 
-  if (error || !data.user || !data.session) {
+  if (error || !data?.user || !data?.session?.access_token) {
     return res.status(401).json({ ok: false, error: 'Email o contraseña incorrectos.' });
   }
 
-  const metadata = data.user.app_metadata || {};
-  const activeDevice = typeof metadata.active_device_id === 'string' ? metadata.active_device_id : null;
-
-  // Si la cuenta ya está abierta en otro dispositivo, se avisa y se bloquea (salvo traslado explícito).
-  if (deviceId && activeDevice && activeDevice !== deviceId && !force) {
-    return res.status(409).json({
-      ok: false,
-      code: 'device_conflict',
-      error: 'La sesión ya está abierta en otro dispositivo. Cierra la sesión allí o pulsa "Abrir en este dispositivo" para trasladarla (la sesión anterior se cerrará).',
-    });
+  const verified = await verifyAccessToken(data.session.access_token);
+  if (!verified || verified.user.id !== data.user.id) {
+    return res.status(401).json({ ok: false, error: 'La sesión no es válida o ha caducado.' });
   }
 
-  // Registrar/trasladar el dispositivo activo de la cuenta.
-  if (deviceId && (activeDevice !== deviceId || force)) {
-    const { error: metaError } = await updateUserAppMetadata(data.user.id, { active_device_id: deviceId });
-    if (metaError) {
-      console.error('Error registrando el dispositivo activo:', metaError.message);
+  return withAccountLock(data.user.id, async () => {
+    const fresh = await fetchAuthoritativeUser(data.user.id);
+    if (!fresh) {
+      await revokeSession(data.session.access_token);
+      return res.status(500).json({ ok: false, error: 'No se pudo leer la cuenta.' });
+    }
+    const metadata = fresh.app_metadata || {};
+    const activeDevice = typeof metadata.active_device_id === 'string' && metadata.active_device_id ? metadata.active_device_id : null;
+    const activeSession = typeof metadata.active_session_id === 'string' && metadata.active_session_id ? metadata.active_session_id : null;
+    const occupiedElsewhere = Boolean(activeDevice || activeSession) && activeDevice !== deviceId;
+
+    // Abierta en otro dispositivo: se bloquea salvo traslado explícito; la sesión nueva se descarta.
+    if (occupiedElsewhere && !force) {
+      await revokeSession(data.session.access_token);
+      return deviceConflict(res);
+    }
+
+    const { data: updatedUser, error: metaError } = await updateUserAppMetadata(fresh.id, {
+      active_device_id: deviceId,
+      active_session_id: verified.sessionId,
+    });
+    if (metaError || !updatedUser?.user) {
+      console.error('Error registrando el dispositivo activo:', metaError?.message);
+      await revokeSession(data.session.access_token);
       return res.status(500).json({ ok: false, error: 'No se pudo registrar el dispositivo.' });
     }
-  }
 
-  return res.json({ ok: true, user: data.user, session: data.session });
+    return res.json({ ok: true, user: updatedUser.user, session: data.session });
+  });
 });
 
 // Renueva la sesión del móvil con el refresh token guardado. Los access tokens de Supabase caducan
@@ -835,36 +1002,75 @@ app.post('/api/auth/refresh', async (req, res) => {
     return res.status(400).json({ ok: false, error: 'Falta el refresh token de la sesión.' });
   }
 
-  const { data, error } = await supabase.auth.refreshSession({ refresh_token: refreshToken });
-  if (error || !data?.session) {
+  const { data, error } = await supabaseAuth.auth.refreshSession({ refresh_token: refreshToken });
+  if (error || !data?.session?.access_token) {
     return res.status(401).json({ ok: false, error: 'La sesión ha caducado. Vuelve a iniciar sesión.' });
   }
 
-  return res.json({ ok: true, user: data.user, session: data.session });
+  const verified = await verifyAccessToken(data.session.access_token);
+  if (!verified) {
+    return res.status(401).json({ ok: false, error: 'La sesión ha caducado. Vuelve a iniciar sesión.' });
+  }
+  // Una sesión trasladada a otro dispositivo no se puede renovar (los marcadores no se tocan).
+  if (sessionBindingState(verified.user, verified.sessionId) === 'conflict') {
+    return deviceConflict(res);
+  }
+
+  return res.json({ ok: true, user: verified.user, session: data.session });
 });
 
-app.get('/api/auth/me', requireAuth, async (req, res) => {
-  // Sesión única por dispositivo: un token usado desde otro dispositivo se rechaza,
-  // salvo que se pida expresamente trasladar la sesión (force), que reutiliza el token
-  // válido para reclamar el dispositivo sin volver a pedir la contraseña.
-  const deviceId = typeof req.headers['x-device-id'] === 'string' ? String(req.headers['x-device-id']).trim() : '';
+// Única ruta que puede enlazar o trasladar la sesión. Usa solo la verificación del token (no
+// requireAuth) para que una sesión antigua o de otro dispositivo pueda pedir el traslado explícito.
+app.get('/api/auth/me', requireVerifiedToken, async (req, res) => {
+  const deviceId = normalizeDeviceId(req.headers['x-device-id']);
   const force = String(req.headers['x-device-force'] || '') === '1';
-  const activeDevice = typeof req.user.app_metadata?.active_device_id === 'string' ? req.user.app_metadata.active_device_id : null;
-  if (deviceId && activeDevice && deviceId !== activeDevice) {
-    if (!force) {
-      return res.status(409).json({
-        ok: false,
-        code: 'device_conflict',
-        error: 'La sesión ya está abierta en otro dispositivo.',
-      });
+
+  return withAccountLock(req.user.id, async () => {
+    const fresh = await fetchAuthoritativeUser(req.user.id);
+    if (!fresh) {
+      return res.status(401).json({ ok: false, error: 'La sesión no es válida o ha caducado.' });
     }
-    const { error: metaError } = await updateUserAppMetadata(req.user.id, { active_device_id: deviceId });
-    if (metaError) {
-      console.error('Error trasladando el dispositivo activo:', metaError.message);
+    const metadata = fresh.app_metadata || {};
+    const activeDevice = typeof metadata.active_device_id === 'string' && metadata.active_device_id ? metadata.active_device_id : null;
+    const activeSession = typeof metadata.active_session_id === 'string' && metadata.active_session_id ? metadata.active_session_id : null;
+
+    if (activeSession === req.authSessionId && (!deviceId || !activeDevice || activeDevice === deviceId)) {
+      return res.json({ ok: true, user: fresh });
+    }
+
+    if (!deviceId) {
+      if (activeSession || activeDevice) return deviceConflict(res);
+      return res.status(400).json({ ok: false, code: 'device_required', error: 'Falta el identificador de este dispositivo.' });
+    }
+
+    // Sesión antigua sin enlazar desde su propio dispositivo: se enlaza. Cualquier otro caso es un
+    // conflicto que solo se resuelve con traslado explícito.
+    const occupied = Boolean(activeSession) || (Boolean(activeDevice) && activeDevice !== deviceId);
+    if (occupied && !force) return deviceConflict(res);
+
+    const { data: updatedUser, error: metaError } = await updateUserAppMetadata(fresh.id, {
+      active_device_id: deviceId,
+      active_session_id: req.authSessionId,
+    });
+    if (metaError || !updatedUser?.user) {
+      console.error('Error enlazando la sesión al dispositivo:', metaError?.message);
       return res.status(500).json({ ok: false, error: 'No se pudo trasladar la sesión a este dispositivo.' });
     }
-  }
-  res.json({ ok: true, user: req.user });
+    return res.json({ ok: true, user: updatedUser.user, transferred: occupied });
+  });
+});
+
+// Cierre de sesión: libera el dispositivo solo si esta sesión es la activa, y revoca la sesión.
+app.post('/api/auth/logout', requireVerifiedToken, async (req, res) => {
+  await withAccountLock(req.user.id, async () => {
+    const fresh = await fetchAuthoritativeUser(req.user.id);
+    if (fresh && sessionBindingState(fresh, req.authSessionId) === 'ok') {
+      const { error } = await updateUserAppMetadata(fresh.id, { active_device_id: null, active_session_id: null });
+      if (error) console.error('Error liberando el dispositivo activo:', error.message);
+    }
+  });
+  await revokeSession(req.authToken);
+  return res.json({ ok: true });
 });
 
 app.post('/api/stripe/terminal/connection-token', requireAuth, async (req, res) => {
@@ -1645,12 +1851,16 @@ app.post('/api/documents', async (req, res) => {
   let userId = null;
   const authToken = getBearerToken(req);
   if (authToken) {
+    let verified = null;
     try {
-      const { data: { user } } = await supabase.auth.getUser(authToken);
-      userId = user?.id || null;
+      verified = await verifyAccessToken(authToken);
     } catch {
       // Sin auth: se publica igual (modo anónimo), pero no se podrá sincronizar.
     }
+    // Una sesión trasladada a otro dispositivo no puede publicar a nombre de la cuenta.
+    const binding = verified ? sessionBindingState(verified.user, verified.sessionId) : null;
+    if (binding === 'conflict') return deviceConflict(res);
+    if (binding === 'ok') userId = verified.user.id;
   }
 
   const insertPayload = {
