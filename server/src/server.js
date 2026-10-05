@@ -1933,8 +1933,187 @@ const companyHistoryUserIds = async (req, res) => {
   }
 };
 
+const refundPinAttempts = new Map();
+const REFUND_PIN_TTL_MS = 15 * 60 * 1000;
+const validRefundPin = (pin) => typeof pin === 'string' && /^\d{4,8}$/.test(pin);
+const hasRefundPin = (metadata) => (
+  typeof metadata?.company_refund_pin_salt === 'string'
+  && /^[a-f0-9]{32}$/.test(metadata.company_refund_pin_salt)
+  && typeof metadata.company_refund_pin_hash === 'string'
+  && /^[a-f0-9]{128}$/.test(metadata.company_refund_pin_hash)
+);
+const deriveRefundPin = (pin, salt) => new Promise((resolve, reject) => {
+  crypto.scrypt(pin, salt, 64, (error, hash) => error ? reject(error) : resolve(hash));
+});
+const verifyRefundPin = async (owner, actorId, pin, res) => {
+  const now = Date.now();
+  for (const [key, attempt] of refundPinAttempts) {
+    if (attempt.expiresAt <= now) refundPinAttempts.delete(key);
+  }
+  const key = JSON.stringify([owner.id, actorId]);
+  const attempt = refundPinAttempts.get(key);
+  if (attempt?.count >= 5) {
+    res.status(429).json({ ok: false, code: 'pin_attempts_exceeded', retryAfterSeconds: Math.ceil((attempt.expiresAt - now) / 1000), error: 'Demasiados intentos de PIN.' });
+    return false;
+  }
+  const metadata = owner.app_metadata;
+  const candidate = await deriveRefundPin(validRefundPin(pin) ? pin : '', metadata.company_refund_pin_salt);
+  const matches = crypto.timingSafeEqual(candidate, Buffer.from(metadata.company_refund_pin_hash, 'hex'));
+  if (!matches || !validRefundPin(pin)) {
+    refundPinAttempts.set(key, { count: (attempt?.count || 0) + 1, expiresAt: attempt?.expiresAt || now + REFUND_PIN_TTL_MS });
+    res.status(403).json({ ok: false, code: 'invalid_pin', error: 'PIN incorrecto.' });
+    return false;
+  }
+  refundPinAttempts.delete(key);
+  return true;
+};
+const refundAccountOwner = async (req, res) => {
+  const actor = await fetchAuthoritativeUser(req.user.id);
+  const role = actor?.app_metadata?.role;
+  const ownerId = actor?.app_metadata?.company_owner_id;
+  if (!actor || !['principal', 'empleado'].includes(role)
+    || (role === 'principal' && ownerId && ownerId !== actor.id)
+    || (role === 'empleado' && (typeof ownerId !== 'string' || !ownerId || ownerId === actor.id))) {
+    res.status(403).json({ ok: false, error: 'Cuenta sin rol o empresa valida.' });
+    return null;
+  }
+  const owner = role === 'principal' ? actor : await fetchAuthoritativeUser(ownerId);
+  if (!owner || owner.app_metadata?.role !== 'principal'
+    || (owner.app_metadata.company_owner_id && owner.app_metadata.company_owner_id !== owner.id)) {
+    res.status(403).json({ ok: false, error: 'La empresa no tiene un principal valido.' });
+    return null;
+  }
+  req.user = actor;
+  return owner;
+};
+
+app.get('/api/company/pin/status', requireAuth, async (req, res) => {
+  try {
+    const owner = await refundAccountOwner(req, res);
+    if (!owner) return;
+    return res.json({ configured: hasRefundPin(owner.app_metadata) });
+  } catch {
+    return res.status(500).json({ ok: false, error: 'No se pudo consultar el PIN.' });
+  }
+});
+
+app.post('/api/company/pin', requireAuth, async (req, res) => {
+  try {
+    const owner = await refundAccountOwner(req, res);
+    if (!owner) return;
+    if (req.user.id !== owner.id) return res.status(403).json({ ok: false, error: 'Solo el principal puede configurar el PIN.' });
+    const { pin, currentPin } = req.body || {};
+    if (!validRefundPin(pin)) return res.status(400).json({ ok: false, error: 'El PIN debe contener de 4 a 8 digitos.' });
+    return await withAccountLock(owner.id, async () => {
+      const freshOwner = await refundAccountOwner(req, res);
+      if (!freshOwner) return;
+      if (freshOwner.id !== owner.id || req.user.id !== freshOwner.id) return res.status(403).json({ ok: false, error: 'La cuenta ha cambiado.' });
+      const metadata = freshOwner.app_metadata;
+      if (hasRefundPin(metadata)) {
+        if (!await verifyRefundPin(freshOwner, req.user.id, currentPin, res)) return;
+      } else if (metadata.company_refund_pin_salt !== undefined || metadata.company_refund_pin_hash !== undefined) {
+        return res.status(409).json({ ok: false, error: 'La configuracion del PIN requiere revision.' });
+      }
+      const salt = crypto.randomBytes(16).toString('hex');
+      const hash = (await deriveRefundPin(pin, salt)).toString('hex');
+      const { error } = await supabase.auth.admin.updateUserById(freshOwner.id, {
+        app_metadata: { ...metadata, company_refund_pin_salt: salt, company_refund_pin_hash: hash },
+      });
+      if (error) return res.status(500).json({ ok: false, error: 'No se pudo guardar el PIN.' });
+      return res.json({ ok: true, configured: true });
+    });
+  } catch {
+    return res.status(500).json({ ok: false, error: 'No se pudo guardar el PIN.' });
+  }
+});
+
+const refundMoneyCents = (amount) => {
+  if (typeof amount !== 'number' || !Number.isFinite(amount) || amount < 0) return null;
+  const cents = Math.round(amount * 100);
+  return Number.isSafeInteger(cents) && Math.abs(amount * 100 - cents) < 0.000001 ? cents : null;
+};
+
+app.post('/api/documents/refund', requireAuth, async (req, res) => {
+  try {
+    const { documentId, amount, pin } = req.body || {};
+    const requestedCents = refundMoneyCents(amount);
+    if (typeof documentId !== 'string' || !documentId.trim() || requestedCents === null || requestedCents <= 0) {
+      return res.status(400).json({ ok: false, error: 'Se requiere documentId e importe positivo con hasta dos decimales.' });
+    }
+    const owner = await refundAccountOwner(req, res);
+    if (!owner) return;
+    return await withAccountLock(owner.id, async () => {
+      const freshOwner = await refundAccountOwner(req, res);
+      if (!freshOwner) return;
+      if (freshOwner.id !== owner.id) return res.status(403).json({ ok: false, error: 'La cuenta ha cambiado.' });
+      if (req.user.app_metadata.role === 'empleado') {
+        if (!hasRefundPin(freshOwner.app_metadata)) return res.status(409).json({ ok: false, code: 'pin_not_configured', error: 'El principal debe configurar el PIN.' });
+        if (!await verifyRefundPin(freshOwner, req.user.id, pin, res)) return;
+      }
+      const userIds = await companyHistoryUserIds(req, res);
+      if (!userIds) return;
+      const { data, error } = await supabase.from('documents')
+        .select('document_data,created_at')
+        .in('user_id', userIds)
+        .eq('document_data->>id', documentId)
+        .order('created_at', { ascending: false })
+        .limit(1);
+      if (error) return res.status(500).json({ ok: false, error: 'No se pudo leer el documento.' });
+      const document = data?.[0]?.document_data;
+      if (!document) return res.status(404).json({ ok: false, error: 'Documento no encontrado.' });
+      if (document.type !== 'COBRO') return res.status(409).json({ ok: false, error: 'Solo se pueden devolver cobros originales.' });
+      const history = document.refundHistory ?? [];
+      const balanceCents = refundMoneyCents(document.amount);
+      if (!Array.isArray(history) || history.some((entry) => refundMoneyCents(entry?.amount) === null || entry.amount <= 0)) {
+        return res.status(409).json({ ok: false, error: 'Historial de devoluciones inconsistente.' });
+      }
+      const refundedCents = history.reduce((total, entry) => total + refundMoneyCents(entry.amount), 0);
+      const originalCents = document.originalAmount === undefined
+        ? balanceCents + refundedCents : refundMoneyCents(document.originalAmount);
+      const rate = document.ivaRateApplied ?? 0;
+      if (balanceCents === null || originalCents === null || !Number.isSafeInteger(originalCents)
+        || !Number.isSafeInteger(refundedCents) || originalCents - refundedCents !== balanceCents
+        || typeof rate !== 'number' || !Number.isFinite(rate) || rate < 0) {
+        return res.status(409).json({ ok: false, error: 'Saldo del documento inconsistente.' });
+      }
+      if (document.isRefunded || balanceCents <= 0 || requestedCents > balanceCents) {
+        return res.status(409).json({ ok: false, error: 'El importe supera el saldo disponible.' });
+      }
+      const remaining = (balanceCents - requestedCents) / 100;
+      const subtotal = remaining / (1 + rate / 100);
+      const updated = {
+        ...document, documentType: 'COMPRA/DEVOLUCIONES', amount: remaining,
+        originalAmount: originalCents / 100, subtotal, iva: remaining - subtotal,
+        isRefunded: remaining === 0,
+        refundHistory: [...history, { amount: requestedCents / 100, date: new Date().toISOString() }],
+      };
+      delete updated.publicUrl;
+      const token = crypto.randomBytes(24).toString('hex');
+      const { error: insertError } = await supabase.from('documents').insert({
+        user_id: freshOwner.id, ticket_code: updated.ticketCode, document_type: updated.documentType,
+        amount: updated.amount, original_amount: updated.originalAmount,
+        document_data: updated, public_token: token,
+      });
+      if (insertError) return res.status(500).json({ ok: false, error: 'No se pudo guardar la devolucion.' });
+      return res.json({ ok: true, document: { ...updated, publicUrl: `${PUBLIC_API_URL}/documents/${token}` } });
+    });
+  } catch {
+    return res.status(500).json({ ok: false, error: 'No se pudo registrar la devolucion.' });
+  }
+});
+
+const isRefundDocument = (document) => (
+  ['DEVOLUCION', 'DEVOLUCIÓN'].includes(document.type) || document.documentType === 'COMPRA/DEVOLUCIONES'
+  || document.documentType === 'TICKET DE DEVOLUCIÓN' || Boolean(document.isRefunded)
+  || (Array.isArray(document.refundHistory) && document.refundHistory.length > 0)
+);
+
 app.post('/api/documents', requireAuth, async (req, res) => {
   const { id, ticketCode, documentType, amount, originalAmount, relatedTicketCode, refundHistory, isRefunded, createdAt, issuer, client, items, subtotal, iva, ivaRateApplied, type } = req.body;
+
+  if (req.user.app_metadata?.role === 'empleado' && isRefundDocument(req.body)) {
+    return res.status(403).json({ ok: false, error: 'Las devoluciones requieren el endpoint autorizado de devolucion.' });
+  }
 
   if (!id || !ticketCode || !documentType || !Number.isFinite(Number(amount))) {
     return res.status(400).json({ ok: false, error: 'Faltan datos obligatorios del documento.' });
@@ -1960,26 +2139,43 @@ app.post('/api/documents', requireAuth, async (req, res) => {
     type,
   };
 
-  const insertPayload = {
-    user_id: req.user.app_metadata?.company_owner_id || req.user.id,
-    ticket_code: ticketCode,
-    document_type: documentType,
-    amount: document.amount,
-    original_amount: document.originalAmount,
-    document_data: document,
-    public_token: token,
-  };
-  const { error } = await supabase.from('documents').insert(insertPayload);
+  const ownerId = req.user.app_metadata?.company_owner_id || req.user.id;
+  return withAccountLock(ownerId, async () => {
+    if (req.user.app_metadata?.role === 'empleado') {
+      const userIds = await companyHistoryUserIds(req, res);
+      if (!userIds) return;
+      const { data, error } = await supabase.from('documents')
+        .select('document_data')
+        .in('user_id', userIds)
+        .eq('document_data->>id', id)
+        .order('created_at', { ascending: false })
+        .limit(1);
+      if (error) return res.status(500).json({ ok: false, error: 'No se pudo verificar el documento.' });
+      if (data?.[0]?.document_data && isRefundDocument(data[0].document_data)) {
+        return res.status(403).json({ ok: false, error: 'Un empleado no puede reemplazar un documento con devoluciones.' });
+      }
+    }
+    const insertPayload = {
+      user_id: ownerId,
+      ticket_code: ticketCode,
+      document_type: documentType,
+      amount: document.amount,
+      original_amount: document.originalAmount,
+      document_data: document,
+      public_token: token,
+    };
+    const { error } = await supabase.from('documents').insert(insertPayload);
 
-  if (error) {
-    console.error('Error guardando documento en Supabase:', error.message);
-    return res.status(500).json({ ok: false, error: `Supabase: ${error.message}` });
-  }
+    if (error) {
+      console.error('Error guardando documento en Supabase:', error.message);
+      return res.status(500).json({ ok: false, error: `Supabase: ${error.message}` });
+    }
 
-  res.status(201).json({
-    ok: true,
-    token,
-    publicUrl: `${PUBLIC_API_URL}/documents/${token}`,
+    return res.status(201).json({
+      ok: true,
+      token,
+      publicUrl: `${PUBLIC_API_URL}/documents/${token}`,
+    });
   });
 });
 

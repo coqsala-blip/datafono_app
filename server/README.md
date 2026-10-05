@@ -40,6 +40,9 @@ npm run dev
 - `POST /api/auth/refresh` (renueva la sesión del móvil con el refresh token y evita que los documentos se publiquen sin dueño)
 - `POST /api/auth/employee-login` (nombre completo, `companyEmail`, `employeeAccessCode` y `deviceId`; no recibe contraseña)
 - `POST /api/auth/employee-access-code` (solo principal; genera un código si no se envía `accessCode` y devuelve el código y correo que debe compartir)
+- `GET /api/company/pin/status` (estado del PIN de devoluciones de la empresa, sin secretos)
+- `POST /api/company/pin` (solo principal; configura o cambia el PIN)
+- `POST /api/documents/refund` (registra una devolución documental autorizada)
 - `POST /api/documents` (publica el ticket/factura y lo asocia a la cuenta autenticada)
 - `GET /api/documents` (lista los documentos de la cuenta)
 - `GET /api/documents/sync-all` (recupera documentos + gastos en una llamada: "Sincronizar historial")
@@ -104,6 +107,139 @@ Si falta algún paso, el backend responde 500 y la app muestra el motivo exacto 
 Los access tokens de Supabase caducan en 1 hora: la app los renueva en segundo plano con
 `POST /api/auth/refresh` (guardando el refresh token en el almacén seguro del móvil) para que los
 tickets y gastos no queden nunca en la nube sin dueño.
+
+### PIN y devoluciones documentales
+
+Las tres rutas nuevas requieren `Authorization: Bearer <access_token>` y pasan por `requireAuth`,
+incluido el control de sesión del dispositivo. El rol debe ser explícitamente `principal` o
+`empleado` en `app_metadata`; un empleado necesita `company_owner_id` de un principal válido.
+No se aceptan roles ni identificadores de empresa enviados en el body o en `user_metadata`.
+
+**Importante: esta operación modifica solamente el historial documental. No devuelve dinero,
+no llama a Stripe Refunds ni modifica ningún pago o suscripción. La devolución real de fondos
+Stripe no está implementada actualmente y debe gestionarse por separado.**
+
+#### Consultar y configurar el PIN
+
+`GET /api/company/pin/status` devuelve exactamente `{"configured":true}` o
+`{"configured":false}`. Tanto el principal como sus empleados consultan el PIN del principal,
+pero nunca reciben su PIN, salt o hash en la respuesta de esta ruta.
+
+`POST /api/company/pin` acepta `{"pin":"1234","currentPin":"0000"}`; `currentPin` es opcional
+solo en el primer alta. Únicamente el principal puede usarla. El PIN es una cadena de 4 a 8
+dígitos, conservando ceros iniciales. Para migrar el PIN local inicial, la app del principal
+debe enviar ese valor como `pin` cuando el servidor devuelva `configured:false`. Este backend
+no lee ni migra el almacenamiento local de la app.
+
+El servidor genera un salt aleatorio de 16 bytes y deriva 64 bytes mediante scrypt asíncrono.
+Guarda únicamente `company_refund_pin_salt` y `company_refund_pin_hash` en `app_metadata` del
+principal, preservando sus demás campos. Nunca guarda el PIN recibido en claro ni lo registra
+en logs. La respuesta de alta/cambio es `{"ok":true,"configured":true}`. El cambio siempre
+verifica `currentPin` contra el hash vigente dentro del bloqueo de cuenta; si la metadata del
+PIN está incompleta o corrupta, no permite restablecerla silenciosamente.
+
+Ejemplos (PIN ficticio; usa HTTPS fuera del entorno local y evita guardar PINs reales en el
+historial de tu terminal):
+
+```http
+GET /api/company/pin/status
+Authorization: Bearer <token-principal-o-empleado>
+```
+
+```http
+POST /api/company/pin
+Authorization: Bearer <token-principal>
+Content-Type: application/json
+
+{"pin":"0123"}
+```
+
+```http
+POST /api/company/pin
+Authorization: Bearer <token-principal>
+Content-Type: application/json
+
+{"pin":"4567","currentPin":"0123"}
+```
+
+#### Registrar una devolución
+
+`POST /api/documents/refund` acepta `{"documentId":"id-del-cobro","amount":12.50,"pin":"4567"}`.
+El empleado debe presentar el PIN configurado del principal; el principal puede omitir `pin`,
+incluso si todavía no lo ha configurado. `amount` debe ser un número finito y positivo, con
+hasta dos decimales. No se aceptan importes como strings ni se confía en saldo, historial,
+importe original, emisor, tipo o propietario enviados por el cliente.
+
+```http
+POST /api/documents/refund
+Authorization: Bearer <token-empleado>
+Content-Type: application/json
+
+{"documentId":"venta-123","amount":12.50,"pin":"4567"}
+```
+
+El servidor consulta la última revisión por `created_at DESC LIMIT 1`, aplicando primero
+`.in('user_id', companyHistoryUserIds(...))` y `.eq('document_data->>id', documentId)`. Esto
+incluye documentos antiguos guardados bajo empleados de la empresa, sin un límite previo de
+500 filas. Un ID ajeno a la empresa responde como no encontrado.
+
+Solo se admiten documentos originales con `type:"COBRO"`, saldo coherente y suficiente y sin
+agotamiento previo. Los cálculos de saldo e historial usan céntimos enteros; se conserva
+`originalAmount` (o se reconstruye como saldo más historial si no estaba guardado), se reduce
+`amount`, se añade `{amount,date}` a `refundHistory` con fecha del servidor y se recalculan
+`subtotal` e `iva` usando `ivaRateApplied` almacenado (0 si falta). `isRefunded` pasa a `true`
+al quedar saldo cero y `documentType` pasa a `COMPRA/DEVOLUCIONES`; `type` permanece `COBRO`.
+
+Se guarda una **nueva fila** del mismo documento, propiedad del principal, con el mismo `id`,
+ticket, fecha original, emisor, cliente e items y un nuevo `public_token` aleatorio de 24 bytes.
+La revisión anterior y su URL pública no cambian. Responde HTTP 200 con
+`{"ok":true,"document":{...documentoActualizado,"publicUrl":"https://.../documents/<token>"}}`.
+
+Los empleados no pueden publicar devoluciones por `POST /api/documents`: se rechazan
+`type:"DEVOLUCION"`, `documentType:"COMPRA/DEVOLUCIONES"` o `"TICKET DE DEVOLUCIÓN"`,
+`refundHistory` no vacío e `isRefunded` verdadero, incluso en republicaciones idénticas.
+Tampoco pueden restaurar saldo enviando un cobro limpio con el ID de un documento ya devuelto.
+Las publicaciones normales de cobros continúan admitidas; las devoluciones del empleado deben
+pasar exclusivamente por el endpoint autorizado.
+
+#### Errores y límites
+
+- `400`: PIN nuevo con formato inválido, ID inválido o importe inválido.
+- `401`: falta autenticación o token no válido.
+- `403`: rol/empresa inválidos, configuración por empleado, PIN incorrecto o ausente al verificar,
+   o intento de publicación de devolución por empleado. PIN incorrecto usa `code:"invalid_pin"`.
+- `404`: documento no encontrado dentro de la empresa.
+- `409`: sesión no enlazada/trasladada, configuración de PIN corrupta, cobro/historial/saldo
+   inválidos, ticket agotado o importe superior al saldo. PIN no configurado para empleado usa
+   `code:"pin_not_configured"`.
+- `429`: después de cinco verificaciones fallidas por pareja principal + actor, los siguientes
+   intentos se bloquean con `code:"pin_attempts_exceeded"` y `retryAfterSeconds`.
+- `500`: fallo de lectura/escritura; estas rutas devuelven errores genéricos, sin secretos ni
+   mensajes internos del proveedor.
+
+La ventana dura 15 minutos desde el primer fallo y no se alarga con nuevos intentos; una
+verificación correcta antes del límite reinicia el contador. Cambiar PIN y devolver comparten
+el contador del mismo actor; consultar el estado no consume intentos. Durante el bloqueo tampoco
+se verifica un PIN correcto. Un PIN ausente/malformado al verificar cuenta como fallo.
+
+La configuración/cambio del PIN, lectura y escritura de devoluciones y publicación de documentos
+se serializan usando el mutex existente del principal. El hash y saldo se releen dentro del
+bloqueo. **El mutex y los límites de intentos son locales a este proceso y se pierden al reiniciar;
+no garantizan atomicidad entre varias instancias.** Antes de escalar hace falta coordinación
+compartida y una transacción de base de datos para saldo/historial. Los hashes están en metadata
+administrada de Supabase, no son un secreto oculto al propio principal ni a sus tokens Supabase;
+no deben copiarse a empleados ni a respuestas/documentos públicos.
+
+Validación local sin red, cuentas reales ni Stripe:
+
+```bash
+node scripts/check-company-pin.js
+```
+
+La prueba ejecuta los handlers reales en una VM con mocks de Supabase, reloj y cuentas; usa crypto
+real para scrypt y comparación segura. Cubre aislamiento, roles/sesiones, alta/cambio, intentos y
+TTL, filtros de documentos, conservación del ticket, validación de importes, concurrencia y
+bypass de publicaciones. La integración y migración inicial del PIN en la app quedan separadas.
 
 ### Despliegue en Render
 
