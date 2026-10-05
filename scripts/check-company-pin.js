@@ -132,6 +132,14 @@ const main = async () => {
     createdAt: '2026-10-01T10:00:00.000Z', ivaRateApplied: 21, subtotal: 100 / 1.21, iva: 100 - 100 / 1.21,
     issuer: { name: 'Company A', nif: 'fixture' }, client: { name: 'Client' }, items: [{ description: 'Item', amount: 100 }],
   };
+  const legacy = loadServer();
+  delete legacy.state.users[0].app_metadata.role;
+  equal((await legacy.call('POST', '/api/company/pin', { userId: 'owner-a', body: { pin: '1234' } })).statusCode, 200, 'Legacy principal can configure PIN without explicit role');
+  equal((await legacy.call('GET', '/api/company/pin/status', { userId: 'employee-a' })).body, { configured: true }, 'Employee resolves legacy principal PIN');
+  equal((await legacy.call('POST', '/api/documents', { userId: 'employee-a', body: document })).statusCode, 201, 'Legacy company charge');
+  equal((await legacy.call('POST', '/api/documents/refund', { userId: 'employee-a', body: { documentId: 'sale', amount: 10, pin: '1234' } })).body.document.amount, 90, 'Legacy company employee refund authorized');
+  equal((await legacy.call('POST', '/api/company/pin', { userId: 'employee-a', body: { pin: '5678' } })).statusCode, 403, 'Legacy principal does not grant employee PIN setup');
+  equal((await legacy.call('POST', '/api/documents/refund', { userId: 'owner-a', body: { documentId: 'sale', amount: 10 } })).statusCode, 200, 'Legacy principal can refund without employee PIN');
   equal((await call('POST', '/api/documents', { userId: 'employee-a', body: document })).statusCode, 201, 'Employee can publish a charge');
   for (const fields of [
     { type: 'DEVOLUCION' }, { type: 'DEVOLUCIÓN' }, { documentType: 'COMPRA/DEVOLUCIONES' },
@@ -198,7 +206,7 @@ const main = async () => {
       equal((await call(method, route, { ...options, body: requestBody })).statusCode, status, `Authentication enforced ${route}`);
     }
     for (const [id, role, ownerId] of [
-      ['no-role', undefined, undefined], ['wrong-role', 'admin', undefined],
+      ['no-role-linked', undefined, 'owner-a'], ['wrong-role', 'admin', undefined],
       ['unlinked', 'empleado', undefined], ['self-linked', 'empleado', 'self-linked'],
       ['missing-owner', 'empleado', 'absent'], ['employee-owner', 'empleado', 'employee-a'],
       ['spoof-principal', 'principal', 'owner-a'],

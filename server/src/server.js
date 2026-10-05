@@ -1967,9 +1967,15 @@ const verifyRefundPin = async (owner, actorId, pin, res) => {
   refundPinAttempts.delete(key);
   return true;
 };
+const isRefundPrincipal = (user) => {
+  const role = user?.app_metadata?.role;
+  const ownerId = user?.app_metadata?.company_owner_id;
+  return Boolean(user) && (role === 'principal' || role === undefined)
+    && (!ownerId || ownerId === user.id);
+};
 const refundAccountOwner = async (req, res) => {
   const actor = await fetchAuthoritativeUser(req.user.id);
-  const role = actor?.app_metadata?.role;
+  const role = isRefundPrincipal(actor) ? 'principal' : actor?.app_metadata?.role;
   const ownerId = actor?.app_metadata?.company_owner_id;
   if (!actor || !['principal', 'empleado'].includes(role)
     || (role === 'principal' && ownerId && ownerId !== actor.id)
@@ -1978,8 +1984,7 @@ const refundAccountOwner = async (req, res) => {
     return null;
   }
   const owner = role === 'principal' ? actor : await fetchAuthoritativeUser(ownerId);
-  if (!owner || owner.app_metadata?.role !== 'principal'
-    || (owner.app_metadata.company_owner_id && owner.app_metadata.company_owner_id !== owner.id)) {
+  if (!isRefundPrincipal(owner)) {
     res.status(403).json({ ok: false, error: 'La empresa no tiene un principal valido.' });
     return null;
   }
@@ -2008,7 +2013,7 @@ app.post('/api/company/pin', requireAuth, async (req, res) => {
       const freshOwner = await refundAccountOwner(req, res);
       if (!freshOwner) return;
       if (freshOwner.id !== owner.id || req.user.id !== freshOwner.id) return res.status(403).json({ ok: false, error: 'La cuenta ha cambiado.' });
-      const metadata = freshOwner.app_metadata;
+      const metadata = freshOwner.app_metadata || {};
       if (hasRefundPin(metadata)) {
         if (!await verifyRefundPin(freshOwner, req.user.id, currentPin, res)) return;
       } else if (metadata.company_refund_pin_salt !== undefined || metadata.company_refund_pin_hash !== undefined) {
