@@ -199,11 +199,22 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
   const createLink = async (owner, account) => {
     const origin = config();
     const state = await mintState(owner);
-    const link = await stripe().v2.core.accountLinks.create({ account: account.id, use_case: {
-      type: 'account_onboarding', account_onboarding: { configurations: ['merchant'],
-        return_url: `${origin}/api/stripe/connect/return?state=${encodeURIComponent(state)}`,
-        refresh_url: `${origin}/api/stripe/connect/refresh?state=${encodeURIComponent(state)}` },
-    } });
+    // La cuenta se crea con merchant (+ customer): el link debe pedir configuraciones compatibles.
+    let link;
+    try {
+      link = await stripe().v2.core.accountLinks.create({ account: account.id, use_case: {
+        type: 'account_onboarding', account_onboarding: { configurations: ['merchant', 'customer'],
+          return_url: `${origin}/api/stripe/connect/return?state=${encodeURIComponent(state)}`,
+          refresh_url: `${origin}/api/stripe/connect/refresh?state=${encodeURIComponent(state)}` },
+      } });
+    } catch (firstError) {
+      if (firstError?.code !== 'configs_must_match_to_use_account_links') throw firstError;
+      link = await stripe().v2.core.accountLinks.create({ account: account.id, use_case: {
+        type: 'account_onboarding', account_onboarding: { configurations: ['merchant'],
+          return_url: `${origin}/api/stripe/connect/return?state=${encodeURIComponent(state)}`,
+          refresh_url: `${origin}/api/stripe/connect/refresh?state=${encodeURIComponent(state)}` },
+      } });
+    }
     await stateOwner(readState(state));
     return { url: safeLink(link, account.id), expiresAt: link.expires_at };
   };
@@ -256,6 +267,9 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
     try { return await task(req, res); } catch (error) {
       if (error?.code === 'account_token_required') error = fail(503, 'connect_country_requires_supported_onboarding');
       const trusted = error?.status && /^connect_[a-z_]+$/.test(error.code || '');
+      if (!trusted) {
+        console.error('Stripe Connect upstream:', error?.type || '', error?.code || '', error?.message || error);
+      }
       return res.status(trusted ? error.status : 502).json({ ok: false,
         code: trusted ? error.code : 'connect_upstream_unavailable', error: 'Stripe Connect test no disponible para esta solicitud.' });
     }

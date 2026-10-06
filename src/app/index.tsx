@@ -2874,11 +2874,14 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       setStripeMethodsError('connect.sessionRequired');
       return;
     }
+    // País del negocio (Config). Si no es un país Connect válido, abrir el selector.
     const country = normalizeConnectCountry(issuer.country);
-    if (!country || stripeCountryConfirmed !== country) {
+    if (!country) {
       setStripeMethodsError('connect.chooseCountry');
+      openStripeCountrySelector();
       return;
     }
+    if (stripeCountryConfirmed !== country) setStripeCountryConfirmed(country);
     stripeConnectBusyRef.current = generation;
     const isCurrent = () => cacheGenerationRef.current === generation && storageScopeRef.current === storageScope &&
       stripeConnectBusyRef.current === generation;
@@ -4850,23 +4853,30 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
               <Text style={styles.cardTitle}>💳 {tr('connect.title')}</Text>
               <Text style={{ color: '#0f172a', fontSize: 12, lineHeight: 18 }}>{tr('connect.phase')}</Text>
               {userRole !== 'principal' ? <Text style={{ fontSize: 12, marginTop: 8 }}>{tr('connect.principalOnly')}</Text> : null}
-              <Text style={{ fontSize: 12, marginTop: 8 }}>{tr('connect.country')}</Text>
+              <Text style={{ fontSize: 12, marginTop: 10 }}>{tr('connect.country')}</Text>
               <Pressable style={[styles.secondaryButton, { marginTop: 6, flexDirection: 'row', alignItems: 'center' }]} onPress={openStripeCountrySelector}
                 disabled={stripeAccountLoading || userRole !== 'principal' || !isLoaded}
                 accessibilityRole="button" accessibilityLabel={tr('connect.chooseCountry')}>
-                <Text style={[styles.secondaryButtonText, { flex: 1 }]}>{stripeCountryConfirmed && stripeCountryConfirmed === normalizeConnectCountry(issuer.country)
-                  ? connectCountryLabel(stripeCountryConfirmed, appLocale) : tr('connect.chooseCountry')}</Text>
+                <Text style={[styles.secondaryButtonText, { flex: 1 }]}>{
+                  (stripeCountryConfirmed || normalizeConnectCountry(issuer.country))
+                    ? connectCountryLabel((stripeCountryConfirmed || normalizeConnectCountry(issuer.country)) as ConnectCountry, appLocale)
+                    : tr('connect.chooseCountry')
+                }</Text>
                 <MaterialIcons name="expand-more" size={20} color="#0f766e" />
               </Pressable>
               <Pressable
-                style={[styles.secondaryButton, { marginTop: 8 }]}
+                style={[styles.primaryButton, {
+                  marginTop: 12,
+                  backgroundColor: '#0f766e',
+                  opacity: (stripeAccountLoading || userRole !== 'principal' || !isLoaded) ? 0.55 : 1,
+                }]}
                 onPress={openStripeAccountSettings}
-                disabled={stripeAccountLoading || userRole !== 'principal' || !isLoaded || !stripeCountryConfirmed ||
-                  stripeCountryConfirmed !== normalizeConnectCountry(issuer.country)}
+                disabled={stripeAccountLoading || userRole !== 'principal' || !isLoaded}
                 accessibilityRole="button"
                 accessibilityLabel={tr('connect.continue')}
               >
-                <Text style={styles.secondaryButtonText}>{stripeAccountLoading ? tr('common.checking') : tr('connect.continue')}
+                <Text style={styles.primaryButtonText}>
+                  {stripeAccountLoading ? tr('common.checking') : tr('connect.continue')}
                 </Text>
               </Pressable>
               {stripeMethodsInfo ? (

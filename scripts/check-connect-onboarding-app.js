@@ -108,12 +108,19 @@ async function run() {
   };
   await captured.openStripeAccountSettings();
   equal(JSON.parse(captured.requests[1].options.body), { country: 'DE' });
-  for (const overrides of [{ stripeCountryConfirmed: null }, { issuer: { country: 'US' } },
-    { issuer: { country: 'DE' }, stripeCountryConfirmed: 'ES' }]) {
+  for (const overrides of [{ issuer: { country: 'US' } }, { issuer: { country: 'GB' } }]) {
     const context = contextFor(overrides);
+    context.openStripeCountrySelector = () => { context.countrySelectorOpened = true; };
     await context.openStripeAccountSettings();
     equal(context.requests, []);
     equal(context.stripeMethodsError, 'connect.chooseCountry');
+    equal(context.countrySelectorOpened, true);
+  }
+  {
+    const context = contextFor({ stripeCountryConfirmed: null, issuer: { country: 'ES' } });
+    await context.openStripeAccountSettings();
+    equal(context.requests.length >= 1, true);
+    equal(context.stripeCountryConfirmed, 'ES');
   }
   for (const [code, key] of [['connect_country_requires_supported_onboarding', 'connect.countryRequiresSupport'],
     ['connect_country_not_approved', 'connect.countryNotApproved'], ['connect_country_mismatch', 'connect.countryMismatch'],
@@ -323,9 +330,9 @@ async function run() {
   const disabled = button.openingElement.attributes.properties.find(attr => attr.name?.getText(ast) === 'disabled').initializer.expression;
   for (const [loading, role, loaded, expected] of [[false, 'principal', true, false], [true, 'principal', true, true],
     [false, 'empleado', true, true], [false, 'principal', false, true]]) {
-    equal(vm.runInNewContext(disabled.getText(ast), { stripeAccountLoading: loading, userRole: role, isLoaded: loaded,
-      stripeCountryConfirmed: 'ES', issuer: { country: 'ES' }, normalizeConnectCountry: helper.normalizeConnectCountry }), expected);
+    equal(vm.runInNewContext(disabled.getText(ast), { stripeAccountLoading: loading, userRole: role, isLoaded: loaded }), expected);
   }
+  equal(disabled.getText(ast).includes('stripeCountryConfirmed'), false);
   equal(source.includes('/api/stripe/account'), false);
   equal(declaration('openStripeAccountSettings').initializer.getText(ast).includes('Linking.'), false);
   equal(declaration('openStripeAccountSettings').initializer.getText(ast).includes('dashboard.stripe.com'), false);
