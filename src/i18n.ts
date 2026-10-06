@@ -4,6 +4,14 @@
 // - Español como idioma de respaldo: toda clave no traducida devuelve el texto en español.
 // Idiomas incluidos: español, inglés, francés, alemán, italiano, portugués, neerlandés y polaco.
 
+import { authTranslations } from './translations/auth';
+import { connectTranslations } from './translations/connect';
+import { emailedReportsTranslations } from './translations/emailed-reports';
+import { imageShareTranslations } from './translations/image-share';
+import { logoTranslations } from './translations/logo';
+import { settingsReportsTranslations } from './translations/settings-reports';
+import { workflowTranslations } from './translations/workflows';
+
 export type AppLocale = 'es' | 'en' | 'fr' | 'de' | 'it' | 'pt' | 'nl' | 'pl';
 
 export const APP_LOCALES: { code: AppLocale; label: string; countries: string }[] = [
@@ -131,7 +139,7 @@ const es: Dict = {
   'lang.subtitle': 'Al instalarse, la app elige el idioma del país del móvil. Puedes cambiarlo aquí cuando quieras.',
   'lang.saved': 'Idioma guardado.',
   'stripe.accountButton': 'CONFIGURAR DÓNDE RECIBIR LOS COBROS',
-    'stripe.cardTitle': 'CONFIGURAR TARJETA',
+    'stripe.cardTitle': 'CUENTA DE COBROS',
   'stripe.accountLoading': 'Abriendo Stripe...',
   'sync.title': 'SINCRONIZAR HISTORIAL',
   'sync.subtitle': 'Si borras los datos de la app, estrenas móvil o se avería, recupera aquí tus tickets, facturas y gastos guardados en la nube.',
@@ -206,7 +214,7 @@ const en: Dict = {
   'lang.subtitle': 'On install, the app picks the language of the phone country. You can change it here at any time.',
   'lang.saved': 'Language saved.',
   'stripe.accountButton': 'SET UP WHERE TO RECEIVE PAYOUTS',
-    'stripe.cardTitle': 'SET UP CARD',
+    'stripe.cardTitle': 'PAYOUT ACCOUNT',
   'stripe.accountLoading': 'Opening Stripe...',
   'sync.title': 'SYNC HISTORY',
   'sync.subtitle': 'If you clear the app data, get a new phone or it breaks, recover your tickets, invoices and expenses stored in the cloud here.',
@@ -250,7 +258,7 @@ const fr: Dict = {
   'lang.subtitle': 'À l’installation, l’app choisit la langue du pays du téléphone. Vous pouvez la changer ici à tout moment.',
   'lang.saved': 'Langue enregistrée.',
   'stripe.accountButton': 'CONFIGURER OÙ RECEVOIR LES ENCAISSEMENTS',
-    'stripe.cardTitle': 'CONFIGURER LA CARTE',
+    'stripe.cardTitle': 'COMPTE D’ENCAISSEMENT',
   'stripe.accountLoading': 'Ouverture de Stripe...',
   'sync.title': 'SYNCHRONISER L’HISTORIQUE',
   'sync.subtitle': 'Si vous effacez les données, changez de téléphone ou s’il tombe en panne, récupérez ici vos tickets, factures et dépenses sauvegardés dans le cloud.',
@@ -325,7 +333,7 @@ const de: Dict = {
   'lang.subtitle': 'Bei der Installation wählt die App die Sprache des Landes des Telefons. Sie können sie hier jederzeit ändern.',
   'lang.saved': 'Sprache gespeichert.',
   'stripe.accountButton': 'FESTLEGEN, WO AUSZAHLUNGEN ANKOMMEN',
-    'stripe.cardTitle': 'KARTE EINRICHTEN',
+    'stripe.cardTitle': 'AUSZAHLUNGSKONTO',
   'stripe.accountLoading': 'Stripe wird geöffnet...',
   'sync.title': 'VERLAUF SYNCHRONISIEREN',
   'sync.subtitle': 'Wenn Sie App-Daten löschen, ein neues Handy bekommen oder es defekt ist, holen Sie hier Ihre in der Cloud gespeicherten Belege, Rechnungen und Ausgaben zurück.',
@@ -400,7 +408,7 @@ const it: Dict = {
   'lang.subtitle': 'All’installazione, l’app sceglie la lingua del paese del telefono. Puoi cambiarla qui quando vuoi.',
   'lang.saved': 'Lingua salvata.',
   'stripe.accountButton': 'CONFIGURA DOVE RICEVERE GLI INCASSI',
-    'stripe.cardTitle': 'CONFIGURA LA CARTA',
+    'stripe.cardTitle': 'CONTO PER GLI INCASSI',
   'stripe.accountLoading': 'Apertura di Stripe...',
   'sync.title': 'SINCRONIZZA STORICO',
   'sync.subtitle': 'Se cancelli i dati dell’app, cambi telefono o si guasta, qui recuperi ticket, fatture e spese salvati nel cloud.',
@@ -475,7 +483,7 @@ const pt: Dict = {
   'lang.subtitle': 'Ao instalar, a app escolhe o idioma do país do telemóvel. Pode mudá-lo aqui quando quiser.',
   'lang.saved': 'Idioma guardado.',
   'stripe.accountButton': 'CONFIGURAR ONDE RECEBER AS COBRANÇAS',
-    'stripe.cardTitle': 'CONFIGURAR O CARTÃO',
+    'stripe.cardTitle': 'CONTA DE RECEBIMENTOS',
   'stripe.accountLoading': 'A abrir o Stripe...',
   'sync.title': 'SINCRONIZAR HISTÓRICO',
   'sync.subtitle': 'Se apagar os dados da app, estrear um telemóvel novo ou ele avariar, recupere aqui os seus tickets, faturas e despesas guardados na nuvem.',
@@ -550,7 +558,7 @@ const nl: Dict = {
   'lang.subtitle': 'Bij installatie kiest de app de taal van het land van de telefoon. Je kunt die hier altijd wijzigen.',
   'lang.saved': 'Taal opgeslagen.',
   'stripe.accountButton': 'INSTELLEN WAAR JE UITBETALINGEN ONTVANGT',
-    'stripe.cardTitle': 'KAART INSTELLEN',
+    'stripe.cardTitle': 'UITBETALINGSREKENING',
   'stripe.accountLoading': 'Stripe openen...',
   'sync.title': 'HISTORIEK SYNCHRONISEREN',
   'sync.subtitle': 'Als je de app-gegevens wist, een nieuwe telefoon krijgt of die stuk gaat, haal je hier je bonnen, facturen en uitgaven uit de cloud terug.',
@@ -625,7 +633,7 @@ const pl: Dict = {
   'lang.subtitle': 'Po instalacji aplikacja wybiera język kraju telefonu. Możesz go zmienić tutaj w każdej chwili.',
   'lang.saved': 'Zapisano język.',
   'stripe.accountButton': 'USTAW, GDZIE OTRZYMUJESZ WYPŁATY',
-    'stripe.cardTitle': 'SKONFIGURUJ KARTĘ',
+    'stripe.cardTitle': 'KONTO DO WYPŁAT',
   'stripe.accountLoading': 'Otwieranie Stripe...',
   'sync.title': 'SYNCHRONIZUJ HISTORIĘ',
   'sync.subtitle': 'Jeśli skasujesz dane aplikacji, kupisz nowy telefon albo się zepsuje, tutaj odzyskasz paragony, faktury i wydatki zapisane w chmurze.',
@@ -671,7 +679,8 @@ const ALL: Record<AppLocale, Dict> = { es, en, fr, de, it, pt, nl, pl };
 
 // Devuelve el texto traducido; si falta la clave, usa el español.
 export const t = (locale: AppLocale, key: string): string =>
-  ALL[locale]?.[key] ?? es[key] ?? key;
+  connectTranslations[locale]?.[key] ?? authTranslations[locale]?.[key] ?? imageShareTranslations[locale]?.[key] ?? logoTranslations[locale]?.[key] ?? emailedReportsTranslations[locale]?.[key] ?? workflowTranslations[locale]?.[key] ?? settingsReportsTranslations[locale]?.[key] ?? ALL[locale]?.[key]
+  ?? connectTranslations.es[key] ?? authTranslations.es[key] ?? imageShareTranslations.es[key] ?? logoTranslations.es[key] ?? emailedReportsTranslations.es[key] ?? workflowTranslations.es[key] ?? settingsReportsTranslations.es[key] ?? es[key] ?? key;
 
 export const detectDeviceLocale = (region: string | null | undefined, tag: string | null | undefined): AppLocale =>
   localeForRegion(region) ?? localeForLanguageTag(tag) ?? 'es';

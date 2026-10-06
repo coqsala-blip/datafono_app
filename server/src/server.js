@@ -1,9 +1,10 @@
-require('dotenv').config();
+if (process.env.CONNECT_TEST_ENV_ISOLATED !== 'true') require('dotenv').config();
 const express = require('express');
 const crypto = require('crypto');
 const QRCode = require('qrcode');
 const Stripe = require('stripe');
 const { createClient } = require('@supabase/supabase-js');
+const createStripeConnect = require('./stripe-connect');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -114,17 +115,23 @@ const filterAvailablePaymentMethods = async (paymentMethodTypes) => {
 // Crea la sesión de Checkout. Primero se filtran los métodos no disponibles según la cuenta; si aun
 // así Stripe rechaza un método local, se retira y se reintenta (con límite y garantizando progreso)
 // para que el cobro nunca se rompa. Avisando por log.
-const createCheckoutSessionWithLocalMethodsFallback = async (params, requestedPaymentMethodTypes) => {
-  const stripeClient = requireStripe();
-  let currentTypes = await filterAvailablePaymentMethods(
-    Array.isArray(requestedPaymentMethodTypes) ? [...requestedPaymentMethodTypes] : requestedPaymentMethodTypes,
-  );
+// options.stripeAccount: cobro directo en cuenta Connect (Stripe-Account). No usa la PMC de plataforma.
+const createCheckoutSessionWithLocalMethodsFallback = async (params, requestedPaymentMethodTypes, options = {}) => {
+  const stripeClient = options.stripeClient || requireStripe();
+  const requestOptions = options.stripeAccount ? { stripeAccount: options.stripeAccount } : {};
+  // En cobros directos Stripe resuelve los métodos de la cuenta conectada; no prefiltrar con la plataforma.
+  let currentTypes = options.stripeAccount
+    ? (Array.isArray(requestedPaymentMethodTypes) ? [...requestedPaymentMethodTypes] : requestedPaymentMethodTypes)
+    : await filterAvailablePaymentMethods(
+      Array.isArray(requestedPaymentMethodTypes) ? [...requestedPaymentMethodTypes] : requestedPaymentMethodTypes,
+    );
   let removalsLeft = EUR_LOCAL_PAYMENT_METHODS.length;
 
   for (;;) {
     try {
       const session = await stripeClient.checkout.sessions.create(
         Array.isArray(currentTypes) ? { ...params, payment_method_types: currentTypes } : params,
+        requestOptions,
       );
       // Con métodos dinámicos (currentTypes null) se devuelve la lista que Stripe resuelve para la
       // sesión, para poder mostrar al vendedor qué métodos ofrecerá este cobro concreto.
@@ -611,6 +618,35 @@ const requireAuth = (req, res, next) => requireVerifiedToken(req, res, () => {
   }
   return next();
 });
+
+const stripeConnect = createStripeConnect({ env: process.env, fetchAuthoritativeUser, updateUserAppMetadata, withAccountLock });
+app.get('/api/stripe/connect/status', requireAuth, stripeConnect.status);
+app.post('/api/stripe/connect/onboarding', requireAuth, stripeConnect.onboarding);
+app.get('/api/stripe/connect/return', stripeConnect.return);
+app.get('/api/stripe/connect/refresh', stripeConnect.refresh);
+
+const connectChargeError = (error) => {
+  if (!error?.status || !/^connect_[a-z_]+$/.test(error.code || '')) return null;
+  const messages = {
+    connect_not_connected: 'Completa el alta de Stripe Connect antes de cobrar.',
+    connect_charges_not_enabled: 'Tu cuenta Connect aún no puede cobrar. Completa la verificación en Stripe.',
+    connect_test_disabled: 'Stripe Connect test no está habilitado.',
+    connect_test_key_invalid: 'Stripe Connect test no está configurado correctamente.',
+    connect_state_secret_missing: 'Stripe Connect test no está configurado correctamente.',
+    connect_public_origin_invalid: 'Stripe Connect test no está configurado correctamente.',
+    connect_country_config_invalid: 'Stripe Connect test no está configurado correctamente.',
+    connect_session_invalid: 'La sesión no es válida o ha caducado.',
+    connect_principal_required: 'No tienes permiso para operar con la cuenta Connect de la empresa.',
+    connect_company_invalid: 'No se pudo resolver la empresa de la cuenta Connect.',
+    connect_account_binding_invalid: 'La cuenta Connect vinculada no es válida.',
+    connect_country_mismatch: 'El país de la cuenta Connect no coincide.',
+    connect_terminal_location_invalid: 'No se pudo preparar la ubicación de Stripe Terminal para la cuenta Connect.',
+  };
+  return {
+    status: error.status,
+    body: { ok: false, code: error.code, error: messages[error.code] || 'Stripe Connect no disponible para esta solicitud.' },
+  };
+};
 
 app.get('/api/billing/status', requireAuth, async (req, res) => {
   let accountOwner = req.user;
@@ -1157,9 +1193,27 @@ app.post('/api/auth/logout', requireVerifiedToken, async (req, res) => {
 });
 
 app.post('/api/stripe/terminal/connection-token', requireAuth, async (req, res) => {
+  let connected = null;
   try {
-    const token = await requireStripe().terminal.connectionTokens.create();
-    return res.status(201).json({ ok: true, secret: token.secret });
+    connected = await stripeConnect.resolveTerminalContext(req);
+  } catch (error) {
+    const mapped = connectChargeError(error);
+    if (mapped) return res.status(mapped.status).json(mapped.body);
+    console.error('Error resolviendo cuenta Connect para Terminal:', error.message);
+    return res.status(502).json({ ok: false, code: 'connect_upstream_unavailable', error: 'No se pudo preparar Stripe Terminal Connect.' });
+  }
+
+  try {
+    const stripeClient = connected?.stripe || requireStripe();
+    const requestOptions = connected ? { stripeAccount: connected.accountId } : {};
+    const token = await stripeClient.terminal.connectionTokens.create({}, requestOptions);
+    return res.status(201).json({
+      ok: true,
+      secret: token.secret,
+      accountId: connected?.accountId || null,
+      locationId: connected?.locationId || null,
+      chargeMode: connected ? 'direct' : 'platform',
+    });
   } catch (error) {
     console.error('Error creando token Stripe Terminal:', error.message);
     return res.status(502).json({ ok: false, error: `Stripe Terminal: ${error.message}` });
@@ -1177,19 +1231,43 @@ app.post('/api/stripe/payment-intent', requireAuth, async (req, res) => {
     return res.status(400).json({ ok: false, error: 'Importe no válido. Usa al menos 0,50 €.' });
   }
 
+  let connected = null;
   try {
-    const paymentIntent = await requireStripe().paymentIntents.create({
+    connected = await stripeConnect.resolveTerminalContext(req);
+  } catch (error) {
+    const mapped = connectChargeError(error);
+    if (mapped) return res.status(mapped.status).json(mapped.body);
+    console.error('Error resolviendo cuenta Connect para PaymentIntent:', error.message);
+    return res.status(502).json({ ok: false, code: 'connect_upstream_unavailable', error: 'No se pudo preparar el cobro Terminal Connect.' });
+  }
+
+  try {
+    const ownerId = connected?.ownerId || req.user.app_metadata?.company_owner_id || req.user.id;
+    const stripeClient = connected?.stripe || requireStripe();
+    const requestOptions = connected ? { stripeAccount: connected.accountId } : {};
+    const paymentIntent = await stripeClient.paymentIntents.create({
       amount,
       currency: stripeCurrency,
       payment_method_types: ['card_present'],
       capture_method: 'automatic',
       metadata: {
-        supabase_user_id: req.user.app_metadata?.company_owner_id || req.user.id,
+        supabase_user_id: ownerId,
         operator_user_id: req.user.id,
         order_id: orderId,
+        ...(connected ? {
+          stripe_connect_account_id: connected.accountId,
+          charge_mode: 'direct',
+        } : { charge_mode: 'platform' }),
       },
+    }, requestOptions);
+    return res.status(201).json({
+      ok: true,
+      paymentIntentId: paymentIntent.id,
+      clientSecret: paymentIntent.client_secret,
+      accountId: connected?.accountId || null,
+      locationId: connected?.locationId || null,
+      chargeMode: connected ? 'direct' : 'platform',
     });
-    return res.status(201).json({ ok: true, paymentIntentId: paymentIntent.id, clientSecret: paymentIntent.client_secret });
   } catch (error) {
     console.error('Error creando PaymentIntent Stripe Terminal:', error.message);
     return res.status(502).json({ ok: false, error: `Stripe Terminal: ${error.message}` });
@@ -1210,9 +1288,21 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
     return res.status(400).json({ ok: false, error: 'Falta el identificador de la operación.' });
   }
 
+  let connected = null;
+  try {
+    // Connect activo: cobro directo en la cuenta del comercio. Sin fallback a la plataforma.
+    connected = await stripeConnect.resolveConnectedAccount(req, { requireCharges: true });
+  } catch (error) {
+    const mapped = connectChargeError(error);
+    if (mapped) return res.status(mapped.status).json(mapped.body);
+    console.error('Error resolviendo cuenta Connect para cobro:', error.message);
+    return res.status(502).json({ ok: false, code: 'connect_upstream_unavailable', error: 'No se pudo preparar el cobro Connect.' });
+  }
+
   try {
     // Métodos dinámicos (Bizum incluido): no se pasa payment_method_types salvo que se configure
     // una lista explícita en STRIPE_PAYMENT_METHOD_TYPES.
+    const ownerId = connected?.ownerId || req.user.app_metadata?.company_owner_id || req.user.id;
     const requestedPaymentMethodTypes = resolveCheckoutPaymentMethodTypes(amount);
     const checkoutSessionParams = {
       mode: 'payment',
@@ -1230,15 +1320,23 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
         },
       ],
       metadata: {
-        supabase_user_id: req.user.app_metadata?.company_owner_id || req.user.id,
+        supabase_user_id: ownerId,
         operator_user_id: req.user.id,
         order_id: orderId,
+        ...(connected ? {
+          stripe_connect_account_id: connected.accountId,
+          charge_mode: 'direct',
+        } : { charge_mode: 'platform' }),
       },
       payment_intent_data: {
         metadata: {
-          supabase_user_id: req.user.app_metadata?.company_owner_id || req.user.id,
+          supabase_user_id: ownerId,
           operator_user_id: req.user.id,
           order_id: orderId,
+          ...(connected ? {
+            stripe_connect_account_id: connected.accountId,
+            charge_mode: 'direct',
+          } : { charge_mode: 'platform' }),
         },
       },
       success_url: `${PUBLIC_API_URL}/stripe/complete?session_id={CHECKOUT_SESSION_ID}`,
@@ -1247,6 +1345,7 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
     const { session, paymentMethodTypes } = await createCheckoutSessionWithLocalMethodsFallback(
       checkoutSessionParams,
       requestedPaymentMethodTypes,
+      connected ? { stripeClient: connected.stripe, stripeAccount: connected.accountId } : {},
     );
 
     const redirectUrl = session.url;
@@ -1262,6 +1361,11 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
       qrDataUrl,
       paymentMethods: paymentMethodTypes || 'auto',
       amount,
+      accountId: connected?.accountId || null,
+      chargeMode: connected ? 'direct' : 'platform',
+      paymentIntentId: typeof session.payment_intent === 'string'
+        ? session.payment_intent
+        : (session.payment_intent?.id || null),
     });
   } catch (error) {
     console.error('Error creando pago Stripe:', error.message);
@@ -1273,13 +1377,38 @@ app.get('/api/stripe/payment/:paymentId', requireAuth, async (req, res) => {
   try {
     // Se expande payment_intent + payment_method para detectar rechazos (p. ej. Bizum
     // declinado por el banco) y saber con qué método pagó el cliente.
-    const session = await requireStripe().checkout.sessions.retrieve(req.params.paymentId, {
+    let connected = null;
+    try {
+      // Sin exigir chargesEnabled: se puede consultar un cobro ya creado aunque falten requisitos.
+      connected = await stripeConnect.resolveConnectedAccount(req, { requireCharges: false });
+    } catch (error) {
+      if (error?.code === 'connect_not_connected') {
+        connected = null;
+      } else {
+        const mapped = connectChargeError(error);
+        if (mapped) return res.status(mapped.status).json(mapped.body);
+        console.error('Error resolviendo cuenta Connect para consulta:', error.message);
+        return res.status(502).json({ ok: false, error: 'No se pudo consultar el estado del pago Stripe.' });
+      }
+    }
+
+    const retrieveOptions = {
       expand: ['payment_intent.payment_method', 'payment_intent.last_payment_error.payment_method'],
-    });
-    const ownerId = req.user.app_metadata?.company_owner_id || req.user.id;
+    };
+    const session = connected
+      ? await connected.stripe.checkout.sessions.retrieve(req.params.paymentId, retrieveOptions, {
+        stripeAccount: connected.accountId,
+      })
+      : await requireStripe().checkout.sessions.retrieve(req.params.paymentId, retrieveOptions);
+    const ownerId = connected?.ownerId || req.user.app_metadata?.company_owner_id || req.user.id;
     const paymentUserId = session.metadata?.supabase_user_id;
     const paymentUser = paymentUserId && paymentUserId !== ownerId ? await fetchAuthoritativeUser(paymentUserId) : null;
     if (paymentUserId !== ownerId && paymentUser?.app_metadata?.company_owner_id !== ownerId) {
+      return res.status(403).json({ ok: false, error: 'Este pago no pertenece a tu empresa.' });
+    }
+    // Cobro directo: la cuenta de la sesión debe coincidir con la vinculada al comercio.
+    if (connected && session.metadata?.stripe_connect_account_id
+      && session.metadata.stripe_connect_account_id !== connected.accountId) {
       return res.status(403).json({ ok: false, error: 'Este pago no pertenece a tu empresa.' });
     }
     return res.json({
@@ -1291,6 +1420,11 @@ app.get('/api/stripe/payment/:paymentId', requireAuth, async (req, res) => {
       usedMethod: resolveOnlinePaymentUsedMethod(session),
       amount: session.amount_total,
       currency: session.currency,
+      accountId: connected?.accountId || session.metadata?.stripe_connect_account_id || null,
+      chargeMode: session.metadata?.charge_mode || (connected ? 'direct' : 'platform'),
+      paymentIntentId: typeof session.payment_intent === 'string'
+        ? session.payment_intent
+        : (session.payment_intent?.id || null),
     });
   } catch (error) {
     console.error('Error consultando pago Stripe:', error.message);
@@ -2038,6 +2172,48 @@ const refundMoneyCents = (amount) => {
   return Number.isSafeInteger(cents) && Math.abs(amount * 100 - cents) < 0.000001 ? cents : null;
 };
 
+const validStripePaymentIntentId = (value) => typeof value === 'string' && /^pi_[A-Za-z0-9]+$/.test(value);
+const validStripeAccountId = (value) => typeof value === 'string' && /^acct_[A-Za-z0-9]+$/.test(value);
+
+// Reembolso de dinero en Stripe cuando el ticket guarda un PaymentIntent. Sin PI: solo documental.
+const createStripeMoneyRefund = async (document, requestedCents, historyLength) => {
+  if (!validStripePaymentIntentId(document.stripePaymentIntentId)) {
+    return { stripeRefundId: null, stripeRefundStatus: null };
+  }
+  const direct = document.chargeMode === 'direct' && validStripeAccountId(document.stripeAccountId);
+  let stripeClient;
+  let requestOptions = {};
+  if (direct) {
+    // Misma clave Connect que creó el cobro directo.
+    const connected = process.env.STRIPE_CONNECT_TEST_ENABLED === 'true'
+      && /^sk_test_[A-Za-z0-9]+$/.test(process.env.STRIPE_CONNECT_TEST_SECRET_KEY || '')
+      ? require('stripe')(process.env.STRIPE_CONNECT_TEST_SECRET_KEY)
+      : null;
+    if (!connected) throw Object.assign(new Error('connect_refund_client_unavailable'), { status: 503, code: 'connect_refund_client_unavailable' });
+    stripeClient = connected;
+    requestOptions = { stripeAccount: document.stripeAccountId };
+  } else {
+    stripeClient = requireStripe();
+  }
+  const refund = await stripeClient.refunds.create({
+    payment_intent: document.stripePaymentIntentId,
+    amount: requestedCents,
+    reason: 'requested_by_customer',
+    metadata: {
+      document_id: String(document.id || ''),
+      ticket_code: String(document.ticketCode || ''),
+      charge_mode: String(document.chargeMode || 'platform'),
+    },
+  }, {
+    ...requestOptions,
+    idempotencyKey: `doc-refund-${document.id}-${historyLength}-${requestedCents}`,
+  });
+  return {
+    stripeRefundId: typeof refund?.id === 'string' ? refund.id : null,
+    stripeRefundStatus: typeof refund?.status === 'string' ? refund.status : null,
+  };
+};
+
 app.post('/api/documents/refund', requireAuth, async (req, res) => {
   try {
     const { documentId, amount, pin } = req.body || {};
@@ -2084,13 +2260,37 @@ app.post('/api/documents/refund', requireAuth, async (req, res) => {
       if (document.isRefunded || balanceCents <= 0 || requestedCents > balanceCents) {
         return res.status(409).json({ ok: false, error: 'El importe supera el saldo disponible.' });
       }
+
+      let moneyRefund = { stripeRefundId: null, stripeRefundStatus: null };
+      try {
+        moneyRefund = await createStripeMoneyRefund(document, requestedCents, history.length);
+      } catch (stripeError) {
+        if (stripeError?.code === 'connect_refund_client_unavailable') {
+          return res.status(503).json({ ok: false, code: stripeError.code, error: 'No se pudo conectar con Stripe Connect para reembolsar.' });
+        }
+        console.error('Error reembolsando en Stripe:', stripeError.message);
+        return res.status(502).json({
+          ok: false,
+          code: 'stripe_refund_failed',
+          error: 'Stripe no pudo reembolsar el cobro. No se ha modificado el ticket.',
+        });
+      }
+
       const remaining = (balanceCents - requestedCents) / 100;
       const subtotal = remaining / (1 + rate / 100);
+      const historyEntry = {
+        amount: requestedCents / 100,
+        date: new Date().toISOString(),
+        ...(moneyRefund.stripeRefundId ? {
+          stripeRefundId: moneyRefund.stripeRefundId,
+          stripeRefundStatus: moneyRefund.stripeRefundStatus,
+        } : {}),
+      };
       const updated = {
         ...document, documentType: 'COMPRA/DEVOLUCIONES', amount: remaining,
         originalAmount: originalCents / 100, subtotal, iva: remaining - subtotal,
         isRefunded: remaining === 0,
-        refundHistory: [...history, { amount: requestedCents / 100, date: new Date().toISOString() }],
+        refundHistory: [...history, historyEntry],
       };
       delete updated.publicUrl;
       const token = crypto.randomBytes(24).toString('hex');
@@ -2099,7 +2299,14 @@ app.post('/api/documents/refund', requireAuth, async (req, res) => {
         amount: updated.amount, original_amount: updated.originalAmount,
         document_data: updated, public_token: token,
       });
-      if (insertError) return res.status(500).json({ ok: false, error: 'No se pudo guardar la devolucion.' });
+      if (insertError) {
+        console.error('Devolución Stripe OK pero fallo al guardar documento:', insertError.message, moneyRefund.stripeRefundId);
+        return res.status(500).json({
+          ok: false,
+          error: 'El reembolso de Stripe se emitió pero no se pudo guardar el ticket. Contacta soporte.',
+          stripeRefundId: moneyRefund.stripeRefundId,
+        });
+      }
       return res.json({ ok: true, document: { ...updated, publicUrl: `${PUBLIC_API_URL}/documents/${token}` } });
     });
   } catch {
@@ -2114,7 +2321,11 @@ const isRefundDocument = (document) => (
 );
 
 app.post('/api/documents', requireAuth, async (req, res) => {
-  const { id, ticketCode, documentType, amount, originalAmount, relatedTicketCode, refundHistory, isRefunded, createdAt, issuer, client, items, subtotal, iva, ivaRateApplied, type } = req.body;
+  const {
+    id, ticketCode, documentType, amount, originalAmount, relatedTicketCode, refundHistory, isRefunded,
+    createdAt, issuer, client, items, subtotal, iva, ivaRateApplied, type,
+    stripePaymentIntentId, stripeAccountId, chargeMode, stripeCheckoutSessionId,
+  } = req.body;
 
   if (req.user.app_metadata?.role === 'empleado' && isRefundDocument(req.body)) {
     return res.status(403).json({ ok: false, error: 'Las devoluciones requieren el endpoint autorizado de devolucion.' });
@@ -2142,6 +2353,11 @@ app.post('/api/documents', requireAuth, async (req, res) => {
     iva,
     ivaRateApplied,
     type,
+    ...(validStripePaymentIntentId(stripePaymentIntentId) ? { stripePaymentIntentId } : {}),
+    ...(validStripeAccountId(stripeAccountId) ? { stripeAccountId } : {}),
+    ...(chargeMode === 'direct' || chargeMode === 'platform' ? { chargeMode } : {}),
+    ...(typeof stripeCheckoutSessionId === 'string' && /^cs_[A-Za-z0-9_]+$/.test(stripeCheckoutSessionId)
+      ? { stripeCheckoutSessionId } : {}),
   };
 
   const ownerId = req.user.app_metadata?.company_owner_id || req.user.id;

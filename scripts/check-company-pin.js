@@ -92,7 +92,10 @@ const loadServer = () => {
     static now() { return state.now; }
   }
   vm.runInNewContext(fs.readFileSync(path.join(root, 'server/src/server.js'), 'utf8'), {
-    require(name) { assert.ok(name in modules, `Unexpected module: ${name}`); return modules[name]; },
+    require(name) {
+      if (name === './stripe-connect') return require('../server/src/stripe-connect');
+      assert.ok(name in modules, `Unexpected module: ${name}`); return modules[name];
+    },
     process: { env: { PUBLIC_API_URL: 'http://localhost:4000', NODE_ENV: 'test', SUPABASE_URL: 'http://supabase.test', SUPABASE_SECRET_KEY: 'test' } },
     console: Object.fromEntries(['log', 'warn', 'error', 'info'].map((method) => [method, (...args) => state.logs.push(args)])),
     Buffer, URL, Date: Clock, setTimeout, clearTimeout, setImmediate,
@@ -140,6 +143,17 @@ const main = async () => {
   equal((await legacy.call('POST', '/api/documents/refund', { userId: 'employee-a', body: { documentId: 'sale', amount: 10, pin: '1234' } })).body.document.amount, 90, 'Legacy company employee refund authorized');
   equal((await legacy.call('POST', '/api/company/pin', { userId: 'employee-a', body: { pin: '5678' } })).statusCode, 403, 'Legacy principal does not grant employee PIN setup');
   equal((await legacy.call('POST', '/api/documents/refund', { userId: 'owner-a', body: { documentId: 'sale', amount: 10 } })).statusCode, 200, 'Legacy principal can refund without employee PIN');
+  const mixedRefunds = loadServer();
+  await mixedRefunds.call('POST', '/api/company/pin', { userId: 'owner-a', body: { pin: '1234' } });
+  await mixedRefunds.call('POST', '/api/documents', { userId: 'owner-a', body: document });
+  const principalPartial = await mixedRefunds.call('POST', '/api/documents/refund', { userId: 'owner-a', body: { documentId: 'sale', amount: 30 } });
+  equal(principalPartial.body.document.amount, 70, 'First partial refund from principal');
+  equal((await mixedRefunds.call('POST', '/api/documents/refund', { userId: 'employee-a', body: { documentId: 'sale', amount: 71, pin: '1234' } })).statusCode, 409, 'Employee cannot exceed balance after principal refund');
+  const employeePartial = await mixedRefunds.call('POST', '/api/documents/refund', { userId: 'employee-a', body: { documentId: 'sale', amount: 20, pin: '1234' } });
+  equal(employeePartial.statusCode, 200, 'Employee can make second refund after principal');
+  equal(employeePartial.body.document.amount, 50, 'Second refund uses authoritative remaining balance');
+  equal(employeePartial.body.document.originalAmount, 100, 'Mixed refunds keep original sale amount');
+  equal(employeePartial.body.document.refundHistory.map(entry => entry.amount), [30, 20], 'Mixed refunds retain both history entries');
   equal((await call('POST', '/api/documents', { userId: 'employee-a', body: document })).statusCode, 201, 'Employee can publish a charge');
   for (const fields of [
     { type: 'DEVOLUCION' }, { type: 'DEVOLUCIÓN' }, { documentType: 'COMPRA/DEVOLUCIONES' },

@@ -18,6 +18,114 @@ cp .env.example .env
 npm run dev
 ```
 
+### Stripe Connect: primera fase, solo onboarding en test
+
+Pruebas en este ordenador: plantilla sin secretos en `server/connect-test.env.example`.
+El archivo local a completar es `server/.env.connect.test` (ignorado por Git).
+Debe usar otro proyecto Supabase con usuarios y datos ficticios, una clave `sk_test_`
+del sandbox elegido y un secreto de estado aleatorio de al menos 32 bytes.
+`PUBLIC_API_URL` debe ser el origen HTTPS de un tunel hacia el puerto local 4100.
+No introducir claves en el chat ni reutilizar usuarios, claves o datos de produccion.
+`CONNECT_TEST_ISOLATED_DATA=true` confirma que se ha preparado esa base independiente.
+Desde la raiz: `node scripts/run-connect-test.js`. El lanzador bloquea la base actual,
+omite el `.env` habitual y las variables heredadas de la aplicacion, y deja vacias
+las claves de cobros y suscripciones existentes. No permite probar ventas en esta fase.
+La app de pruebas debera usar tambien Supabase independiente y este backend; el APK
+instalado no cambia de entorno por arrancar este servidor. No hay tunel ni servidor
+arrancado automaticamente. Validar con `node scripts/check-connect-test-environment.js`.
+
+Esta fase no modifica cobros, devoluciones, suscripciones, destino de fondos ni Dashboard.
+Usa Accounts v2 con Dashboard completo (`full`), comisiones y responsabilidad de saldos
+negativos gestionadas por Stripe (`fees_collector: stripe`, `losses_collector: stripe`),
+`customer: {}` y `merchant.capabilities.card_payments.requested: true`. No solicita payouts
+explicitamente. Usa la version API predeterminada del SDK instalado, sin forzar preview.
+
+Configurar exclusivamente en el entorno test del backend:
+
+- `STRIPE_CONNECT_TEST_ENABLED=true` (cualquier otro valor desactiva la fase).
+- `STRIPE_CONNECT_TEST_COUNTRIES`: lista separada por comas de codigos ISO UE27 en mayusculas,
+  revisados para esta plataforma. Por defecto `ES`; vacios, codigos ajenos o invalidos bloquean
+  la fase con `503 connect_country_config_invalid`. No habilitar paises sin revisar Stripe.
+- `STRIPE_CONNECT_TEST_SECRET_KEY`: clave separada con prefijo `sk_test_`; nunca usa `STRIPE_SECRET_KEY`.
+- `STRIPE_CONNECT_STATE_SECRET`: secreto aleatorio duradero de al menos 32 bytes, independiente
+   de las claves Stripe; mantenerlo entre reinicios e instancias, no imprimirlo ni registrarlo.
+- `PUBLIC_API_URL`: origen HTTPS canonico, sin ruta, query, fragmento ni credenciales.
+
+Sin habilitar, status devuelve `enabled:false` sin inicializar ni llamar a Stripe. Habilitado
+pero con configuracion ausente o invalida responde 503 con un `code` especifico y error generico.
+No hay cambios de variables ni claves de produccion como parte de esta implementacion.
+
+`GET /api/stripe/connect/status` exige `requireAuth`. Principal o empleado vinculado consulta
+la cuenta del principal. Respuesta exacta:
+
+```json
+{"ok":true,"enabled":true,"livemode":false,"connected":true,"accountId":"acct_...","chargesEnabled":false,"payoutsEnabled":false,"requirementsPending":true,"phase":"onboarding_only"}
+```
+
+Sin vinculacion, `connected:false`, `accountId:null` y los tres indicadores son `false`.
+Los indicadores de capacidades solo son `true` con status `active`; campos incompletos
+mantienen `requirementsPending:true`. No se devuelve metadata ni secretos.
+
+`POST /api/stripe/connect/onboarding` exige `requireAuth` y principal autoritativo, incluido
+principal legacy sin rol solo si no tiene enlace a otro propietario. Body: `{"country":"ES"}`.
+El pais es obligatorio, exactamente un codigo UE27 en mayusculas; ausente o invalido: 400.
+Catalogo seleccionable de la app: AT, BE, BG, HR, CY, CZ, DK, EE, FI, FR, DE, GR, HU,
+IE, IT, LV, LT, LU, MT, NL, PL, PT, RO, SK, SI, ES, SE. Catalogo no equivale a aprobacion:
+un pais fuera de `STRIPE_CONNECT_TEST_COUNTRIES` responde `503 connect_country_not_approved`.
+FR esta bloqueado incluso dentro de la lista: `503 connect_country_requires_supported_onboarding`,
+sin crear cuenta ni escribir metadata. Falta implementar y verificar un flujo adicional compatible
+con Stripe; no se simula ni omite `account_token`. Stripe documenta `account_token_required`
+para plataformas de paises obligatorios, como Francia: es una condicion de la plataforma,
+no una afirmacion de que todo comercio frances lo requiera. Este bloqueo FR es conservador.
+Si Stripe devuelve `account_token_required` para otro candidato, se traduce al mismo codigo
+de onboarding adicional, sin enlazar cuenta ni revelar detalles internos. El intento persistido
+se conserva para recuperacion segura; no se borra ni se reintenta con otro pais a ciegas.
+Referencia: https://docs.stripe.com/api/v2/core/accounts/create y
+https://docs.stripe.com/connect/account-tokens. Verificar tambien el pais de la plataforma,
+acceso v2, capacidades y permiso transfronterizo antes de ampliar aprobaciones.
+Un empleado no puede escribir. Identificadores, rol, email y nombre enviados en el body se
+ignoran; se utiliza el correo confirmado de Auth y `user_metadata.full_name` del principal.
+Respuesta 200: `{ok:true,livemode:false,phase:"onboarding_only",accountId,url,expiresAt}`;
+`url` es un enlace temporal de Stripe y `expiresAt` su fecha RFC3339. No registrar esa respuesta.
+
+La vinculacion duradera se guarda en `app_metadata.stripe_connect_test_account_id` y
+`stripe_connect_test_country`; el intento pendiente persiste tambien `country`.
+Cambiar pais con intento pendiente o cuenta vinculada responde 409 sin nuevas escrituras,
+cuentas ni enlaces. Los intentos y vinculaciones legacy sin pais se interpretan como ES,
+su unico pais original; nunca se reinterpretan como el pais nuevo solicitado.
+Stripe guarda `metadata.supabase_owner_id`; cada lectura exige coincidencia, `livemode:false`,
+Dashboard completo, ambas responsabilidades exactas y `identity.country` igual al pais esperado,
+solicitando `include: defaults` e `identity`. Una identidad ausente o distinta responde
+`409 connect_country_mismatch` sin mutar la vinculacion, tambien en los callbacks.
+Antes de crear se persiste `stripe_connect_test_creation` con token y parametros estables.
+Los reintentos recuperan la cuenta por metadata, incluso tras reiniciar o superar 24 horas.
+Si el resultado sigue incierto tras 23 horas, se bloquea otra creacion con
+`409 connect_creation_recovery_required`; resolver manualmente en test, nunca borrar el intento
+para reintentar a ciegas. El bloqueo existente del propietario solo cubre un proceso: no ejecutar
+esta fase en multiples instancias sin coordinacion compartida.
+
+`GET /api/stripe/connect/return?state=...` y `GET /api/stripe/connect/refresh?state=...`
+no reciben bearer ni accountId en la URL. Validan HMAC, caducidad de 30 minutos, nonce persistido,
+dueño principal, pais vinculado y sesion/dispositivo activos releidos de Auth. State invalido, caducado o
+revocado: 400. Return consume el nonce y redirige a
+`tpvapp://pago-completado?connect=return`: volver no demuestra que las capacidades esten activas.
+Refresh rota el nonce, valida otra vez la cuenta y redirige a un nuevo enlace HTTPS, limitado
+a `onboarding.stripe.com` o `connect.stripe.com`, sin usuario/password ni puerto alternativo.
+La app consulta status con autenticacion antes y despues del navegador. En Configuracion exige
+seleccionar explicitamente un pais en un modal UE27, lo guarda en `issuer.country` y captura
+el codigo normalizado para la solicitud. No asume confirmado ES por ser el valor inicial.
+La confirmacion y el modal se reinician al cambiar de cuenta; los errores de pais se traducen
+en ocho idiomas. Los nombres usan `Intl.DisplayNames` con fallback al codigo ISO en runtimes
+sin soporte. No cambia ventas en `eur`, comisiones ni suscripciones; monedas no EUR quedan
+para una fase futura independiente.
+Evitar registrar query strings de estas rutas en proxies o herramientas de observabilidad.
+
+Validacion local sin red ni cuentas reales: `node scripts/check-stripe-connect.js`.
+App: `node scripts/check-connect-onboarding-app.js`. Los dobles prueban contratos y parametros
+para 26 candidatos no FR, no cumplimiento normativo ni disponibilidad real en esos paises.
+La lista aprobada por defecto ES tampoco prueba aprobacion real de Stripe: hay que verificarla
+en el entorno autorizado. No se han usado claves, API real ni Dashboard para esta ampliacion.
+
 ### Endpoints principales
 
 - `GET /health`

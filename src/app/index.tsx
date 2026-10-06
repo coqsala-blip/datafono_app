@@ -1,3 +1,4 @@
+import { MaterialIcons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { requestNeededAndroidPermissions, useStripeTerminal } from '@stripe/stripe-terminal-react-native';
 import { Camera, CameraView } from 'expo-camera';
@@ -12,8 +13,10 @@ import * as WebBrowser from 'expo-web-browser';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
+  AppState,
   Image,
-  Linking,
+  Keyboard,
+  KeyboardAvoidingView,
   Modal,
   Platform,
   Pressable,
@@ -24,13 +27,19 @@ import {
   View
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { APP_LOCALES, APP_LOCALE_STORAGE_KEY, detectDeviceLocale, isAppLocale, t as translateKey, type AppLocale } from '../i18n';
+import { buildAuthRequestBody, classifySessionCheck, getOrCreateDeviceId, validateAuthForm, type AuthForm } from '../auth/auth-session';
+import { LogoSettings } from '../components/logo-settings';
+import { normalizeLogoSettings, renderIssuerBlock, type LogoOffset, type LogoPosition, type LogoSize } from '../documents/logo-layout';
+import { buildPdfFilename, buildReportPdfFilename, copyPdfForExport } from '../documents/pdf-export';
+import { APP_LOCALES, APP_LOCALE_STORAGE_KEY, detectDeviceLocale, formatCurrencyForLocale, isAppLocale, t as translateKey, type AppLocale } from '../i18n';
+import { CONNECT_EU_COUNTRIES, connectCountryLabel, connectErrorKey, connectStatusKey, normalizeConnectCountry, parseConnectOnboardingUrl, parseConnectStatus, type ConnectCountry } from '../payments/connect-onboarding';
+import { buildEmailedReport } from '../reports/emailed-report';
 
 type DocumentType = 'TICKET DE VENTA' | 'FACTURA SIMPLIFICADA' | 'FACTURA COMPLETA' | 'TICKET DE DEVOLUCIÓN' | 'COMPRA/DEVOLUCIONES' | 'PRESUPUESTO' | 'FACTURA';
 type TransactionType = 'COBRO' | 'DEVOLUCIÓN';
 type Tab = 'gastos_facturacion' | 'tpv' | 'presupuesto' | 'stats' | 'config';
 type UserRole = 'principal' | 'empleado';
-type AuthenticatedUser = { app_metadata?: { role?: unknown } };
+type AuthenticatedUser = { id?: string; app_metadata?: { role?: unknown; company_owner_id?: unknown } };
 
 type Client = { name: string; nif: string; address: string };
 type Issuer = {
@@ -38,6 +47,10 @@ type Issuer = {
   nif: string;
   address: string;
   logoUri?: string;
+  logoPosition?: LogoPosition;
+  logoSize?: LogoSize;
+  logoOffsetA4?: LogoOffset;
+  logoOffsetTicket?: LogoOffset;
   managerEmail?: string;
   accountHolder?: string;
   iban?: string;
@@ -47,25 +60,41 @@ type Issuer = {
 };
 type InvoiceItem = { id: string; description: string; price: string };
 type PendingInvoice = { client: Client; items: InvoiceItem[]; ivaRate: number; total: number; docType: DocumentType };
-type StripeTerminalPaymentIntentResult = { paymentIntentId?: string; clientSecret?: string; error?: string };
-type StripeOnlinePaymentResult = { paymentId?: string; checkoutUrl?: string; redirectUrl?: string; qrDataUrl?: string | null; paymentMethods?: string[] | 'auto'; error?: string };
-type StripeOnlinePaymentStatusResult = { status?: string; paymentStatus?: string; checkoutStatus?: string; usedMethod?: string | null; error?: string };
-type StripeAccountResult = {
-  ok?: boolean;
-  livemode?: boolean | null;
+type StripeTerminalPaymentIntentResult = {
+  paymentIntentId?: string;
+  clientSecret?: string;
   accountId?: string | null;
-  country?: string | null;
-  businessType?: string | null;
-  businessName?: string | null;
-  defaultCurrency?: string | null;
-  chargesEnabled?: boolean | null;
-  payoutsEnabled?: boolean | null;
-  detailsSubmitted?: boolean | null;
-  payoutSchedule?: { interval?: string | null; delay_days?: number | null; monthly_anchor?: number | null; weekly_anchor?: string | null } | null;
-  requirementsDue?: string[];
-  disabledReason?: string | null;
-  bankAccounts?: { id?: string; bankName?: string | null; last4?: string | null; country?: string | null; currency?: string | null; status?: string | null }[];
-  dashboardUrls?: { account?: string; payouts?: string; paymentMethods?: string; balances?: string; overview?: string };
+  locationId?: string | null;
+  chargeMode?: 'direct' | 'platform';
+  code?: string;
+  error?: string;
+};
+type StripePaymentRefs = {
+  stripePaymentIntentId?: string;
+  stripeAccountId?: string | null;
+  chargeMode?: 'direct' | 'platform';
+  stripeCheckoutSessionId?: string | null;
+};
+type StripeOnlinePaymentResult = {
+  paymentId?: string;
+  checkoutUrl?: string;
+  redirectUrl?: string;
+  qrDataUrl?: string | null;
+  paymentMethods?: string[] | 'auto';
+  accountId?: string | null;
+  chargeMode?: 'direct' | 'platform';
+  paymentIntentId?: string | null;
+  code?: string;
+  error?: string;
+};
+type StripeOnlinePaymentStatusResult = {
+  status?: string;
+  paymentStatus?: string;
+  checkoutStatus?: string;
+  usedMethod?: string | null;
+  accountId?: string | null;
+  chargeMode?: 'direct' | 'platform';
+  paymentIntentId?: string | null;
   error?: string;
 };
 type SyncAllResult = {
@@ -125,8 +154,12 @@ interface Transaction {
   client?: Client;
   items?: InvoiceItem[];
   isRefunded?: boolean;
-  refundHistory?: { amount: number; date: string }[];
+  refundHistory?: { amount: number; date: string; stripeRefundId?: string; stripeRefundStatus?: string }[];
   publicUrl?: string;
+  stripePaymentIntentId?: string;
+  stripeAccountId?: string | null;
+  chargeMode?: 'direct' | 'platform';
+  stripeCheckoutSessionId?: string | null;
 }
 
 // Estado de la suscripción que devuelve GET /api/billing/status, incluidos los datos de impago
@@ -151,16 +184,44 @@ interface CashInvoiceDraft extends Transaction {
 }
 
 const initialIssuer: Issuer = {
-  name: 'COMERCIO LOCAL AUTÓNOMO S.L.',
-  nif: 'B98765432',
-  address: 'Calle Mayor 45, Santander',
+  name: '',
+  nif: '',
+  address: '',
   logoUri: undefined,
-  managerEmail: 'gestor@tugestoria.com',
-  accountHolder: 'Comercio Local Autónomo S.L.',
-  iban: 'ES9121000418450200051332',
-  bankName: 'Banco Santander',
+  managerEmail: '',
+  accountHolder: '',
+  iban: '',
+  bankName: '',
   country: 'ES',
   additionalUsers: 0,
+};
+
+const restoreIssuerSettings = (value: unknown): Issuer => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid issuer settings');
+  const saved = value as Record<string, unknown>;
+  const samples = {
+    name: 'COMERCIO LOCAL AUTÓNOMO S.L.',
+    nif: 'B98765432',
+    address: 'Calle Mayor 45, Santander',
+    managerEmail: 'gestor@tugestoria.com',
+    accountHolder: 'Comercio Local Autónomo S.L.',
+    iban: 'ES9121000418450200051332',
+    bankName: 'Banco Santander',
+  };
+  const restored = { ...initialIssuer, ...normalizeLogoSettings(saved) };
+  for (const field of Object.keys(samples) as (keyof typeof samples)[]) {
+    if (saved[field] !== undefined && typeof saved[field] !== 'string') throw new Error('Invalid issuer field');
+    restored[field] = saved[field] === samples[field] ? '' : (saved[field] as string | undefined) ?? '';
+  }
+  for (const field of ['country', 'logoUri'] as const) {
+    if (saved[field] !== undefined && typeof saved[field] !== 'string') throw new Error('Invalid issuer field');
+    if (typeof saved[field] === 'string') restored[field] = saved[field];
+  }
+  if (saved.additionalUsers !== undefined) {
+    if (typeof saved.additionalUsers !== 'number' || !Number.isFinite(saved.additionalUsers) || saved.additionalUsers < 0) throw new Error('Invalid issuer seats');
+    restored.additionalUsers = saved.additionalUsers;
+  }
+  return restored;
 };
 
 const STORAGE_KEY_TRANSACTIONS = '@tpv_transactions_v1';
@@ -185,14 +246,32 @@ type AuthSession = {
   expires_in?: number;
 };
 
+// Solo en este dispositivo: el iCloud/Keychain no lo copia a otro iPhone.
+const DEVICE_ID_STORE = {
+  getItemAsync: (key: string) => SecureStore.getItemAsync(key, { keychainAccessible: SecureStore.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY }),
+  setItemAsync: (key: string, value: string) => SecureStore.setItemAsync(key, value, { keychainAccessible: SecureStore.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY }),
+};
+// Intervalo de comprobación de que esta sesión sigue siendo la activa de la cuenta.
+const SESSION_CHECK_INTERVAL_MS = 30000;
+
 const roleFromUser = (user?: AuthenticatedUser): UserRole =>
   user?.app_metadata?.role === 'empleado' ? 'empleado' : 'principal';
+
+const storageScopeFromUser = (user?: AuthenticatedUser): string | null => {
+  if (!user?.id?.trim()) return null;
+  const ownerId = user.app_metadata?.company_owner_id;
+  const companyId = typeof ownerId === 'string' && ownerId.trim() ? ownerId : user.id;
+  return `${encodeURIComponent(companyId)}:${encodeURIComponent(user.id)}`;
+};
+
+// Las claves globales antiguas se conservan sin leer ni migrar: no tienen propietario verificable.
+const accountStorageKey = (key: string, scope: string): string => `${key}:account:${scope}`;
 
 const formatCurrency = (amount: number) =>
   new Intl.NumberFormat('es-ES', { style: 'currency', currency: 'EUR' }).format(amount);
 
 const formatDate = (isoDate: string) =>
-  new Intl.DateTimeFormat('es-ES', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(isoDate));
+  new Intl.DateTimeFormat('es-ES', { dateStyle: 'short', timeStyle: 'short', hourCycle: 'h23' }).format(new Date(isoDate));
 
 export default function TpvScreen() {
   const [digits, setDigits] = useState('0');
@@ -203,6 +282,9 @@ export default function TpvScreen() {
   const [issuer, setIssuer] = useState<Issuer>(initialIssuer);
   const [userRole, setUserRole] = useState<UserRole>('principal');
   const [ownerPin, setOwnerPin] = useState('');
+  const [companyPinConfigured, setCompanyPinConfigured] = useState<boolean | null>(null);
+  const companyPinBusyRef = useRef(false);
+  const syncCompanyPinRef = useRef<() => Promise<void>>(() => Promise.resolve());
   const [ownerPinInput, setOwnerPinInput] = useState('');
   const [ownerRecoveryEmail, setOwnerRecoveryEmail] = useState('');
   const [ownerRecoveryPhone, setOwnerRecoveryPhone] = useState('');
@@ -216,6 +298,7 @@ export default function TpvScreen() {
   const [recoverySectionVisible, setRecoverySectionVisible] = useState(false);
   const [userPermissionsModalVisible, setUserPermissionsModalVisible] = useState(false);
   const [pendingRefund, setPendingRefund] = useState<{ ticket: Transaction; amount: number } | null>(null);
+  const refundBusyRef = useRef(false);
   const [ivaPercentage, setIvaPercentage] = useState('21');
   const [activeTab, setActiveTab] = useState<Tab>('tpv');
   const [isProcessing, setIsProcessing] = useState(false);
@@ -223,12 +306,27 @@ export default function TpvScreen() {
   const [selectedTicket, setSelectedTicket] = useState<Transaction | null>(null);
   const [selectedExpense, setSelectedExpense] = useState<Expense | null>(null);
   const [isLoaded, setIsLoaded] = useState(false);
+  const [storageScope, setStorageScope] = useState<string | null>(null);
+  const storageScopeRef = useRef<string | null>(null);
+  const loadedScopeRef = useRef<string | null>(null);
+  const issuerLoadedScopeRef = useRef<string | null>(null);
+  const issuerWriteQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const issuerRef = useRef(issuer);
+  issuerRef.current = issuer;
+  const cacheGenerationRef = useRef(0);
   const [authLoading, setAuthLoading] = useState(true);
   const [accessToken, setAccessToken] = useState<string | null>(null);
   // Marca de caducidad (segundos epoch) del access token actual: permite renovarlo a tiempo.
   const [tokenExpiresAt, setTokenExpiresAt] = useState(0);
-  // Sesión única: identificador estable de este dispositivo, guardado la primera vez que se usa.
-  const [deviceId, setDeviceId] = useState('');
+  // Sesión única: identificador estable de este dispositivo en SecureStore. El acceso se bloquea
+  // hasta tenerlo; las peticiones usan siempre la promesa compartida, no el estado de React.
+  const [deviceIdStatus, setDeviceIdStatus] = useState<'loading' | 'ready' | 'unavailable'>('loading');
+  const deviceIdPromiseRef = useRef<Promise<string | null> | null>(null);
+  const resolveDeviceId = () => {
+    deviceIdPromiseRef.current ??= getOrCreateDeviceId(DEVICE_ID_STORE);
+    return deviceIdPromiseRef.current;
+  };
+  const [authSubmitting, setAuthSubmitting] = useState(false);
   const [syncHistoryLoading, setSyncHistoryLoading] = useState(false);
   const [syncHistoryMessage, setSyncHistoryMessage] = useState('');
   const [syncHistoryError, setSyncHistoryError] = useState('');
@@ -239,7 +337,7 @@ export default function TpvScreen() {
   const [authPassword, setAuthPassword] = useState('');
   const [authFullName, setAuthFullName] = useState('');
   const [authCompanyName, setAuthCompanyName] = useState('');
-  const [authRegistrationRole, setAuthRegistrationRole] = useState<UserRole>('principal');
+  const [authRegistrationRole, setAuthRegistrationRole] = useState<UserRole | null>(null);
   const [authEmployeeAccessCode, setAuthEmployeeAccessCode] = useState('');
   const [employeeAccessCode, setEmployeeAccessCode] = useState('');
   const [authError, setAuthError] = useState('');
@@ -272,7 +370,7 @@ const [seatsPanelOpen, setSeatsPanelOpen] = useState(false);
   // Alta de empleado: un unico boton que cobra las plazas y guarda el codigo del empleado.
   const [employeeSaveLoading, setEmployeeSaveLoading] = useState(false);
   const [terminalError, setTerminalError] = useState('');
-  const [terminalMessage, setTerminalMessage] = useState('Listo para cobrar con tarjeta o wallet contactless.');
+  const [terminalMessage, setTerminalMessage] = useState('tpv.ready');
 
   const {
     initialize,
@@ -284,18 +382,18 @@ const [seatsPanelOpen, setSeatsPanelOpen] = useState(false);
     processPaymentIntent,
   } = useStripeTerminal({
     onDidRequestReaderInput: (input) => {
-      setTerminalMessage(`Acerca la tarjeta o wallet al móvil (${input.join(' / ')}).`);
+      setTerminalMessage(`${tr('tpv.contactlessHint')} (${input.join(' / ')})`);
     },
     onDidRequestReaderDisplayMessage: (message) => {
       setTerminalMessage(String(message));
     },
     onDidChangeConnectionStatus: (status) => {
-      if (status === 'connected') setTerminalMessage('Lector Tap to Pay listo.');
-      if (status === 'connecting') setTerminalMessage('Preparando lector Tap to Pay...');
-      if (status === 'discovering') setTerminalMessage('Buscando compatibilidad Tap to Pay...');
+      if (status === 'connected') setTerminalMessage('tpv.ready');
+      if (status === 'connecting') setTerminalMessage('tpv.preparing');
+      if (status === 'discovering') setTerminalMessage('tpv.discovering');
     },
     onDidDisconnect: () => {
-      setTerminalMessage('El lector se ha desconectado. Vuelve a iniciar el cobro.');
+      setTerminalMessage('tpv.disconnected');
     },
   });
 
@@ -334,13 +432,39 @@ const [seatsPanelOpen, setSeatsPanelOpen] = useState(false);
   const [onlinePaymentLoading, setOnlinePaymentLoading] = useState(false);
   const [onlinePaymentError, setOnlinePaymentError] = useState('');
   const [onlinePaymentMessage, setOnlinePaymentMessage] = useState('');
-  const [onlinePayment, setOnlinePayment] = useState<{ paymentId: string; checkoutUrl: string; qrDataUrl: string | null } | null>(null);
+  const [onlinePayment, setOnlinePayment] = useState<{
+    paymentId: string;
+    checkoutUrl: string;
+    qrDataUrl: string | null;
+    accountId?: string | null;
+    chargeMode?: 'direct' | 'platform';
+    paymentIntentId?: string | null;
+  } | null>(null);
   const onlinePaymentConfirmedRef = useRef(false);
   // Idioma de la app: eleccion manual guardada en AsyncStorage; si no hay, el pais del movil.
   const [appLocale, setAppLocaleState] = useState<AppLocale>('es');
   // Selector de idioma: se abre desde el boton de la cabecera (ya no vive en la pestaña Config).
   const [languageModalVisible, setLanguageModalVisible] = useState(false);
   const tr = useCallback((key: string) => translateKey(appLocale, key), [appLocale]);
+  // Los efectos de sesión (arranque y comprobación periódica) leen el idioma actual sin reiniciarse.
+  const trRef = useRef(tr);
+  trRef.current = tr;
+  const formatUiCurrency = (value: number) => formatCurrencyForLocale(appLocale, value);
+  const formatUiDate = (isoDate: string) => new Intl.DateTimeFormat(appLocale, {
+    dateStyle: 'short', timeStyle: 'short', hourCycle: 'h23',
+  }).format(new Date(isoDate));
+  const documentTypeLabel = (type: DocumentType) => {
+    const keys: Record<DocumentType, string> = {
+      'TICKET DE VENTA': 'document.sale',
+      'FACTURA SIMPLIFICADA': 'document.simplified',
+      'FACTURA COMPLETA': 'document.complete',
+      'TICKET DE DEVOLUCIÓN': 'document.refund',
+      'COMPRA/DEVOLUCIONES': 'document.purchaseRefunds',
+      'PRESUPUESTO': 'document.quote',
+      'FACTURA': 'document.invoice',
+    };
+    return tr(keys[type]);
+  };
   // Al arrancar: idioma guardado > idioma del pais del dispositivo > espanol.
   // expo-localization es un modulo nativo: si el APK/cliente instalado es anterior a su
   // instalacion, cargarlo estaticamente romperia el arranque. Se importa de forma dinamica
@@ -371,7 +495,7 @@ const [seatsPanelOpen, setSeatsPanelOpen] = useState(false);
     setLanguageModalVisible(false);
     try {
       await AsyncStorage.setItem(APP_LOCALE_STORAGE_KEY, locale);
-      Alert.alert(tr('lang.title'), tr('lang.saved'));
+      Alert.alert(translateKey(locale, 'lang.title'), translateKey(locale, 'lang.saved'));
     } catch {
       // Sin almacen persistente: el idioma se aplica solo en esta sesion.
     }
@@ -381,6 +505,8 @@ const [seatsPanelOpen, setSeatsPanelOpen] = useState(false);
   // efectos sin depender de cierres obsoletas y sin volver a lanzar los efectos en cada
   // render (lo que provocaria bucles y peticiones de red innecesarias).
   const refreshUserSessionRef = useRef<() => Promise<string | null>>(() => Promise.resolve(null));
+  const activateAccountCacheRef = useRef<(user?: AuthenticatedUser) => boolean>(() => false);
+  const clearStoredSessionRef = useRef<() => Promise<void>>(() => Promise.resolve());
 // Permite reler GET /api/billing/status (estado de pago y bloqueo) sin repetir el efecto completo.
 const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.resolve());
   const registerTransactionDocumentRef = useRef<(transaction: Transaction) => Promise<Transaction>>(
@@ -391,15 +517,26 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   transactionsRef.current = transactions;
   registerTransactionDocumentRef.current = registerTransactionDocument;
 
-  const onlinePaymentRef = useRef<{ paymentId: string; checkoutUrl: string; qrDataUrl: string | null } | null>(null);
-  const createOnlinePaymentRef = useRef<(method: string, paymentAmount: number) => void>(() => {});
+  const onlinePaymentRef = useRef<{
+    paymentId: string;
+    checkoutUrl: string;
+    qrDataUrl: string | null;
+    accountId?: string | null;
+    chargeMode?: 'direct' | 'platform';
+    paymentIntentId?: string | null;
+  } | null>(null);
+  const createOnlinePaymentRef = useRef<(method: string, paymentAmount: number, paymentRefs?: StripePaymentRefs) => void>(() => {});
   onlinePaymentRef.current = onlinePayment;
 
-  // Configuración de la cuenta de Stripe (dónde recibe los cobros)
   const [stripeAccountLoading, setStripeAccountLoading] = useState(false);
-  // Resumen del estado de la cuenta de Stripe (se muestra tras configurarla)
+  const stripeConnectBusyRef = useRef<number | null>(null);
   const [stripeMethodsInfo, setStripeMethodsInfo] = useState('');
   const [stripeMethodsError, setStripeMethodsError] = useState('');
+  const [stripeCountryModalVisible, setStripeCountryModalVisible] = useState(false);
+  const [stripeCountryConfirmed, setStripeCountryConfirmed] = useState<ConnectCountry | null>(null);
+  const stripeCountryScopeRef = useRef<{ scope: string; generation: number } | null>(null);
+
+  useEffect(() => () => { stripeConnectBusyRef.current = null; stripeCountryScopeRef.current = null; }, []);
 
   // Facturas y productos
   const [invoiceItems, setInvoiceItems] = useState<InvoiceItem[]>([{ id: '1', description: '', price: '' }]);
@@ -409,9 +546,99 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   // Estados específicos para Presupuesto
   const [presupuestoClient, setPresupuestoClient] = useState<Client>({ name: '', nif: '', address: '' });
   const [presupuestoItems, setPresupuestoItems] = useState<InvoiceItem[]>([{ id: '1', description: '', price: '' }]);
+  const quoteScrollRef = useRef<ScrollView>(null);
+  const quoteInputRefs = useRef<Record<string, TextInput | null>>({});
+  const quoteFocusedInputRef = useRef<string | null>(null);
+  const quoteFocusGenerationRef = useRef(0);
+  const quoteScrollOffsetRef = useRef(0);
+  const quoteKeyboardYRef = useRef<number | null>(null);
+  const quoteNewLineRef = useRef<string | null>(null);
+  const [quoteKeyboardHeight, setQuoteKeyboardHeight] = useState(0);
+  const measureQuoteInput = useCallback((generation: number) => {
+    const keyboardY = quoteKeyboardYRef.current;
+    const scroll = quoteScrollRef.current;
+    const key = quoteFocusedInputRef.current;
+    const input = key === null ? null : quoteInputRefs.current[key];
+    const offset = quoteScrollOffsetRef.current;
+    const isCurrent = () => generation === quoteFocusGenerationRef.current &&
+      keyboardY === quoteKeyboardYRef.current && scroll === quoteScrollRef.current &&
+      key === quoteFocusedInputRef.current && offset === quoteScrollOffsetRef.current;
+    if (keyboardY === null || !scroll || !isCurrent()) return;
+    scroll.getNativeScrollRef()?.measureInWindow((_x, viewportY, _width, viewportHeight) => {
+      if (!isCurrent() || viewportHeight <= 0) return;
+      const viewportBottom = viewportY + viewportHeight;
+      setQuoteKeyboardHeight(Platform.OS === 'android' ? Math.max(0, viewportBottom - keyboardY) : 0);
+      if (!input) return;
+      input.measureInWindow((_inputX, inputY, _inputWidth, inputHeight) => {
+        if (!isCurrent() || quoteInputRefs.current[key!] !== input || inputHeight <= 0) return;
+        const overlap = inputY + inputHeight - Math.min(viewportBottom, keyboardY);
+        if (overlap > 0) scroll.scrollTo({ y: offset + overlap + 16, animated: true });
+      });
+    });
+  }, []);
+  const scheduleQuoteReveal = useCallback(() => {
+    const generation = ++quoteFocusGenerationRef.current;
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => measureQuoteInput(generation));
+    });
+  }, [measureQuoteInput]);
+  const revealQuoteInput = (key: string) => {
+    quoteFocusedInputRef.current = key;
+    scheduleQuoteReveal();
+  };
+  const blurQuoteInput = (key: string) => {
+    if (quoteFocusedInputRef.current !== key) return;
+    quoteFocusedInputRef.current = null;
+    quoteFocusGenerationRef.current += 1;
+  };
+  useEffect(() => {
+    if (activeTab !== 'presupuesto') return;
+    const updateKeyboard = (event: { endCoordinates: { screenY: number; height: number } }) => {
+      if (event.endCoordinates.height <= 0) {
+        quoteKeyboardYRef.current = null;
+        quoteFocusGenerationRef.current += 1;
+        setQuoteKeyboardHeight(0);
+        return;
+      }
+      quoteKeyboardYRef.current = event.endCoordinates.screenY;
+      scheduleQuoteReveal();
+    };
+    const subscription = Keyboard.addListener('keyboardDidShow', updateKeyboard);
+    const frameSubscription = Keyboard.addListener('keyboardDidChangeFrame', updateKeyboard);
+    const hideSubscription = Keyboard.addListener('keyboardDidHide', () => {
+      quoteKeyboardYRef.current = null;
+      quoteFocusGenerationRef.current += 1;
+      setQuoteKeyboardHeight(0);
+    });
+    return () => {
+      subscription.remove();
+      frameSubscription.remove();
+      hideSubscription.remove();
+      quoteKeyboardYRef.current = null;
+      quoteFocusedInputRef.current = null;
+      quoteFocusGenerationRef.current += 1;
+      setQuoteKeyboardHeight(0);
+    };
+  }, [activeTab, scheduleQuoteReveal]);
   const [presupuestoIvaInput, setPresupuestoIvaInput] = useState('21');
   const [presupuestoClientEmail, setPresupuestoClientEmail] = useState('');
   const [presupuestoDocumentType, setPresupuestoDocumentType] = useState<'PRESUPUESTO' | 'FACTURA'>('PRESUPUESTO');
+  const resetQuoteForm = () => {
+    quoteFocusGenerationRef.current += 1;
+    quoteFocusedInputRef.current = null;
+    quoteNewLineRef.current = null;
+    quoteKeyboardYRef.current = null;
+    quoteScrollOffsetRef.current = 0;
+    Object.values(quoteInputRefs.current).forEach((input) => input?.blur());
+    quoteInputRefs.current = {};
+    setQuoteKeyboardHeight(0);
+    setPresupuestoClient({ name: '', nif: '', address: '' });
+    setPresupuestoClientEmail('');
+    setPresupuestoItems([{ id: '1', description: '', price: '' }]);
+    setPresupuestoIvaInput('21');
+    Keyboard.dismiss();
+    quoteScrollRef.current?.scrollTo({ y: 0, animated: false });
+  };
 
   // Estados específicos para Gastos
   const [expenseProvider, setExpenseProvider] = useState('');
@@ -428,15 +655,132 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   const [hasPermission, setHasPermission] = useState<boolean | null>(null);
   const [scanned, setScanned] = useState(false);
 
+  const resetAccountCache = () => {
+    cacheGenerationRef.current += 1;
+    loadedScopeRef.current = null;
+    issuerLoadedScopeRef.current = null;
+    setIsLoaded(false);
+    autoSyncDoneRef.current = false;
+    transactionsRef.current = [];
+    onlinePaymentRef.current = null;
+    onlinePaymentConfirmedRef.current = false;
+    setTransactions([]);
+    setTransactionHistory([]);
+    setCashInvoiceDrafts([]);
+    setExpenses([]);
+    setIssuer({ ...initialIssuer });
+    setOwnerPin('');
+    setCompanyPinConfigured(null);
+    companyPinBusyRef.current = false;
+    refundBusyRef.current = false;
+    setOwnerRecoveryEmail('');
+    setOwnerRecoveryPhone('');
+    setOwnerPinInput('');
+    setOwnerPinSetupNew('');
+    setOwnerPinSetupConfirm('');
+    setOwnerPinChangeCurrent('');
+    setOwnerPinChangeNew('');
+    setOwnerPinChangeConfirm('');
+    setOwnerRecoveryCode('');
+    setPinModalVisible(false);
+    setRecoverySectionVisible(false);
+    setUserPermissionsModalVisible(false);
+    setEmployeeAccessCode('');
+    setSelectedTicket(null);
+    setSelectedExpense(null);
+    setPeriodDetails(null);
+    setPendingRefund(null);
+    setTicketToPartialRefund(null);
+    setPartialRefundModalVisible(false);
+    setPendingInvoice(null);
+    setPendingDocumentType('TICKET DE VENTA');
+    setClient({ name: '', nif: '', address: '' });
+    setInvoiceItems([{ id: '1', description: '', price: '' }]);
+    setInvoiceIvaInput('21');
+    setPresupuestoClient({ name: '', nif: '', address: '' });
+    setPresupuestoItems([{ id: '1', description: '', price: '' }]);
+    setPresupuestoClientEmail('');
+    setExpenseProvider('');
+    setExpenseAmountInput('');
+    setExpenseImageUri(null);
+    setSearchQuery('');
+    setDigits('0');
+    setActiveTab('tpv');
+    setOnlinePayment(null);
+    setOnlinePaymentModalVisible(false);
+    setOnlinePaymentLoading(false);
+    setOnlinePaymentError('');
+    setOnlinePaymentMessage('');
+    setIsProcessing(false);
+    setTerminalError('');
+    setTerminalMessage('tpv.ready');
+    setStripeMethodsInfo('');
+    setStripeMethodsError('');
+    setStripeAccountLoading(false);
+    setStripeCountryModalVisible(false);
+    setStripeCountryConfirmed(null);
+    setSubscriptionLoading(false);
+    setSeatsSyncMessage('');
+    setSeatsCardMissing(false);
+    setSeatsPanelOpen(false);
+    setNfcModalVisible(false);
+    setClientModalVisible(false);
+    setScannerModalVisible(false);
+    setManagerModalVisible(false);
+    setTransactionReportModalVisible(false);
+    setExpenseReportModalVisible(false);
+    setSyncHistoryLoading(false);
+    setSyncHistoryMessage('');
+    setSyncHistoryError('');
+    setHasActiveSubscription(false);
+    setSubscriptionStatus('missing');
+    setSubscriptionPastDue(false);
+    setSubscriptionLocked(false);
+    setSubscriptionDaysUntilLock(null);
+    setSubscriptionPastDueInvoiceUrl(null);
+    setSubscriptionError('');
+    setPastDueMessage('');
+    seatsSyncedRef.current = 0;
+  };
+
+  const activateAccountCache = (user?: AuthenticatedUser): boolean => {
+    const scope = storageScopeFromUser(user);
+    if (!scope) return false;
+    if (storageScopeRef.current !== scope) {
+      storageScopeRef.current = scope;
+      resetAccountCache();
+      setStorageScope(scope);
+    }
+    return true;
+  };
+
   // CARGAR DATOS AL INICIAR
   useEffect(() => {
+    if (!accessToken || !storageScope || storageScopeRef.current !== storageScope) return;
+    if (loadedScopeRef.current === storageScope) return;
+    issuerLoadedScopeRef.current = null;
+    let cancelled = false;
+    const generation = cacheGenerationRef.current;
+    const isCurrent = () => !cancelled && cacheGenerationRef.current === generation && storageScopeRef.current === storageScope;
     (async () => {
       try {
+        await issuerWriteQueueRef.current;
+        if (!isCurrent()) return;
+        const storedIssuer = await AsyncStorage.getItem(accountStorageKey(STORAGE_KEY_ISSUER, storageScope));
+        if (!isCurrent()) return;
+        if (storedIssuer !== null) {
+          setIssuer(restoreIssuerSettings(JSON.parse(storedIssuer)));
+        }
+        issuerLoadedScopeRef.current = storageScope;
+      } catch (error) {
+        console.error('Error al cargar emisor:', error);
+      }
+      try {
+        if (!isCurrent()) return;
         const [
           storedTransactions,
           storedCashInvoiceDrafts,
           storedExpenses,
-          storedIssuer,
           storedOwnerPin,
           storedRecoveryEmail,
           storedRecoveryPhone,
@@ -444,11 +788,15 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
           STORAGE_KEY_TRANSACTIONS,
           STORAGE_KEY_CASH_INVOICE_DRAFTS,
           STORAGE_KEY_EXPENSES,
-          STORAGE_KEY_ISSUER,
           STORAGE_KEY_OWNER_PIN,
           STORAGE_KEY_OWNER_RECOVERY_EMAIL,
           STORAGE_KEY_OWNER_RECOVERY_PHONE,
-        ]).then((entries) => entries.map(([, value]) => value));
+        ].map((key) => accountStorageKey(key, storageScope))).then((entries) => entries.map(([, value]) => value)).catch((error) => {
+          if (isCurrent()) issuerLoadedScopeRef.current = null;
+          throw error;
+        });
+
+        if (!isCurrent()) return;
 
         if (storedTransactions) {
           const parsedTransactions = JSON.parse(storedTransactions) as Transaction[];
@@ -481,31 +829,27 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
           sales.forEach((sale) => {
             if (sale.refundHistory && sale.refundHistory.length > 0) {
               sale.documentType = 'COMPRA/DEVOLUCIONES';
-              sale.publicUrl = undefined;
             }
           });
 
           setTransactions(sales);
-          void Promise.all(sales.filter((sale) => sale.refundHistory && sale.refundHistory.length > 0).map(async (sale) => {
-            const publishedSale = await registerTransactionDocumentRef.current(sale);
-            setTransactions((current) => current.map((transaction) =>
-              transaction.id === publishedSale.id ? publishedSale : transaction
-            ));
-          }));
         }
         if (storedCashInvoiceDrafts) setCashInvoiceDrafts(JSON.parse(storedCashInvoiceDrafts) as CashInvoiceDraft[]);
         if (storedExpenses) setExpenses(JSON.parse(storedExpenses));
-        if (storedIssuer) setIssuer(JSON.parse(storedIssuer));
         if (storedOwnerPin) setOwnerPin(storedOwnerPin);
         if (storedRecoveryEmail) setOwnerRecoveryEmail(storedRecoveryEmail);
         if (storedRecoveryPhone) setOwnerRecoveryPhone(storedRecoveryPhone);
       } catch (error) {
         console.error('Error al cargar datos guardados:', error);
       } finally {
-        setIsLoaded(true);
+        if (isCurrent()) {
+          loadedScopeRef.current = storageScope;
+          setIsLoaded(true);
+        }
       }
     })();
-  }, []);
+    return () => { cancelled = true; };
+  }, [accessToken, storageScope]);
 
   // Plazas de empleado (usuarios adicionales): el número contratado vive en Stripe y aquí solo se
   // refleja. Se aplica al entrar (así sigue estando tras borrar los datos de la app) y cada cambio
@@ -644,7 +988,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   const saveEmployeeWithSeats = async () => {
     if (!accessToken || !configuredDocumentApiUrl) return;
     const code = employeeAccessCode.trim();
-    if (code.length < 8) {
+    if (code && code.length < 8) {
       Alert.alert('Código demasiado corto', 'Usa un código de al menos 8 caracteres. No es el PIN del jefe.');
       return;
     }
@@ -690,19 +1034,19 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         body: JSON.stringify({ accessCode: code }),
       }, 10000);
       const responseText = await response.text();
-      let result: { error?: string } = {};
+      let result: { error?: string; accessCode?: string; companyEmail?: string } = {};
       try {
-        result = JSON.parse(responseText) as { error?: string };
+        result = JSON.parse(responseText) as { error?: string; accessCode?: string; companyEmail?: string };
       } catch {
         throw new Error('El servidor todavia no tiene disponible la funcion de empleados. Despliega la ultima version del backend en Render.');
       }
       if (!response.ok) throw new Error(result.error || 'No se pudo guardar el código.');
 
-      setEmployeeAccessCode('');
+      setEmployeeAccessCode(result.accessCode || code);
       applySubscriptionSeats(seats);
       Alert.alert(
         'Empleado añadido',
-        `Se han contratado ${seats} plaza(s) de empleado${seats === 1 ? '' : 's'} y el código de acceso esta listo.\n\nCompartelo solo con quien deba acceder al TPV.`,
+        `${tr('auth.companyEmail')}: ${result.companyEmail || authEmail}\n${tr('registration.additionalCode')}: ${result.accessCode || code}`,
       );
     } catch (error) {
       Alert.alert('No se pudo añadir el empleado', error instanceof Error ? error.message : 'Intentalo de nuevo.');
@@ -765,7 +1109,8 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   useEffect(() => {
     // Se espera a tener cargados los datos guardados para que las plazas de Stripe no las
     // sobrescriba el número que hubiera en el móvil.
-    if (!isLoaded || !accessToken || !configuredDocumentApiUrl) return;
+    if (!isLoaded || !accessToken || !configuredDocumentApiUrl || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
+    const generation = cacheGenerationRef.current;
 
     const runStatusCheck = async () => {
       setSubscriptionLoading(true);
@@ -774,10 +1119,11 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
           headers: { Authorization: `Bearer ${accessToken}` },
         }, 10000);
         const result = await response.json() as SubscriptionStatusResult;
+        if (cacheGenerationRef.current !== generation) return;
         if (response.status === 401) {
           // El token caducó mientras la app estaba abierta: se renueva para no cortar la sesión.
           const renewed = await refreshUserSessionRef.current();
-          if (!renewed) await clearStoredSession();
+          if (!renewed) await clearStoredSessionRef.current();
           return;
         }
         setHasActiveSubscription(Boolean(result.active));
@@ -792,9 +1138,10 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         applySubscriptionSeats(result.additionalUsers);
         setSubscriptionError(response.ok ? '' : (result.error || 'No se pudo consultar la suscripción.'));
       } catch {
+        if (cacheGenerationRef.current !== generation) return;
         setSubscriptionError('No se pudo comprobar la suscripción. Comprueba tu conexión.');
       } finally {
-        setSubscriptionLoading(false);
+        if (cacheGenerationRef.current === generation) setSubscriptionLoading(false);
       }
     };
 
@@ -802,22 +1149,13 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     // pantalla de bloqueo, sin depender del momento en que se monte el efecto.
     refreshSubscriptionStatusRef.current = runStatusCheck;
     void runStatusCheck();
-  }, [accessToken, isLoaded]);
+  }, [accessToken, isLoaded, storageScope]);
 
   useEffect(() => {
     (async () => {
       // ID estable de este dispositivo para el bloqueo de sesion unica por cuenta.
-      try {
-        const DEVICE_ID_KEY = '@tpv_device_id_v1';
-        let id = await AsyncStorage.getItem(DEVICE_ID_KEY);
-        if (!id) {
-          id = 'dev-' + Math.random().toString(36).slice(2, 10) + '-' + Date.now().toString(36);
-          await AsyncStorage.setItem(DEVICE_ID_KEY, id);
-        }
-        setDeviceId(id);
-      } catch {
-        // Sin almacen: el login funciona sin bloqueo de dispositivo.
-      }
+      const bootDeviceId = await resolveDeviceId();
+      setDeviceIdStatus(bootDeviceId ? 'ready' : 'unavailable');
       
       // La sesión se guarda como access token + refresh token + caducidad, para poder renovarla.
       let storedToken = await SecureStore.getItemAsync(AUTH_TOKEN_KEY);
@@ -841,14 +1179,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         }
       }
 
-      // Sesion unica: identificador estable de este dispositivo para /api/auth/me.
-      let bootDeviceId = '';
-      try {
-        bootDeviceId = (await AsyncStorage.getItem('@tpv_device_id_v1')) || '';
-      } catch {
-        // Sin almacenamiento no hay bloqueo de dispositivo.
-      }
-
+      // /api/auth/me es la única ruta que enlaza la sesión a este dispositivo o la traslada.
       const verifySession = async (forceTransfer: boolean) => {
         const headers: Record<string, string> = { Authorization: `Bearer ${storedToken}` };
         if (bootDeviceId) headers['X-Device-Id'] = bootDeviceId;
@@ -861,20 +1192,20 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
 
         if (response.status === 409 && bootDeviceId) {
           // La cuenta ya esta abierta en otro movil: ofrecer trasladar la sesion aqui.
-          const conflict = await response.json().catch(() => ({})) as { error?: string };
           let transfer = false;
           await new Promise<void>((resolve) => {
             Alert.alert(
-              'Sesion ya abierta',
-              conflict.error || 'La sesion ya esta abierta en otro dispositivo.',
+              trRef.current('auth.conflictTitle'),
+              trRef.current('auth.conflictMessage'),
               [
-                { text: 'Cancelar', style: 'cancel', onPress: () => resolve() },
-                { text: 'Abrir en este dispositivo', style: 'destructive', onPress: () => { transfer = true; resolve(); } },
+                { text: trRef.current('auth.conflictCancel'), style: 'cancel', onPress: () => resolve() },
+                { text: trRef.current('auth.conflictTransfer'), style: 'destructive', onPress: () => { transfer = true; resolve(); } },
               ],
+              { cancelable: false },
             );
           });
           if (!transfer) {
-            await clearStoredSession();
+            await clearStoredSessionRef.current();
             return;
           }
           response = await verifySession(true);
@@ -882,92 +1213,148 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
 
         if (response.ok) {
           const result = await response.json() as { user?: AuthenticatedUser };
+          if (!activateAccountCacheRef.current(result.user)) {
+            await clearStoredSessionRef.current();
+            return;
+          }
           setUserRole(roleFromUser(result.user));
           setAccessToken(storedToken);
         } else if (response.status === 401) {
           // El token caducó: se intenta renovar con el refresh token antes de pedir la contraseña.
           const renewed = await refreshUserSessionRef.current();
-          if (!renewed) await clearStoredSession();
+          if (renewed) {
+            storedToken = renewed;
+            const verified = await verifySession(false);
+            const result = await verified.json().catch(() => ({})) as { user?: AuthenticatedUser };
+            if (verified.ok && activateAccountCacheRef.current(result.user)) {
+              setUserRole(roleFromUser(result.user));
+              setAccessToken(renewed);
+            } else {
+              await clearStoredSessionRef.current();
+            }
+          } else {
+            await clearStoredSessionRef.current();
+          }
         } else {
-          await clearStoredSession();
+          await clearStoredSessionRef.current();
         }
       } catch {
-        setAccessToken(storedToken);
+        setAuthError(trRef.current('auth.errorNetwork'));
       } finally {
         setAuthLoading(false);
       }
     })();
   }, []);
 
-  const submitAuth = async (forceDevice = false) => {
+  const selectAuthRole = (role: UserRole | null) => {
+    setAuthRegistrationRole(role);
+    setAuthMode('login');
+    setAuthEmail('');
+    setAuthPassword('');
+    setAuthEmployeeAccessCode('');
+    setAuthFullName('');
+    setAuthCompanyName('');
     setAuthError('');
-    const email = authEmail.trim().toLowerCase();
+  };
+
+  const submitAuth = async (forceDevice = false) => {
+    if (authSubmitting || authRegistrationRole === null) return;
+    setAuthError('');
     if (!configuredDocumentApiUrl) {
-      setAuthError('No hay una URL de backend configurada.');
+      setAuthError(tr('auth.errorNoBackend'));
+      return;
+    }
+    const form: AuthForm = {
+      mode: authRegistrationRole === 'empleado' ? 'login' : authMode,
+      role: authRegistrationRole,
+      email: authEmail,
+      password: authPassword,
+      fullName: authFullName,
+      companyName: authCompanyName,
+      employeeAccessCode: authEmployeeAccessCode,
+    };
+    const validationError = validateAuthForm(form);
+    if (validationError) {
+      setAuthError(tr(validationError));
+      return;
+    }
+    // Sin identificador estable de dispositivo no se permite acceder (no hay modo sin bloqueo).
+    const currentDeviceId = await resolveDeviceId();
+    if (!currentDeviceId) {
+      setDeviceIdStatus('unavailable');
+      setAuthError(tr('auth.deviceUnavailable'));
       return;
     }
 
+    setAuthSubmitting(true);
     try {
-      const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/auth/${authMode}`, {
+      const authEndpoint = form.role === 'empleado' ? 'employee-login' : form.mode;
+      const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/auth/${authEndpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-          email,
-          password: authPassword,
-          fullName: authFullName,
-          companyName: authCompanyName,
-          role: authRegistrationRole,
-          employeeAccessCode: authEmployeeAccessCode,
-          // Sesion unica: identificador de este dispositivo (solo relevante en el login).
-          deviceId: authMode === 'login' ? deviceId : undefined,
-          force: authMode === 'login' ? forceDevice : undefined,
-        }),
+        body: JSON.stringify(buildAuthRequestBody(form, currentDeviceId, forceDevice)),
       }, 10000);
-      const result = await response.json() as { error?: string; code?: string; user?: AuthenticatedUser; session?: AuthSession; requiresEmailConfirmation?: boolean };
+      const result = await response.json().catch(() => ({})) as { error?: string; code?: string; user?: AuthenticatedUser; session?: AuthSession; requiresEmailConfirmation?: boolean };
 
       if (!response.ok) {
-        if (response.status === 409 && result.code === 'device_conflict') {
+        if (response.status === 409 && result.code === 'device_conflict' && form.mode === 'login') {
           // La cuenta ya esta abierta en otro movil: se ofrece trasladar la sesion aqui.
           Alert.alert(
-            'Sesión ya abierta',
-            result.error || 'La sesión ya está abierta en otro dispositivo.',
+            tr('auth.conflictTitle'),
+            tr('auth.conflictMessage'),
             [
-              { text: 'Cancelar', style: 'cancel' },
-              { text: 'Abrir en este dispositivo', style: 'destructive', onPress: () => void submitAuth(true) },
+              { text: tr('auth.conflictCancel'), style: 'cancel' },
+              { text: tr('auth.conflictTransfer'), style: 'destructive', onPress: () => void submitAuth(true) },
             ],
           );
           return;
         }
-        setAuthError(result.error || 'No se pudo completar la operación.');
+        setAuthError(result.error || tr('auth.errorGeneric'));
         return;
       }
 
-      if (authMode === 'register' && result.requiresEmailConfirmation) {
-        Alert.alert('Confirma tu email', 'Revisa tu correo para activar la cuenta y después inicia sesión.');
+      if (form.mode === 'register' && result.requiresEmailConfirmation) {
+        Alert.alert(tr('auth.confirmEmailTitle'), tr('auth.confirmEmailMessage'));
         setAuthMode('login');
+        setAuthPassword('');
         return;
       }
 
       const token = result.session?.access_token;
       if (!token) {
-        setAuthError('El servidor no devolvió una sesión válida.');
+        setAuthError(tr('auth.errorNoSession'));
+        return;
+      }
+      if (!storageScopeFromUser(result.user)) {
+        setAuthError(tr('auth.errorNoSession'));
         return;
       }
 
       // Se guardan también el refresh token y la caducidad para renovar la sesión sin volver a entrar.
       await persistSession(result.session);
-      setUserRole(roleFromUser(result.user));
+      activateAccountCache(result.user);
+      setUserRole(result.user ? roleFromUser(result.user) : form.role);
       setAccessToken(token);
       setAuthPassword('');
+      setAuthEmployeeAccessCode('');
     } catch {
-      setAuthError('No se pudo conectar con el servidor. Comprueba tu conexión.');
+      setAuthError(tr('auth.errorNetwork'));
+    } finally {
+      setAuthSubmitting(false);
     }
   };
 
   const signOut = async () => {
+    // Libera el dispositivo en el servidor (solo si esta sesión es la activa). Si falla, el
+    // siguiente acceso desde otro móvil pedirá trasladar la sesión.
+    if (accessToken && configuredDocumentApiUrl) {
+      await fetchWithTimeout(`${configuredDocumentApiUrl}/api/auth/logout`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${accessToken}` },
+      }, 5000).catch(() => undefined);
+    }
     await clearStoredSession();
     setUserRole('principal');
-    setAuthPassword('');
   };
 
   // Cierre de sesion con confirmacion: se pide confirmacion para no perder la sesion
@@ -1003,6 +1390,17 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
 
   // Borra la sesión guardada (token, refresco y caducidad) y devuelve la app a la pantalla de acceso.
   const clearStoredSession = async () => {
+    const scope = storageScopeRef.current;
+    const issuerSave = scope && loadedScopeRef.current === scope && issuerLoadedScopeRef.current === scope
+      ? writeIssuerSettings(scope, issuerRef.current)
+      : issuerWriteQueueRef.current;
+    storageScopeRef.current = null;
+    setStorageScope(null);
+    resetAccountCache();
+    setAccessToken(null);
+    setTokenExpiresAt(0);
+    selectAuthRole(null);
+    await issuerSave;
     try {
       await SecureStore.deleteItemAsync(AUTH_TOKEN_KEY);
       await SecureStore.deleteItemAsync(AUTH_REFRESH_TOKEN_KEY);
@@ -1010,8 +1408,6 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     } catch {
       // No hay nada que limpiar.
     }
-    setAccessToken(null);
-    setTokenExpiresAt(0);
     // Con una sesión nueva, el historial se volverá a sincronizar solo al abrir la app.
     autoSyncDoneRef.current = false;
   };
@@ -1020,13 +1416,17 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   // no se puede renovar (entonces hay que volver a iniciar sesión).
   const refreshUserSession = async (): Promise<string | null> => {
     if (!configuredDocumentApiUrl) return null;
+    const generation = cacheGenerationRef.current;
     let refreshToken: string | null = null;
     try {
       refreshToken = await SecureStore.getItemAsync(AUTH_REFRESH_TOKEN_KEY);
     } catch {
       refreshToken = null;
     }
-    if (!refreshToken) return null;
+    if (!refreshToken) {
+      await clearStoredSession();
+      return null;
+    }
 
     try {
       const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/auth/refresh`, {
@@ -1034,18 +1434,25 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ refreshToken }),
       }, 10000);
-      const result = await response.json().catch(() => ({})) as { session?: AuthSession; user?: AuthenticatedUser };
+      const result = await response.json().catch(() => ({})) as { session?: AuthSession; user?: AuthenticatedUser; code?: string };
+      if (cacheGenerationRef.current !== generation) return null;
       const renewedToken = result.session?.access_token;
-      if (!renewedToken) {
-        // Solo se cierra la sesión si el servidor confirma que el refresh token ya no vale (401).
+      if (!response.ok || !renewedToken) {
+        // Solo se cierra la sesión si el servidor confirma que el refresh token ya no vale (401) o
+        // que la sesión se ha trasladado a otro dispositivo (409).
         // Un 404 (backend aún sin desplegar), un 502 (Render arrancando) o un fallo de red no deben
         // expulsar al usuario: se conserva la sesión y se reintenta en el siguiente uso.
-        if (response.status === 401) await clearStoredSession();
+        const outcome = classifySessionCheck(response.status, result.code);
+        if (outcome === 'expired' || outcome === 'conflict') await clearStoredSession();
+        if (outcome === 'conflict') Alert.alert(tr('auth.sessionMovedTitle'), tr('auth.sessionMovedMessage'));
         return null;
       }
+      if (!storageScopeFromUser(result.user)) return null;
       await persistSession(result.session);
+      if (cacheGenerationRef.current !== generation) return null;
+      if (!authLoading) activateAccountCache(result.user);
       if (result.user) setUserRole(roleFromUser(result.user));
-      setAccessToken(renewedToken);
+      if (!authLoading) setAccessToken(renewedToken);
       return renewedToken;
     } catch {
       // Sin conexión: se mantiene la sesión actual y se reintenta en el siguiente uso.
@@ -1062,6 +1469,71 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     return (await refreshUserSession()) ?? accessToken;
   };
 
+  const requestCompanyPin = async (pin?: string, currentPin?: string): Promise<{ configured?: boolean }> => {
+    const generation = cacheGenerationRef.current;
+    if (!accessToken || !configuredDocumentApiUrl) throw new Error('Inicia sesión y conecta con el servidor para configurar el PIN.');
+    const token = await ensureFreshAccessToken();
+    if (cacheGenerationRef.current !== generation) throw new Error('La cuenta ha cambiado.');
+    if (!token) throw new Error('La sesión ha caducado. Vuelve a iniciar sesión.');
+    const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/company/pin${pin === undefined ? '/status' : ''}`, {
+      method: pin === undefined ? 'GET' : 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      ...(pin === undefined ? {} : { body: JSON.stringify({ pin, ...(currentPin === undefined ? {} : { currentPin }) }) }),
+    }, 15000);
+    const result = await response.json() as { configured?: boolean; error?: string };
+    if (cacheGenerationRef.current !== generation) throw new Error('La cuenta ha cambiado.');
+    if (!response.ok) throw new Error(result.error || 'No se pudo configurar el PIN en el servidor.');
+    if (pin === undefined && typeof result.configured !== 'boolean') throw new Error('El servidor no confirmó el estado del PIN.');
+    return result;
+  };
+
+  const syncCompanyPin = async () => {
+    if (!isLoaded || !accessToken || userRole !== 'principal' || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope || companyPinBusyRef.current) return;
+    const generation = cacheGenerationRef.current;
+    companyPinBusyRef.current = true;
+    try {
+      const status = await requestCompanyPin();
+      if (cacheGenerationRef.current !== generation) return;
+      setCompanyPinConfigured(status.configured === true);
+      if (!status.configured && /^\d{4,6}$/.test(ownerPin)) {
+        await requestCompanyPin(ownerPin);
+        if (cacheGenerationRef.current === generation) setCompanyPinConfigured(true);
+      }
+    } catch (error) {
+      if (cacheGenerationRef.current === generation) console.warn('No se pudo sincronizar el PIN principal:', error);
+    } finally {
+      if (cacheGenerationRef.current === generation) companyPinBusyRef.current = false;
+    }
+  };
+  syncCompanyPinRef.current = syncCompanyPin;
+  useEffect(() => {
+    void syncCompanyPinRef.current();
+  }, [isLoaded, accessToken, ownerPin, userRole, storageScope, userPermissionsModalVisible]);
+
+  const saveCompanyPin = async (pin: string, currentPin?: string): Promise<boolean> => {
+    if (userRole !== 'principal' || !isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope || companyPinBusyRef.current) return false;
+    const generation = cacheGenerationRef.current;
+    companyPinBusyRef.current = true;
+    try {
+      if (currentPin === undefined) {
+        const status = await requestCompanyPin();
+        if (cacheGenerationRef.current !== generation) return false;
+        setCompanyPinConfigured(status.configured === true);
+        if (status.configured) throw new Error('El PIN ya está configurado. Usa Cambiar PIN principal.');
+      }
+      await requestCompanyPin(pin, currentPin);
+      if (cacheGenerationRef.current !== generation) return false;
+      setCompanyPinConfigured(true);
+      setOwnerPin(pin);
+      return true;
+    } catch (error) {
+      if (cacheGenerationRef.current === generation) Alert.alert('PIN no guardado', error instanceof Error ? error.message : 'No se pudo conectar con el servidor.');
+      return false;
+    } finally {
+      if (cacheGenerationRef.current === generation) companyPinBusyRef.current = false;
+    }
+  };
+
   // Renovación automática antes de que caduque la sesión (1 hora por defecto en Supabase).
   useEffect(() => {
     if (!accessToken) return;
@@ -1070,6 +1542,52 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     const timer = setTimeout(() => { void refreshUserSessionRef.current(); }, Math.max(30000, msUntilRenewal));
     return () => clearTimeout(timer);
   }, [accessToken, tokenExpiresAt]);
+
+  // Sesión única: cada 30 s y al volver a primer plano se confirma que esta sesión sigue siendo la
+  // activa. Si se trasladó a otro dispositivo se cierra aquí (sin reclamarla de vuelta).
+  const sessionCheckInFlightRef = useRef(false);
+  useEffect(() => {
+    if (!accessToken || !configuredDocumentApiUrl) return;
+    let cancelled = false;
+    const checkActiveSession = async () => {
+      if (sessionCheckInFlightRef.current) return;
+      sessionCheckInFlightRef.current = true;
+      try {
+        const currentDeviceId = await resolveDeviceId();
+        const headers: Record<string, string> = { Authorization: `Bearer ${accessToken}` };
+        if (currentDeviceId) headers['X-Device-Id'] = currentDeviceId;
+        const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/auth/me`, { headers }, 8000);
+        const result = await response.json().catch(() => ({})) as { code?: string; user?: AuthenticatedUser };
+        if (cancelled) return;
+        const outcome = classifySessionCheck(response.status, result.code);
+        if (outcome === 'ok') {
+          if (!activateAccountCacheRef.current(result.user)) {
+            await clearStoredSessionRef.current();
+            return;
+          }
+          setUserRole(roleFromUser(result.user));
+        } else if (outcome === 'conflict') {
+          await clearStoredSessionRef.current();
+          Alert.alert(trRef.current('auth.sessionMovedTitle'), trRef.current('auth.sessionMovedMessage'));
+        } else if (outcome === 'expired') {
+          await refreshUserSessionRef.current();
+        }
+      } catch {
+        // Sin conexión: se vuelve a comprobar en el siguiente intervalo.
+      } finally {
+        sessionCheckInFlightRef.current = false;
+      }
+    };
+    const interval = setInterval(() => { void checkActiveSession(); }, SESSION_CHECK_INTERVAL_MS);
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state === 'active') void checkActiveSession();
+    });
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+      subscription.remove();
+    };
+  }, [accessToken]);
 
 
   const startSubscriptionCheckout = async () => {
@@ -1124,73 +1642,79 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
 
   // GUARDAR TRANSACCIONES AUTOMÁTICAMENTE
   useEffect(() => {
-    if (!isLoaded) return;
-    AsyncStorage.setItem(STORAGE_KEY_TRANSACTIONS, JSON.stringify(transactions)).catch((error) =>
+    if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
+    AsyncStorage.setItem(accountStorageKey(STORAGE_KEY_TRANSACTIONS, storageScope), JSON.stringify(transactions)).catch((error) =>
       console.error('Error al guardar transacciones:', error)
     );
-  }, [transactions, isLoaded]);
+  }, [transactions, isLoaded, storageScope]);
 
   useEffect(() => {
-    if (!isLoaded) return;
-    AsyncStorage.setItem(STORAGE_KEY_CASH_INVOICE_DRAFTS, JSON.stringify(cashInvoiceDrafts)).catch((error) =>
+    if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
+    AsyncStorage.setItem(accountStorageKey(STORAGE_KEY_CASH_INVOICE_DRAFTS, storageScope), JSON.stringify(cashInvoiceDrafts)).catch((error) =>
       console.error('Error al guardar facturas pendientes de cobro:', error)
     );
-  }, [cashInvoiceDrafts, isLoaded]);
+  }, [cashInvoiceDrafts, isLoaded, storageScope]);
 
   // GUARDAR GASTOS AUTOMÁTICAMENTE
   useEffect(() => {
-    if (!isLoaded) return;
-    AsyncStorage.setItem(STORAGE_KEY_EXPENSES, JSON.stringify(expenses)).catch((error) =>
+    if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
+    AsyncStorage.setItem(accountStorageKey(STORAGE_KEY_EXPENSES, storageScope), JSON.stringify(expenses)).catch((error) =>
       console.error('Error al guardar gastos:', error)
     );
-  }, [expenses, isLoaded]);
+  }, [expenses, isLoaded, storageScope]);
 
   // GUARDAR EMISOR AUTOMÁTICAMENTE
-  useEffect(() => {
-    if (!isLoaded) return;
-    AsyncStorage.setItem(STORAGE_KEY_ISSUER, JSON.stringify(issuer)).catch((error) =>
-      console.error('Error al guardar emisor:', error)
-    );
-  }, [issuer, isLoaded]);
+  const writeIssuerSettings = (scope: string, settings: Issuer): Promise<void> => {
+    const serialized = JSON.stringify(settings);
+    const pending = issuerWriteQueueRef.current.then(() =>
+      AsyncStorage.setItem(accountStorageKey(STORAGE_KEY_ISSUER, scope), serialized)
+    ).catch((error) => console.error('Error al guardar emisor:', error));
+    issuerWriteQueueRef.current = pending;
+    return pending;
+  };
 
   useEffect(() => {
-    if (!isLoaded) return;
-    AsyncStorage.setItem(STORAGE_KEY_OWNER_PIN, ownerPin).catch((error) =>
+    if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope || issuerLoadedScopeRef.current !== storageScope) return;
+    void writeIssuerSettings(storageScope, issuer);
+  }, [issuer, isLoaded, storageScope]);
+
+  useEffect(() => {
+    if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
+    AsyncStorage.setItem(accountStorageKey(STORAGE_KEY_OWNER_PIN, storageScope), ownerPin).catch((error) =>
       console.error('Error al guardar el PIN del jefe:', error)
     );
-  }, [ownerPin, isLoaded]);
+  }, [ownerPin, isLoaded, storageScope]);
 
   useEffect(() => {
-    if (!isLoaded) return;
-    AsyncStorage.setItem(STORAGE_KEY_OWNER_RECOVERY_EMAIL, ownerRecoveryEmail).catch((error) =>
+    if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
+    AsyncStorage.setItem(accountStorageKey(STORAGE_KEY_OWNER_RECOVERY_EMAIL, storageScope), ownerRecoveryEmail).catch((error) =>
       console.error('Error al guardar el email de recuperación:', error)
     );
-  }, [ownerRecoveryEmail, isLoaded]);
+  }, [ownerRecoveryEmail, isLoaded, storageScope]);
 
   useEffect(() => {
-    if (!isLoaded) return;
-    AsyncStorage.setItem(STORAGE_KEY_OWNER_RECOVERY_PHONE, ownerRecoveryPhone).catch((error) =>
+    if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
+    AsyncStorage.setItem(accountStorageKey(STORAGE_KEY_OWNER_RECOVERY_PHONE, storageScope), ownerRecoveryPhone).catch((error) =>
       console.error('Error al guardar el teléfono de recuperación:', error)
     );
-  }, [ownerRecoveryPhone, isLoaded]);
+  }, [ownerRecoveryPhone, isLoaded, storageScope]);
 
   useEffect(() => {
-    if (!isLoaded || transactionsRef.current.length === 0) return;
+    if (!isLoaded || !accessToken || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope || transactionsRef.current.length === 0) return;
+    const generation = cacheGenerationRef.current;
     const transactionsNeedingPublication = transactionsRef.current.filter((transaction) =>
-      !transaction.publicUrl || (issuer.logoUri && transaction.issuer.logoUri !== issuer.logoUri)
+      !transaction.publicUrl && !transaction.refundHistory?.length && transaction.documentType !== 'COMPRA/DEVOLUCIONES'
     );
     if (transactionsNeedingPublication.length === 0) return;
 
     void Promise.all(transactionsNeedingPublication.map(async (transaction) => {
-      const publishedTransaction = await registerTransactionDocumentRef.current({
-        ...transaction,
-        issuer: issuer.logoUri ? { ...transaction.issuer, logoUri: issuer.logoUri } : transaction.issuer,
-      });
+      const publishedTransaction = await registerTransactionDocumentRef.current(transaction);
+      if (cacheGenerationRef.current !== generation) return;
       setTransactions((current) => current.map((item) =>
         item.id === publishedTransaction.id ? publishedTransaction : item
       ));
     }));
-  }, [issuer.logoUri, isLoaded, transactions.length]);
+  }, [isLoaded, transactions.length, storageScope, accessToken]);
 
   useEffect(() => {
     if (userRole === 'empleado' && activeTab !== 'tpv') setActiveTab('tpv');
@@ -1228,7 +1752,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
           return;
         }
         setTerminalError('');
-        setTerminalMessage('Listo para cobrar con tarjeta o wallet contactless.');
+        setTerminalMessage('tpv.ready');
       } catch (error) {
         setTerminalError(error instanceof Error ? error.message : 'No se pudo iniciar Stripe Terminal.');
       }
@@ -1375,16 +1899,16 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
 
       const net = income - expensesAmount;
       const label = chartGranularity === 'day'
-        ? new Intl.DateTimeFormat('es-ES', { day: '2-digit', month: '2-digit' }).format(bucketDate)
+        ? new Intl.DateTimeFormat(appLocale, { day: '2-digit', month: '2-digit' }).format(bucketDate)
         : chartGranularity === 'week'
-          ? `Sem ${index + 1}`
-          : new Intl.DateTimeFormat('es-ES', { month: 'short' }).format(bucketDate);
+          ? `${tr('reports.week')} ${index + 1}`
+          : new Intl.DateTimeFormat(appLocale, { month: 'short' }).format(bucketDate);
 
       buckets.push({ label, income, expenses: expensesAmount, net, start, end });
     }
 
     return buckets;
-  }, [chartGranularity, expenses, transactions]);
+  }, [appLocale, chartGranularity, expenses, transactions, tr]);
 
   const maxChartValue = useMemo(() => {
     if (chartData.length === 0) return 1;
@@ -1433,11 +1957,11 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     const start = parseDateInput(transactionStartDateInput);
     const end = parseDateInput(transactionEndDateInput);
     if (!start || !end) {
-      Alert.alert('Fecha inválida', 'Comprueba el formato DD/MM/YYYY.');
+      Alert.alert(tr('validation.error'), tr('validation.dates'));
       return;
     }
     if (start > end) {
-      Alert.alert('Rango inválido', 'La fecha de inicio no puede ser posterior a la fecha de fin.');
+      Alert.alert(tr('validation.error'), tr('validation.dates'));
       return;
     }
 
@@ -1490,25 +2014,25 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
 
   const TransactionHistory = () => (
     <View style={styles.card}>
-      <Text style={styles.cardTitle}>📜 HISTORIAL DE TRANSACCIONES ({transactionHistory.length})</Text>
+      <Text style={styles.cardTitle}>📜 {tr('history.title').replace('{count}', String(transactionHistory.length))}</Text>
       <TextInput
         style={styles.input}
-        placeholder="Buscar por código o cliente..."
+        placeholder={tr('history.search')}
         placeholderTextColor="#94a3b8"
         value={searchQuery}
         onChangeText={setSearchQuery}
       />
       {transactionHistory.length === 0 ? (
-        <Text style={styles.emptyText}>No hay transacciones registradas.</Text>
+        <Text style={styles.emptyText}>{tr('history.empty')}</Text>
       ) : (
         transactionHistory.map((t) => (
           <Pressable key={t.id} style={styles.listItem} onPress={() => setSelectedTicket(t)}>
             <View>
-              <Text style={styles.listItemTitle}>{t.ticketCode} ({t.documentType})</Text>
-              <Text style={styles.listItemSubtitle}>{formatDate(t.createdAt)} • {t.client?.name || 'Cliente General'}</Text>
+              <Text style={styles.listItemTitle}>{t.ticketCode} ({documentTypeLabel(t.documentType)})</Text>
+              <Text style={styles.listItemSubtitle}>{formatUiDate(t.createdAt)} • {t.client?.name || tr('workflow.generalClient')}</Text>
             </View>
             <Text style={[styles.listItemAmount, t.type === 'DEVOLUCIÓN' && { color: '#dc2626' }]}>
-              {t.type === 'DEVOLUCIÓN' ? '-' : ''}{formatCurrency(t.amount)}
+              {t.type === 'DEVOLUCIÓN' ? '-' : ''}{formatUiCurrency(t.amount)}
             </Text>
           </Pressable>
         ))
@@ -1517,6 +2041,8 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   );
 
   async function registerTransactionDocument(transaction: Transaction): Promise<Transaction> {
+    if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return transaction;
+    const generation = cacheGenerationRef.current;
     if (DOCUMENT_API_URL_CANDIDATES.length === 0) {
       const error = new Error('No hay una URL de backend configurada en la aplicación.');
       setTerminalError(error.message);
@@ -1540,6 +2066,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     // Si la sesión está a punto de caducar se renueva aquí: así el documento se guarda asociado a
     // la cuenta y se puede recuperar después con "Sincronizar historial" (no queda sin dueño).
     const authToken = await ensureFreshAccessToken();
+    if (cacheGenerationRef.current !== generation) return transaction;
     if (accessToken && !authToken) {
       setTerminalError('La sesión ha caducado. Vuelve a iniciar sesión para guardar el ticket en la nube.');
       return transaction;
@@ -1548,6 +2075,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     let lastError: unknown;
     for (const baseUrl of DOCUMENT_API_URL_CANDIDATES) {
       for (let attempt = 0; attempt < 3; attempt += 1) {
+        if (cacheGenerationRef.current !== generation) return transaction;
         try {
           const response = await fetchWithTimeout(`${baseUrl}/api/documents`, {
             method: 'POST',
@@ -1572,6 +2100,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
           }
 
           const result = await response.json() as { publicUrl?: string };
+          if (cacheGenerationRef.current !== generation) return transaction;
           if (!result.publicUrl) {
             throw new Error(`${baseUrl}: el backend no devolvió una URL pública.`);
           }
@@ -1608,7 +2137,18 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     });
   }, [isProcessing]);
 
-  const createTransaction = useCallback((type: TransactionType, documentType: DocumentType, method: string, customAmount?: number, transactionClient?: Client, customItems?: InvoiceItem[], customIvaRate?: number) => {
+  const createTransaction = useCallback((
+    type: TransactionType,
+    documentType: DocumentType,
+    method: string,
+    customAmount?: number,
+    transactionClient?: Client,
+    customItems?: InvoiceItem[],
+    customIvaRate?: number,
+    paymentRefs?: StripePaymentRefs,
+  ) => {
+    if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
+    const generation = cacheGenerationRef.current;
     const finalAmount = customAmount !== undefined ? customAmount : amount;
     if (type === 'COBRO' && finalAmount <= 0) {
       Alert.alert('Importe inválido', 'Introduce una cantidad superior a 0,00 €.');
@@ -1643,6 +2183,10 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       items: customItems,
       isRefunded: false,
       refundHistory: [],
+      ...(paymentRefs?.stripePaymentIntentId ? { stripePaymentIntentId: paymentRefs.stripePaymentIntentId } : {}),
+      ...(paymentRefs?.stripeAccountId ? { stripeAccountId: paymentRefs.stripeAccountId } : {}),
+      ...(paymentRefs?.chargeMode ? { chargeMode: paymentRefs.chargeMode } : {}),
+      ...(paymentRefs?.stripeCheckoutSessionId ? { stripeCheckoutSessionId: paymentRefs.stripeCheckoutSessionId } : {}),
     };
 
     setTransactions((current) => [transaction, ...current]);
@@ -1651,13 +2195,15 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     setIsProcessing(false);
 
     setTimeout(async () => {
+      if (cacheGenerationRef.current !== generation) return;
       const publishedTransaction = await registerTransactionDocumentRef.current(transaction);
+      if (cacheGenerationRef.current !== generation) return;
       setTransactions((current) => current.map((item) =>
         item.id === publishedTransaction.id ? publishedTransaction : item
       ));
       setSelectedTicket(publishedTransaction);
     }, 0);
-  }, [amount, ivaPercentage, issuer]);
+  }, [amount, ivaPercentage, issuer, isLoaded, storageScope]);
 
   const startPayment = (documentType: DocumentType) => {
     if (!requireSubscription('realizar cobros')) return;
@@ -1667,7 +2213,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       return;
     }
     if (amount <= 0) {
-      Alert.alert('Importe inválido', 'Introduce una cantidad superior a 0,00 €.');
+      Alert.alert(tr('validation.error'), tr('validation.amount'));
       return;
     }
     setPendingDocumentType(documentType);
@@ -1677,7 +2223,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   const submitClientModal = () => {
     const validClient = Object.fromEntries(Object.entries(client).map(([key, value]) => [key, value.trim()])) as Client;
     if (!validClient.name || !validClient.nif || !validClient.address) {
-      Alert.alert('Datos incompletos', 'Indica nombre, NIF/CIF y dirección fiscal.');
+      Alert.alert(tr('validation.error'), tr('validation.client'));
       return;
     }
 
@@ -1686,19 +2232,19 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       .filter(i => i.description !== '' && i.price !== '');
 
     if (validItems.length === 0) {
-      Alert.alert('Sin productos', 'Añade al menos un producto con su descripción y precio.');
+      Alert.alert(tr('validation.error'), tr('validation.items'));
       return;
     }
 
     const subtotal = validItems.reduce((acc, item) => acc + (parseFloat(item.price.replace(',', '.')) || 0), 0);
     if (subtotal <= 0) {
-      Alert.alert('Importe inválido', 'El total de los productos debe ser superior a 0,00 €.');
+      Alert.alert(tr('validation.error'), tr('validation.amount'));
       return;
     }
 
     const parsedIva = parseFloat(invoiceIvaInput.replace(',', '.')) || 21;
     if (parsedIva < 0 || parsedIva > 100) {
-      Alert.alert('IVA inválido', 'Introduce un IVA entre 0 y 100.');
+      Alert.alert(tr('validation.error'), tr('validation.vat'));
       return;
     }
 
@@ -1715,7 +2261,13 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     setNfcModalVisible(true);
   };
 
-  const createStripeTerminalPaymentIntent = async (paymentAmount: number, orderId: string): Promise<string> => {
+  const createStripeTerminalPaymentIntent = async (paymentAmount: number, orderId: string): Promise<{
+    clientSecret: string;
+    paymentIntentId: string;
+    accountId: string | null;
+    locationId: string | null;
+    chargeMode: 'direct' | 'platform';
+  }> => {
     if (!accessToken || !configuredDocumentApiUrl) {
       throw new Error('Inicia sesión para poder cobrar con Stripe.');
     }
@@ -1729,14 +2281,23 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       body: JSON.stringify({ amount: paymentAmount, orderId }),
     }, 15000);
     const result = await response.json() as StripeTerminalPaymentIntentResult;
-    if (!response.ok || !result.clientSecret) {
+    if (!response.ok || !result.clientSecret || !result.paymentIntentId) {
+      if (result.code && ['connect_not_connected', 'connect_charges_not_enabled'].includes(result.code)) {
+        throw new Error(tr(connectErrorKey(result)));
+      }
       throw new Error(result.error || 'Stripe no devolvió un PaymentIntent para cobro presencial.');
     }
 
-    return result.clientSecret;
+    return {
+      clientSecret: result.clientSecret,
+      paymentIntentId: result.paymentIntentId,
+      accountId: result.accountId || null,
+      locationId: result.locationId || null,
+      chargeMode: result.chargeMode === 'direct' ? 'direct' : 'platform',
+    };
   };
 
-  const createTransactionFromConfirmedPayment = (method: string, paymentAmount: number): void => {
+  const createTransactionFromConfirmedPayment = (method: string, paymentAmount: number, paymentRefs?: StripePaymentRefs): void => {
     setNfcModalVisible(false);
 
     // createTransaction ya deja el ticket seleccionado (setSelectedTicket) y lo publica con su QR,
@@ -1750,39 +2311,41 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         pendingInvoice.client,
         pendingInvoice.items,
         pendingInvoice.ivaRate,
+        paymentRefs,
       );
       setPendingInvoice(null);
       setClient({ name: '', nif: '', address: '' });
       setInvoiceItems([{ id: '1', description: '', price: '' }]);
       setInvoiceIvaInput('21');
     } else {
-      createTransaction('COBRO', pendingDocumentType, method);
+      createTransaction('COBRO', pendingDocumentType, method, paymentAmount, undefined, undefined, undefined, paymentRefs);
     }
   };
   useEffect(() => {
     createOnlinePaymentRef.current = createTransactionFromConfirmedPayment;
   });
 
-  const ensureTapToPayReader = async () => {
-    if (!STRIPE_TERMINAL_LOCATION_ID) {
-      throw new Error('Falta EXPO_PUBLIC_STRIPE_TERMINAL_LOCATION_ID. Añade el ID de ubicación de Stripe Terminal.');
+  const ensureTapToPayReader = async (locationId?: string | null) => {
+    const resolvedLocationId = (typeof locationId === 'string' && locationId.trim()) || STRIPE_TERMINAL_LOCATION_ID;
+    if (!resolvedLocationId) {
+      throw new Error('Falta la ubicación de Stripe Terminal. Completa Connect o configura EXPO_PUBLIC_STRIPE_TERMINAL_LOCATION_ID.');
     }
 
     if (!isStripeTerminalInitialized) {
-      setTerminalMessage('Inicializando Stripe Terminal...');
+      setTerminalMessage('tpv.preparing');
       const { error } = await initialize();
       if (error) throw new Error(error.message || 'No se pudo iniciar Stripe Terminal.');
     }
 
     if (connectedReader) return connectedReader;
 
-    setTerminalMessage('Conectando lector Tap to Pay...');
+    setTerminalMessage('tpv.preparing');
     const connectionResult = await easyConnect({
       discoveryMethod: 'tapToPay',
       // Stripe no permite el lector Tap to Pay real en una app depurable.
       // El lector simulado solo se activa durante el desarrollo local.
       simulated: __DEV__,
-      locationId: STRIPE_TERMINAL_LOCATION_ID,
+      locationId: resolvedLocationId,
       merchantDisplayName: issuer.name,
       autoReconnectOnUnexpectedDisconnect: true,
     });
@@ -1795,7 +2358,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
 
   const completePayment = async () => {
     if (!accessToken || !configuredDocumentApiUrl) {
-      Alert.alert('Sesión requerida', 'Inicia sesión para poder cobrar con Stripe.');
+      Alert.alert(tr('pay.sessionRequired'), tr('pay.sessionRequiredBody'));
       return;
     }
 
@@ -1803,17 +2366,18 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     const orderId = `stripe-terminal-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     setIsProcessing(true);
     setTerminalError('');
-    setTerminalMessage('Preparando cobro contactless...');
+    setTerminalMessage('tpv.preparing');
 
     try {
-      await ensureTapToPayReader();
-      const clientSecret = await createStripeTerminalPaymentIntent(paymentAmount, orderId);
-      const retrievedResult = await retrievePaymentIntent(clientSecret);
+      // Primero el PaymentIntent (y location Connect); después el lector Tap to Pay.
+      const intent = await createStripeTerminalPaymentIntent(paymentAmount, orderId);
+      await ensureTapToPayReader(intent.locationId);
+      const retrievedResult = await retrievePaymentIntent(intent.clientSecret);
       if (retrievedResult.error || !retrievedResult.paymentIntent) {
         throw new Error(retrievedResult.error?.message || 'No se pudo preparar el cobro presencial.');
       }
 
-      setTerminalMessage('Acerca la tarjeta, Google Pay, Apple Pay o Samsung Pay al móvil.');
+      setTerminalMessage('tpv.contactlessHint');
       const collectedResult = await collectPaymentMethod({
         paymentIntent: retrievedResult.paymentIntent,
         customerCancellation: 'disableIfAvailable',
@@ -1822,7 +2386,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         throw new Error(collectedResult.error?.message || 'No se pudo leer la tarjeta o wallet.');
       }
 
-      setTerminalMessage('Procesando pago contactless...');
+      setTerminalMessage('common.checking');
       const processedResult = await processPaymentIntent({ paymentIntent: collectedResult.paymentIntent });
       if (processedResult.error || !processedResult.paymentIntent) {
         throw new Error(processedResult.error?.message || 'No se pudo confirmar el cobro presencial.');
@@ -1831,8 +2395,12 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         throw new Error(`Stripe Terminal devolvió el estado ${processedResult.paymentIntent.status || 'desconocido'}.`);
       }
 
-      setTerminalMessage('Pago aprobado. Generando ticket...');
-      createTransactionFromConfirmedPayment('Stripe Terminal - Contactless', paymentAmount);
+      setTerminalMessage('pay.confirmedTicket');
+      createTransactionFromConfirmedPayment('Stripe Terminal - Contactless', paymentAmount, {
+        stripePaymentIntentId: intent.paymentIntentId,
+        stripeAccountId: intent.accountId,
+        chargeMode: intent.chargeMode,
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'No se pudo completar el cobro presencial.';
       setTerminalError(message);
@@ -1870,6 +2438,8 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   };
 
   const createOnlinePayment = async () => {
+    if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
+    const generation = cacheGenerationRef.current;
     if (!accessToken || !configuredDocumentApiUrl) {
       Alert.alert('Sesión requerida', 'Inicia sesión para poder cobrar con Stripe.');
       return;
@@ -1891,6 +2461,20 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     setOnlinePaymentMessage('Generando el enlace y el QR de pago...');
 
     try {
+      // Si Connect test está activo, el cobro es directo: exigir cuenta con cobros habilitados.
+      const connectResponse = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/stripe/connect/status`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      }, 15000);
+      const connectResult: unknown = await connectResponse.json();
+      if (cacheGenerationRef.current !== generation) return;
+      if (connectResponse.ok) {
+        const status = parseConnectStatus(connectResult);
+        if (status?.enabled) {
+          if (!status.connected) throw new Error(tr('connect.notConnected'));
+          if (!status.chargesEnabled) throw new Error(tr('connect.chargesNotEnabled'));
+        }
+      }
+
       const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/stripe/payment`, {
         method: 'POST',
         headers: {
@@ -1900,28 +2484,45 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         body: JSON.stringify({ amount: paymentAmount, orderId }),
       }, 30000);
       const result = await response.json() as StripeOnlinePaymentResult;
+      if (cacheGenerationRef.current !== generation) return;
       const checkoutUrl = result.checkoutUrl || result.redirectUrl;
       if (!response.ok || !checkoutUrl || !result.paymentId) {
+        if (result.code && ['connect_not_connected', 'connect_charges_not_enabled'].includes(result.code)) {
+          throw new Error(tr(connectErrorKey(result)));
+        }
         throw new Error(result.error || `Stripe no devolvió un enlace de pago (HTTP ${response.status}).`);
       }
 
-      setOnlinePayment({ paymentId: result.paymentId, checkoutUrl, qrDataUrl: result.qrDataUrl || null });
+      setOnlinePayment({
+        paymentId: result.paymentId,
+        checkoutUrl,
+        qrDataUrl: result.qrDataUrl || null,
+        accountId: result.accountId || null,
+        chargeMode: result.chargeMode === 'direct' ? 'direct' : 'platform',
+        paymentIntentId: result.paymentIntentId || null,
+      });
       // Se indican al vendedor los métodos que Stripe ofrece en este cobro concreto.
       const offeredMethods = Array.isArray(result.paymentMethods) && result.paymentMethods.length > 0
         ? result.paymentMethods.join(', ')
         : '';
+      const directHint = result.chargeMode === 'direct'
+        ? ' Cobro directo a tu cuenta Connect de prueba.'
+        : '';
       setOnlinePaymentMessage(
         offeredMethods
-          ? `Muestra el QR al cliente o abre el enlace de pago. Métodos en este cobro: ${offeredMethods}.`
-          : 'Muestra el QR al cliente o abre el enlace de pago. Stripe mostrará los métodos activados en tu cuenta (tarjeta, Bizum...).',
+          ? `Muestra el QR al cliente o abre el enlace de pago. Métodos en este cobro: ${offeredMethods}.${directHint}`
+          : `Muestra el QR al cliente o abre el enlace de pago. Stripe mostrará los métodos activados en tu cuenta (tarjeta, Bizum...).${directHint}`,
       );
       // Persistir el cobro pendiente: al volver del navegador la app puede remontarse y
       // perder el estado en memoria; asi se reanuda la comprobacion automaticamente.
       try {
-        await AsyncStorage.setItem(STORAGE_KEY_PENDING_ONLINE_PAYMENT, JSON.stringify({
+        await AsyncStorage.setItem(accountStorageKey(STORAGE_KEY_PENDING_ONLINE_PAYMENT, storageScope), JSON.stringify({
           paymentId: result.paymentId,
           checkoutUrl,
           qrDataUrl: result.qrDataUrl || null,
+          accountId: result.accountId || null,
+          chargeMode: result.chargeMode || null,
+          paymentIntentId: result.paymentIntentId || null,
           paymentAmount,
           pendingDocumentType,
           pendingInvoice,
@@ -1981,7 +2582,10 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   // Comprueba el pago sin tocar los mensajes de la interfaz (para la espera automatica).
   // Devuelve true cuando ya no hay que seguir esperando (pago confirmado o enlace caducado).
   const confirmOnlinePaymentInBackground = async (paymentId?: string): Promise<boolean> => {
+    if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return false;
+    const generation = cacheGenerationRef.current;
     const payment = await readOnlinePaymentStatus(paymentId);
+    if (cacheGenerationRef.current !== generation) return true;
     const status = payment?.status;
     if (!status) return false;
 
@@ -1992,15 +2596,23 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       if (onlinePaymentConfirmedRef.current) return true;
       onlinePaymentConfirmedRef.current = true;
       setOnlinePaymentMessage('Pago confirmado. Generando el ticket con su QR...');
+      const currentOnline = onlinePaymentRef.current;
       createTransactionFromConfirmedPayment(
         usedMethod === 'bizum' ? 'Stripe - Bizum (enlace o QR)' : usedMethod === 'card' ? 'Stripe - Tarjeta online' : 'Stripe - Enlace o QR (tarjeta o Bizum)',
         paymentAmount,
+        {
+          stripePaymentIntentId: payment?.paymentIntentId || currentOnline?.paymentIntentId || undefined,
+          stripeAccountId: payment?.accountId || currentOnline?.accountId || null,
+          chargeMode: payment?.chargeMode || currentOnline?.chargeMode || 'platform',
+          stripeCheckoutSessionId: currentOnline?.paymentId || paymentId || null,
+        },
       );
       try {
-        await AsyncStorage.removeItem(STORAGE_KEY_PENDING_ONLINE_PAYMENT);
+        await AsyncStorage.removeItem(accountStorageKey(STORAGE_KEY_PENDING_ONLINE_PAYMENT, storageScope));
       } catch {
         // No bloqueante.
       }
+      if (cacheGenerationRef.current !== generation) return true;
       closeOnlinePaymentModal();
       // createTransaction ya deja el ticket en selectedTicket: el recibo/factura con su QR
       // para el cliente se muestra solo al volver del pago.
@@ -2021,7 +2633,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       setOnlinePayment(null);
       setOnlinePaymentError('El enlace de pago ha caducado. Genera uno nuevo.');
       try {
-        await AsyncStorage.removeItem(STORAGE_KEY_PENDING_ONLINE_PAYMENT);
+        await AsyncStorage.removeItem(accountStorageKey(STORAGE_KEY_PENDING_ONLINE_PAYMENT, storageScope));
       } catch {
         // No bloqueante.
       }
@@ -2087,9 +2699,11 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   // vaciar el estado en memoria. Aqui se recupera el cobro pendiente guardado y se sigue
   // comprobando hasta que Stripe confirma el pago y se muestra el ticket con su QR.
   useEffect(() => {
-    if (!accessToken || !configuredDocumentApiUrl || !isLoaded) return;
+    if (!accessToken || !configuredDocumentApiUrl || !isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
 
     let cancelled = false;
+    const generation = cacheGenerationRef.current;
+    const isCurrent = () => !cancelled && cacheGenerationRef.current === generation && storageScopeRef.current === storageScope;
 
     const readOnlinePaymentStatusWith = async (paymentId: string): Promise<StripeOnlinePaymentStatusResult | null> => {
       if (!accessToken || !configuredDocumentApiUrl) return null;
@@ -2106,16 +2720,19 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     const resumePendingOnlinePayment = async () => {
       let stored: string | null = null;
       try {
-        stored = await AsyncStorage.getItem(STORAGE_KEY_PENDING_ONLINE_PAYMENT);
+        stored = await AsyncStorage.getItem(accountStorageKey(STORAGE_KEY_PENDING_ONLINE_PAYMENT, storageScope));
       } catch {
         return;
       }
-      if (cancelled || !stored) return;
+      if (!isCurrent() || !stored) return;
 
       let pending: {
         paymentId?: string;
         checkoutUrl?: string;
         qrDataUrl?: string | null;
+        accountId?: string | null;
+        chargeMode?: 'direct' | 'platform' | null;
+        paymentIntentId?: string | null;
         paymentAmount?: number;
         pendingDocumentType?: DocumentType;
         pendingInvoice?: PendingInvoice | null;
@@ -2125,7 +2742,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       } catch {
         return;
       }
-      if (cancelled || !pending?.paymentId || !pending?.checkoutUrl) return;
+      if (!isCurrent() || !pending?.paymentId || !pending?.checkoutUrl) return;
 
       // Restaurar el contexto del cobro para generar el mismo ticket al confirmarse.
       // digits guarda centimos (amount = Number(digits) / 100), asi que se multiplica por 100.
@@ -2141,17 +2758,25 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       }
 
       onlinePaymentConfirmedRef.current = false;
-      setOnlinePayment({ paymentId: pending.paymentId, checkoutUrl: pending.checkoutUrl, qrDataUrl: pending.qrDataUrl || null });
+      setOnlinePayment({
+        paymentId: pending.paymentId,
+        checkoutUrl: pending.checkoutUrl,
+        qrDataUrl: pending.qrDataUrl || null,
+        accountId: pending.accountId || null,
+        chargeMode: pending.chargeMode === 'direct' ? 'direct' : 'platform',
+        paymentIntentId: pending.paymentIntentId || null,
+      });
       setOnlinePaymentError('');
       setOnlinePaymentMessage('Comprobando el pago realizado...');
       setOnlinePaymentModalVisible(true);
 
       const amountToConfirm = pending.pendingInvoice ? pending.pendingInvoice.total : (pending.paymentAmount || 0);
       let attempts = 0;
-      while (!cancelled && attempts < 120) {
+      while (isCurrent() && attempts < 120) {
         attempts += 1;
         try {
           const payment = await readOnlinePaymentStatusWith(pending.paymentId);
+          if (!isCurrent()) return;
           const status = payment?.status;
           const resumeUsedMethod = methodLabelFor(payment?.usedMethod);
           if (status === 'SUCCEEDED') {
@@ -2161,13 +2786,20 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
               createOnlinePaymentRef.current(
                 resumeUsedMethod === 'bizum' ? 'Stripe - Bizum (enlace o QR)' : resumeUsedMethod === 'card' ? 'Stripe - Tarjeta online' : 'Stripe - Enlace o QR (tarjeta o Bizum)',
                 amountToConfirm,
+                {
+                  stripePaymentIntentId: payment?.paymentIntentId || pending.paymentIntentId || undefined,
+                  stripeAccountId: payment?.accountId || pending.accountId || null,
+                  chargeMode: payment?.chargeMode || (pending.chargeMode === 'direct' ? 'direct' : 'platform'),
+                  stripeCheckoutSessionId: pending.paymentId,
+                },
               );
             }
             try {
-              await AsyncStorage.removeItem(STORAGE_KEY_PENDING_ONLINE_PAYMENT);
+              await AsyncStorage.removeItem(accountStorageKey(STORAGE_KEY_PENDING_ONLINE_PAYMENT, storageScope));
             } catch {
               // No bloqueante.
             }
+            if (!isCurrent()) return;
             setOnlinePaymentModalVisible(false);
             setOnlinePayment(null);
             onlinePaymentConfirmedRef.current = false;
@@ -2182,10 +2814,11 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
           }
           if (status === 'EXPIRED') {
             try {
-              await AsyncStorage.removeItem(STORAGE_KEY_PENDING_ONLINE_PAYMENT);
+              await AsyncStorage.removeItem(accountStorageKey(STORAGE_KEY_PENDING_ONLINE_PAYMENT, storageScope));
             } catch {
               // No bloqueante.
             }
+            if (!isCurrent()) return;
             setOnlinePayment(null);
             setOnlinePaymentModalVisible(false);
             setOnlinePaymentError('El enlace de pago ha caducado. Genera uno nuevo.');
@@ -2197,7 +2830,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         await new Promise((resolve) => setTimeout(resolve, 3000));
       }
 
-      if (!cancelled) {
+      if (isCurrent()) {
         setOnlinePaymentMessage('No hemos podido confirmar el pago automáticamente. Pulsa "Ya ha pagado: comprobar ahora".');
       }
     };
@@ -2207,74 +2840,99 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     return () => {
       cancelled = true;
     };
-  }, [accessToken, isLoaded]);
+  }, [accessToken, isLoaded, storageScope]);
 
-  // Abre en el navegador del móvil el Dashboard de Stripe (modo test o real según la clave del
-  // backend) para que el comercio configure DÓNDE recibe sus cobros: cuenta bancaria y titular,
-  // calendario de pagos y datos de la cuenta. Antes de abrirlo, muestra un resumen del estado real.
+  const openStripeCountrySelector = () => {
+    if (userRole !== 'principal' || !isLoaded || !storageScope || stripeAccountLoading ||
+      loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
+    stripeCountryScopeRef.current = { scope: storageScope, generation: cacheGenerationRef.current };
+    setStripeCountryModalVisible(true);
+  };
+
+  const selectStripeConnectCountry = (country: ConnectCountry) => {
+    const selection = stripeCountryScopeRef.current;
+    if (!selection || selection.generation !== cacheGenerationRef.current || selection.scope !== storageScope ||
+      storageScopeRef.current !== selection.scope || loadedScopeRef.current !== selection.scope ||
+      userRole !== 'principal' || stripeAccountLoading || !normalizeConnectCountry(country)) return;
+    setIssuer(current => ({ ...current, country }));
+    setStripeCountryConfirmed(country);
+    setStripeCountryModalVisible(false);
+    stripeCountryScopeRef.current = null;
+    setStripeMethodsError('');
+    setStripeMethodsInfo('');
+  };
+
   const openStripeAccountSettings = async () => {
-    if (!accessToken || !configuredDocumentApiUrl) {
-      Alert.alert('Sesión requerida', 'Inicia sesión para configurar tu cuenta de Stripe.');
+    const generation = cacheGenerationRef.current;
+    if (stripeConnectBusyRef.current === generation) return;
+    if (userRole !== 'principal') {
+      setStripeMethodsError('connect.principalOnly');
       return;
     }
-
+    if (!accessToken || !configuredDocumentApiUrl || !isLoaded || !storageScope ||
+      storageScopeRef.current !== storageScope || loadedScopeRef.current !== storageScope) {
+      setStripeMethodsError('connect.sessionRequired');
+      return;
+    }
+    const country = normalizeConnectCountry(issuer.country);
+    if (!country || stripeCountryConfirmed !== country) {
+      setStripeMethodsError('connect.chooseCountry');
+      return;
+    }
+    stripeConnectBusyRef.current = generation;
+    const isCurrent = () => cacheGenerationRef.current === generation && storageScopeRef.current === storageScope &&
+      stripeConnectBusyRef.current === generation;
     setStripeAccountLoading(true);
     setStripeMethodsError('');
     setStripeMethodsInfo('');
 
-    try {
-      const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/stripe/account`, {
-        headers: { Authorization: `Bearer ${accessToken}` },
+    const request = async (onboarding = false): Promise<unknown> => {
+      const token = await ensureFreshAccessToken();
+      if (!isCurrent()) return null;
+      if (!token) throw new Error();
+      const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/stripe/connect/${onboarding ? 'onboarding' : 'status'}`, {
+        method: onboarding ? 'POST' : 'GET',
+        headers: { Authorization: `Bearer ${token}`, ...(onboarding ? { 'Content-Type': 'application/json' } : {}) },
+        ...(onboarding ? { body: JSON.stringify({ country }) } : {}),
       }, 30000);
-      const result = await response.json() as StripeAccountResult;
-      if (!response.ok || !result.ok) {
-        throw new Error(result.error || 'No se pudo consultar tu cuenta de Stripe.');
-      }
+      const result: unknown = await response.json();
+      if (!isCurrent()) return null;
+      if (!response.ok) throw new Error(connectErrorKey(result));
+      return result;
+    };
+    const readStatus = async () => {
+      const result = await request();
+      if (!isCurrent()) return null;
+      const status = parseConnectStatus(result);
+      if (!status) throw new Error();
+      setStripeMethodsInfo(connectStatusKey(status));
+      return status;
+    };
 
-      const schedule = result.payoutSchedule || {};
-      const scheduleText = schedule.interval
-        ? `${schedule.interval}${typeof schedule.delay_days === 'number' ? ` (cada ${schedule.delay_days} días)` : ''}`
-        : 'por defecto';
-      const lines = [
-        `Modo de Stripe: ${result.livemode === true ? 'REAL (live): cobra dinero de verdad' : result.livemode === false ? 'PRUEBAS (test)' : 'desconocido'}`,
-        `Cuenta: ${result.accountId || 'desconocida'}${result.businessName ? ` · ${result.businessName}` : ''}`,
-        `País de la cuenta: ${result.country || 'desconocido'}`,
-        `Cobros (charges): ${result.chargesEnabled === true ? 'activados' : result.chargesEnabled === false ? 'NO activados' : 'desconocido'}`,
-        `Pagos a tu banco (payouts): ${result.payoutsEnabled === true ? 'activados' : result.payoutsEnabled === false ? 'NO activados' : 'desconocido'}`,
-        `Calendario de pagos: ${scheduleText}`,
-        `Moneda por defecto: ${(result.defaultCurrency || 'eur').toUpperCase()}`,
-      ];
-
-      if (Array.isArray(result.bankAccounts) && result.bankAccounts.length > 0) {
-        const banks = result.bankAccounts.map((bank) => (
-          `${bank.bankName || 'Banco'} ····${bank.last4 || '????'} (${(bank.currency || 'eur').toUpperCase()}${bank.country ? `, ${bank.country}` : ''})${bank.status ? ` - ${bank.status}` : ''}`
-        ));
-        lines.push(`Cuenta bancaria de abono: ${banks.join(' | ')}`);
-      } else {
-        lines.push('Cuenta bancaria de abono: NINGUNA configurada todavía. Añádela en Stripe para poder recibir el dinero de los cobros.');
+    try {
+      const status = await readStatus();
+      if (!isCurrent() || !status?.enabled) return;
+      const result = await request(true);
+      if (!isCurrent()) return;
+      const url = parseConnectOnboardingUrl(result, status.accountId);
+      if (!url) throw new Error();
+      try {
+        await WebBrowser.openAuthSessionAsync(url, 'tpvapp://pago-completado');
+      } finally {
+        if (isCurrent()) {
+          setStripeMethodsInfo('');
+          await readStatus();
+        }
       }
-
-      if (result.detailsSubmitted === false) {
-        lines.push('Datos de la empresa: pendientes de completar en Stripe.');
-      }
-      if (Array.isArray(result.requirementsDue) && result.requirementsDue.length > 0) {
-        lines.push(`Stripe pide completar: ${result.requirementsDue.join(', ')}`);
-      }
-      if (result.disabledReason) {
-        lines.push(`Aviso de Stripe: ${result.disabledReason}`);
-      }
-
-      const url = result.dashboardUrls?.payouts || result.dashboardUrls?.account || 'https://dashboard.stripe.com/settings/payouts';
-      lines.push('');
-      lines.push(`Abriendo Stripe en: ${url}`);
-      lines.push('En Stripe: "Bank accounts and scheduling" (cuenta bancaria, titular y calendario de pagos). Ahí eliges la cuenta donde quieres recibir el dinero y cada cuánto se te ingresa.');
-      setStripeMethodsInfo(lines.join('\n'));
-
-      await Linking.openURL(url);
     } catch (error) {
-      setStripeMethodsError(error instanceof Error ? error.message : 'No se pudo abrir la configuración de Stripe.');
+      if (isCurrent()) setStripeMethodsError(error instanceof Error &&
+        ['connect.countryRequiresSupport', 'connect.countryNotApproved', 'connect.countryMismatch'].includes(error.message)
+        ? error.message : 'connect.failed');
     } finally {
-      setStripeAccountLoading(false);
+      if (isCurrent()) {
+        stripeConnectBusyRef.current = null;
+        setStripeAccountLoading(false);
+      }
     }
   };
 
@@ -2315,15 +2973,15 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     const parsedAmount = parseFloat(expenseAmountInput.replace(',', '.'));
 
     if (!cleanProvider) {
-      Alert.alert('Proveedor requerido', 'Indica el nombre del proveedor o establecimiento del gasto.');
+      Alert.alert(tr('validation.error'), tr('validation.provider'));
       return;
     }
     if (isNaN(parsedAmount) || parsedAmount <= 0) {
-      Alert.alert('Importe inválido', 'Introduce un importe válido para el gasto.');
+      Alert.alert(tr('validation.error'), tr('validation.amount'));
       return;
     }
     if (!expenseImageUri) {
-      Alert.alert('Imagen requerida', 'Adjunta la fotografía del ticket o factura del gasto.');
+      Alert.alert(tr('validation.error'), tr('validation.photo'));
       return;
     }
 
@@ -2342,7 +3000,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     setExpenseProvider('');
     setExpenseAmountInput('');
     setExpenseImageUri(null);
-    Alert.alert('¡Gasto guardado!', 'El ticket de gasto se ha almacenado correctamente.');
+    Alert.alert(tr('expense.save'), tr('expense.saved'));
   
     // Copia del gasto a la nube (mejor esfuerzo) para poder recuperarlo al sincronizar.
     void uploadExpensesToCloud([newExpense]).catch((error) =>
@@ -2352,9 +3010,12 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
 
   // Sube gastos locales a la nube para que se puedan recuperar tras borrar datos o cambiar de movil.
   const uploadExpensesToCloud = async (list: Expense[]): Promise<void> => {
+    if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
+    const generation = cacheGenerationRef.current;
     if (list.length === 0 || !accessToken || DOCUMENT_API_URL_CANDIDATES.length === 0) return;
     // El gasto se sube con un token vigente para que quede asociado a la cuenta del usuario.
     const authToken = await ensureFreshAccessToken();
+    if (cacheGenerationRef.current !== generation) return;
     if (!authToken) {
       throw new Error('La sesión ha caducado. Vuelve a iniciar sesión para guardar el gasto en la nube.');
     }
@@ -2382,7 +3043,30 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
 
   // Recupera de la nube todo el historial del usuario (tickets, facturas y gastos) y lo restaura
   // en la app. Pensado para: datos borrados, movil nuevo o averia.
+  const mergeCloudTransactions = (current: Transaction[], cloud: Transaction[]): Transaction[] => {
+    const latest = new Map<string, Transaction>();
+    for (const document of cloud) {
+      const previous = latest.get(document.id);
+      if (!previous || (document.refundHistory?.length ?? 0) > (previous.refundHistory?.length ?? 0)) latest.set(document.id, document);
+    }
+    const keys = new Set(current.flatMap((document) => [document.id, document.ticketCode]));
+    const merged = current.map((document) => {
+      const revision = latest.get(document.id);
+      if (!document.publicUrl || !revision || (document.refundHistory?.length ?? 0) > (revision.refundHistory?.length ?? 0)) return document;
+      return revision;
+    });
+    const additions = [...latest.values()].filter((document) => {
+      if (keys.has(document.id) || keys.has(document.ticketCode)) return false;
+      keys.add(document.id);
+      keys.add(document.ticketCode);
+      return true;
+    });
+    return [...additions, ...merged];
+  };
+
   const syncHistoryFromCloud = async (options?: { silent?: boolean }) => {
+    if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
+    const generation = cacheGenerationRef.current;
     // Modo silencioso: lo usa la sincronización automática del arranque, que no debe mostrar avisos
     // de "no hay historial" ni errores en pantalla (sí en la consola).
     const silent = options?.silent === true;
@@ -2413,6 +3097,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       // 2) Descargar todo el historial del usuario (documentos + gastos) en una sola llamada.
       // Se renueva la sesión si hace falta: con un token caducado el servidor respondería 401.
       const authToken = await ensureFreshAccessToken();
+      if (cacheGenerationRef.current !== generation) return;
       if (!authToken) {
         if (!silent) setSyncHistoryError(tr('sync.login'));
         return;
@@ -2421,6 +3106,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         headers: { Authorization: 'Bearer ' + authToken },
       }, 30000);
       const result = await response.json() as SyncAllResult;
+      if (cacheGenerationRef.current !== generation) return;
       if (!response.ok || !result.ok) {
         throw new Error(result.error || 'HTTP ' + response.status);
       }
@@ -2437,24 +3123,15 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         }) as unknown as Transaction);
       // El recuento se calcula fuera del setState: si se calcula dentro, el aviso podría decir
       // "todavía no hay historial" aunque los tickets sí se hayan recuperado.
-      const existingDocKeys = new Set(transactions.flatMap((item) => [item.id, item.ticketCode]));
-      const restoredDocsToAdd = restoredDocs.filter((doc) => {
-        // El mismo ticket puede estar publicado varias veces en la nube: se recupera una sola vez.
-        if (existingDocKeys.has(doc.id) || existingDocKeys.has(doc.ticketCode)) return false;
-        existingDocKeys.add(doc.id);
-        existingDocKeys.add(doc.ticketCode);
-        return true;
-      });
-      const restoredDocsCount = restoredDocsToAdd.length;
-      if (restoredDocsToAdd.length > 0) {
-        setTransactions((current) => {
-          const currentKeys = new Set(current.flatMap((item) => [item.id, item.ticketCode]));
-          const additions = restoredDocsToAdd.filter(
-            (doc) => !currentKeys.has(doc.id) && !currentKeys.has(doc.ticketCode)
-          );
-          return [...additions, ...current];
-        });
-      }
+      const mergedDocs = mergeCloudTransactions(transactions, restoredDocs);
+      const restoredDocsCount = mergedDocs.filter((document) => {
+        const previous = transactions.find((item) => item.id === document.id);
+        return !previous || JSON.stringify(previous) !== JSON.stringify(document);
+      }).length;
+      setTransactions((current) => cacheGenerationRef.current === generation ? mergeCloudTransactions(current, restoredDocs) : current);
+      setSelectedTicket((current) => current && cacheGenerationRef.current === generation
+        ? mergeCloudTransactions([current], restoredDocs).find((document) => document.id === current.id) ?? current
+        : current);
 
       // 4) Restaurar gastos (los datos si; la foto no se sube a la nube).
       const restoredExpenses = (Array.isArray(result.expenses) ? result.expenses : [])
@@ -2493,32 +3170,60 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         );
       }
     } catch (error) {
+      if (cacheGenerationRef.current !== generation) return;
       if (silent) {
         console.warn('No se pudo sincronizar el historial automaticamente:', error);
       } else {
         setSyncHistoryError(error instanceof Error ? error.message : tr('sync.error'));
       }
     } finally {
-      setSyncHistoryLoading(false);
+      if (cacheGenerationRef.current === generation) setSyncHistoryLoading(false);
     }
   };
 
   // Sincronización automática: al abrir la app con una cuenta cuya suscripción está activa se
   // recupera el historial de la nube (tickets, facturas y gastos) sin pulsar el botón.
   useEffect(() => {
-    if (!isLoaded || !accessToken || !hasActiveSubscription) return;
+    if (!isLoaded || !accessToken || !hasActiveSubscription || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
     if (autoSyncDoneRef.current) return;
     autoSyncDoneRef.current = true;
     void syncHistoryFromCloudRef.current({ silent: true });
-  }, [isLoaded, accessToken, hasActiveSubscription]);
+  }, [isLoaded, accessToken, hasActiveSubscription, storageScope]);
+  useEffect(() => {
+    if (!isLoaded || !accessToken || !hasActiveSubscription || !storageScope) return;
+    const refreshHistory = () => {
+      if (AppState.currentState === 'active') void syncHistoryFromCloudRef.current({ silent: true });
+    };
+    const interval = setInterval(refreshHistory, 60000);
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state === 'active') refreshHistory();
+    });
+    return () => {
+      clearInterval(interval);
+      subscription.remove();
+    };
+  }, [isLoaded, accessToken, hasActiveSubscription, storageScope]);
   syncHistoryFromCloudRef.current = syncHistoryFromCloud;
   refreshUserSessionRef.current = refreshUserSession;
+  activateAccountCacheRef.current = activateAccountCache;
+  clearStoredSessionRef.current = clearStoredSession;
 
   const generateExpensePdfUri = async (expense: Expense): Promise<string> => {
+    const filename = buildPdfFilename([tr('expense.detail'), expense.expenseCode]);
     const expenseImageBase64 = await convertImageToBase64(expense.imageUri);
     if (!expenseImageBase64) {
       throw new Error('No se pudo convertir la foto del gasto para el PDF.');
     }
+
+    let expenseLogo = '';
+    if (expense.issuer?.logoUri) {
+      try {
+        expenseLogo = await convertImageToBase64(expense.issuer.logoUri);
+      } catch {
+        expenseLogo = '';
+      }
+    }
+    const expenseIssuer = expense.issuer ? renderIssuerBlock(expense.issuer, expenseLogo, true) : { topHtml: '', bottomHtml: '' };
 
     const htmlContent = `
       <!DOCTYPE html>
@@ -2526,8 +3231,9 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         <head>
           <meta charset="utf-8">
           <style>
-            body { font-family: 'Courier New', Courier, monospace; background-color: #ffffff; color: #000000; margin: 0; padding: 20px; display: flex; justify-content: center; }
-            .container { width: 100%; max-width: 600px; background: #fff; padding: 20px; border: 1px solid #cbd5e1; }
+            @page { size: A4; margin: 20px; }
+            body { font-family: 'Courier New', Courier, monospace; background-color: #ffffff; color: #000000; margin: 0; padding: 0; }
+            .container { width: 600px; max-width: 600px; margin: 0 auto; background: #fff; padding: 20px; border: 1px solid #cbd5e1; }
             .center { text-align: center; }
             .bold { font-weight: bold; }
             .title { font-size: 16px; font-weight: bold; margin-bottom: 4px; }
@@ -2541,6 +3247,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         </head>
         <body>
           <div class="container">
+            ${expenseIssuer.topHtml}
             <div class="center title">COMPROBANTE DE GASTO</div>
             <div class="center subtitle">Ref: ${expense.expenseCode}</div>
             <div class="divider"></div>
@@ -2561,12 +3268,13 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
             <div class="img-container">
               <img src="${expenseImageBase64}" class="expense-img" />
             </div>
+            ${expenseIssuer.bottomHtml}
           </div>
         </body>
       </html>
     `;
-    const { uri } = await Print.printToFileAsync({ html: htmlContent });
-    return uri;
+    const { uri } = await Print.printToFileAsync({ html: htmlContent, width: 595.28, height: 841.89, margins: { top: 15, bottom: 15, left: 15, right: 15 } });
+    return copyPdfForExport(uri, filename);
   };
 
   const generateAndShareExpensePdf = async (expense: Expense) => {
@@ -2582,11 +3290,11 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     if (!requireSubscription('enviar presupuestos o facturas')) return;
     const validClient = Object.fromEntries(Object.entries(presupuestoClient).map(([key, value]) => [key, value.trim()])) as Client;
     if (!validClient.name || !validClient.nif || !validClient.address) {
-      Alert.alert('Datos incompletos', 'Indica nombre, NIF/CIF y dirección fiscal del cliente.');
+      Alert.alert(tr('validation.error'), tr('validation.client'));
       return;
     }
     if (!presupuestoClientEmail.trim()) {
-      Alert.alert('Correo requerido', `Introduce el correo electrónico del cliente para enviarle la ${presupuestoDocumentType === 'FACTURA' ? 'factura' : 'presupuesto'}.`);
+      Alert.alert(tr('validation.error'), tr('validation.email'));
       return;
     }
 
@@ -2595,7 +3303,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       .filter(i => i.description !== '' && i.price !== '');
 
     if (validItems.length === 0) {
-      Alert.alert('Sin productos', 'Añade al menos un producto con su descripción y precio.');
+      Alert.alert(tr('validation.error'), tr('validation.items'));
       return;
     }
 
@@ -2606,7 +3314,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     try {
       const isAvailable = await MailComposer.isAvailableAsync();
       if (!isAvailable) {
-        Alert.alert('Correo no disponible', 'Este dispositivo no tiene configurado un cliente de correo.');
+        Alert.alert(tr('validation.error'), tr('validation.mailUnavailable'));
         return;
       }
 
@@ -2638,16 +3346,18 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
 
       const pdfUri = await generatePdfFileUri(publishedDocument);
 
-      await MailComposer.composeAsync({
+      const result = await MailComposer.composeAsync({
         recipients: [presupuestoClientEmail.trim()],
         subject: `${presupuestoDocumentType === 'FACTURA' ? 'Factura' : 'Presupuesto'} de Servicios - Ref: ${publishedDocument.ticketCode} (${issuer.name})`,
         body: `Estimado/a ${validClient.name},\n\nAdjunto le hacemos llegar la ${presupuestoDocumentType === 'FACTURA' ? 'factura' : 'presupuesto'} solicitada con importe total de ${formatCurrency(totalWithIva)}.\n\nAtentamente,\n${issuer.name}`,
         attachments: [pdfUri],
       });
 
-      Alert.alert('¡Enviado!', `La ${presupuestoDocumentType === 'FACTURA' ? 'factura' : 'presupuesto'} se ha enviado correctamente por correo.`);
+      if (result.status === MailComposer.MailComposerStatus.SENT || result.status === MailComposer.MailComposerStatus.SAVED) {
+        resetQuoteForm();
+      }
     } catch {
-      Alert.alert('Error', 'No se pudo generar o enviar el presupuesto por correo.');
+      Alert.alert(tr('validation.error'), tr('quote.sendFailed'));
     }
   };
 
@@ -2669,16 +3379,17 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       item.id === publishedTransaction.id ? publishedTransaction : item
     ));
     setSelectedTicket(publishedTransaction);
-    Alert.alert('Factura cobrada', 'La factura se ha guardado junto con el resto de cobros del TPV.');
+    resetQuoteForm();
+    Alert.alert(documentTypeLabel('FACTURA'), tr('cash.saved'));
   };
 
   const deleteCashInvoiceDraft = (draft: CashInvoiceDraft) => {
     Alert.alert(
-      'Eliminar factura pendiente',
-      `¿Quieres eliminar la factura ${draft.ticketCode}? No se marcará como cobrada.`,
+      tr('workflow.delete'),
+      tr('cash.deleteConfirm').replace('{code}', draft.ticketCode),
       [
-        { text: 'Cancelar', style: 'cancel' },
-        { text: 'Eliminar', style: 'destructive', onPress: () => setCashInvoiceDrafts((current) => current.filter((item) => item.id !== draft.id)) },
+        { text: tr('common.cancel'), style: 'cancel' },
+        { text: tr('workflow.delete'), style: 'destructive', onPress: () => setCashInvoiceDrafts((current) => current.filter((item) => item.id !== draft.id)) },
       ],
     );
   };
@@ -2718,8 +3429,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
 
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      allowsEditing: true,
-      aspect: [1, 1],
+      allowsEditing: false,
       quality: 0.7,
     });
 
@@ -2739,8 +3449,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
 
     const result = await ImagePicker.launchCameraAsync({
       mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      allowsEditing: true,
-      aspect: [1, 1],
+      allowsEditing: false,
       quality: 0.7,
     });
 
@@ -2813,79 +3522,88 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     }
   };
 
-  const applyRefundToTicket = async (targetTicket: Transaction, refundVal: number, pinAuthorized = false) => {
-    if (userRole === 'empleado' && !pinAuthorized) {
+  const applyRefundToTicket = async (targetTicket: Transaction, refundVal: number, pin?: string): Promise<boolean> => {
+    if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return false;
+    if (refundBusyRef.current) return false;
+    if (!Number.isFinite(refundVal) || refundVal <= 0) {
+      Alert.alert('Importe inválido', 'Introduce un importe positivo para devolver.');
+      return false;
+    }
+    if (userRole === 'empleado' && (typeof pin !== 'string' || !pin.trim())) {
       setPendingRefund({ ticket: targetTicket, amount: refundVal });
       setOwnerPinInput('');
       setPinModalVisible(true);
-      return;
+      return false;
     }
 
     if (targetTicket.type !== 'COBRO') {
       Alert.alert('Acción no permitida', 'Solo se pueden realizar devoluciones sobre tickets de cobro originales.');
-      return;
+      return false;
     }
     if (targetTicket.isRefunded || targetTicket.amount <= 0) {
       Alert.alert('⚠️ Devolución bloqueada', `El ticket ${targetTicket.ticketCode} ya no tiene saldo disponible.`);
-      return;
+      return false;
     }
 
     if (refundVal > targetTicket.amount) {
       Alert.alert('Importe excedido', `El importe a devolver no puede superar el saldo actual del ticket (${formatCurrency(targetTicket.amount)}).`);
-      return;
+      return false;
     }
-
-    const originalAmount = targetTicket.originalAmount ?? targetTicket.amount;
-    const refundedAmount = (targetTicket.refundHistory || []).reduce((sum, refund) => sum + refund.amount, 0);
-    const newRefundedAmount = refundedAmount + refundVal;
-    const newRemainingAmount = originalAmount - newRefundedAmount;
-    const isFullyDepleted = newRemainingAmount <= 0.005;
-    const updatedSubtotal = newRemainingAmount / (1 + (targetTicket.ivaRateApplied / 100));
-    const refundDate = new Date().toISOString();
-    const updatedTicket: Transaction = {
-      ...targetTicket,
-      documentType: 'COMPRA/DEVOLUCIONES',
-      amount: newRemainingAmount,
-      originalAmount,
-      subtotal: updatedSubtotal,
-      iva: newRemainingAmount - updatedSubtotal,
-      isRefunded: isFullyDepleted,
-      refundHistory: [
-        ...(targetTicket.refundHistory || []),
-        { amount: refundVal, date: refundDate },
-      ],
-      publicUrl: undefined,
-    };
-
-    const publishedTicket = await registerTransactionDocument(updatedTicket);
-    setTransactions((current) => current.map((transaction) =>
-      transaction.id === targetTicket.id ? publishedTicket : transaction
-    ));
-    setSelectedTicket(publishedTicket);
+    const generation = cacheGenerationRef.current;
+    refundBusyRef.current = true;
+    try {
+      if (!accessToken || !configuredDocumentApiUrl) throw new Error('Inicia sesión y conecta con el servidor para devolver.');
+      const authToken = await ensureFreshAccessToken();
+      if (cacheGenerationRef.current !== generation) return false;
+      if (!authToken) throw new Error('La sesión ha caducado. Vuelve a iniciar sesión.');
+      const hasPreviousRefunds = Boolean(targetTicket.refundHistory?.length || targetTicket.documentType === 'COMPRA/DEVOLUCIONES');
+      const original = targetTicket.publicUrl || hasPreviousRefunds ? targetTicket : await registerTransactionDocument(targetTicket);
+      if (cacheGenerationRef.current !== generation) return false;
+      if (!original.publicUrl && !hasPreviousRefunds) throw new Error('No se pudo publicar el ticket original. Reintenta la devolución.');
+      const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/documents/refund`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
+        body: JSON.stringify({ documentId: original.id, amount: refundVal, ...(userRole === 'empleado' ? { pin: pin?.trim() } : {}) }),
+      }, 15000);
+      const result = await response.json() as { ok?: boolean; document?: Transaction; error?: string };
+      if (cacheGenerationRef.current !== generation) return false;
+      if (!response.ok || !result.ok || !result.document || result.document.id !== targetTicket.id || !result.document.publicUrl || !Number.isFinite(result.document.amount)) {
+        throw new Error(result.error || 'El servidor no confirmó la devolución.');
+      }
+      const updatedTicket = result.document;
+      setTransactions((current) => current.map((transaction) => transaction.id === targetTicket.id ? updatedTicket : transaction));
+      setSelectedTicket(updatedTicket);
+      return true;
+    } catch (error) {
+      if (cacheGenerationRef.current === generation) Alert.alert('Devolución no realizada', error instanceof Error ? error.message : 'No se pudo conectar con el servidor.');
+      return false;
+    } finally {
+      if (cacheGenerationRef.current === generation) refundBusyRef.current = false;
+    }
   };
 
-  const confirmRefundPin = () => {
-    if (!ownerPin) {
-      Alert.alert('PIN no configurado', 'El usuario principal debe configurar primero el PIN en Configuración.');
-      setPinModalVisible(false);
-      return;
-    }
-    if (ownerPinInput !== ownerPin) {
-      Alert.alert('PIN incorrecto', 'El PIN introducido no es válido.');
-      setOwnerPinInput('');
-      return;
-    }
+  const confirmRefundPin = async () => {
     const refund = pendingRefund;
-    setPinModalVisible(false);
-    setPendingRefund(null);
-    if (refund) void applyRefundToTicket(refund.ticket, refund.amount, true);
+    const pin = ownerPinInput.trim();
+    const generation = cacheGenerationRef.current;
+    if (!refund || refundBusyRef.current) return;
+    if (!/^\d{4,6}$/.test(pin)) {
+      Alert.alert('PIN inválido', 'El PIN debe tener entre 4 y 6 dígitos.');
+      return;
+    }
+    if (await applyRefundToTicket(refund.ticket, refund.amount, pin) && cacheGenerationRef.current === generation) {
+      setPinModalVisible(false);
+      setPendingRefund(null);
+      setOwnerPinInput('');
+    }
   };
 
-  const handleSetupOwnerPin = () => {
+  const handleSetupOwnerPin = async () => {
+    const generation = cacheGenerationRef.current;
     const trimmedNew = ownerPinSetupNew.trim();
     const trimmedConfirm = ownerPinSetupConfirm.trim();
 
-    if (trimmedNew.length < 4 || trimmedNew.length > 6) {
+    if (!/^\d{4,6}$/.test(trimmedNew)) {
       Alert.alert('PIN inválido', 'El PIN debe tener entre 4 y 6 dígitos.');
       return;
     }
@@ -2895,23 +3613,24 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       return;
     }
 
-    setOwnerPin(trimmedNew);
+    if (!await saveCompanyPin(trimmedNew) || cacheGenerationRef.current !== generation) return;
     setOwnerPinSetupNew('');
     setOwnerPinSetupConfirm('');
     Alert.alert('PIN guardado', 'Tu PIN principal se ha configurado correctamente.');
   };
 
-  const handleChangeOwnerPin = () => {
+  const handleChangeOwnerPin = async () => {
+    const generation = cacheGenerationRef.current;
     const current = ownerPinChangeCurrent.trim();
     const next = ownerPinChangeNew.trim();
     const confirm = ownerPinChangeConfirm.trim();
 
-    if (current !== ownerPin) {
-      Alert.alert('PIN actual incorrecto', 'El PIN actual no coincide.');
+    if (!/^\d{4,6}$/.test(current)) {
+      Alert.alert('PIN inválido', 'El PIN actual debe tener entre 4 y 6 dígitos.');
       return;
     }
 
-    if (next.length < 4 || next.length > 6) {
+    if (!/^\d{4,6}$/.test(next)) {
       Alert.alert('PIN inválido', 'El nuevo PIN debe tener entre 4 y 6 dígitos.');
       return;
     }
@@ -2921,7 +3640,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       return;
     }
 
-    setOwnerPin(next);
+    if (!await saveCompanyPin(next, current) || cacheGenerationRef.current !== generation) return;
     setOwnerPinChangeCurrent('');
     setOwnerPinChangeNew('');
     setOwnerPinChangeConfirm('');
@@ -3073,16 +3792,20 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   };
 
   const generatePdfFileUri = async (transaction: Transaction): Promise<string> => {
+    const filename = buildPdfFilename([documentTypeLabel(transaction.documentType), transaction.ticketCode]);
     const qrApiUrl = getTransactionQrUrl(transaction, 140);
+    const isA4 = transaction.documentType === 'FACTURA COMPLETA' ||
+      transaction.documentType === 'FACTURA' ||
+      transaction.documentType === 'PRESUPUESTO';
 
-    let logoHtml = '';
+    let logoDataURL = '';
     if (transaction.issuer.logoUri) {
       console.log('🖼️ Procesando logo para PDF...');
       try {
         const base64Logo = await convertImageToBase64(transaction.issuer.logoUri);
         if (base64Logo && base64Logo.length > 50) {
           console.log('✅ Logo convertido correctamente');
-          logoHtml = `<div style="text-align: center; margin-bottom: 15px; padding-top: 10px;"><img src="${base64Logo}" style="width: 85px; height: 85px;" /></div>`;
+          logoDataURL = base64Logo;
         } else {
           console.log('❌ Logo base64 no válido, longitud:', base64Logo?.length || 0);
         }
@@ -3090,6 +3813,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         console.log('❌ Error procesando logo:', logoError);
       }
     }
+    const documentLogo = renderIssuerBlock(transaction.issuer, logoDataURL, isA4);
 
     const clientHtml = transaction.client ? `
       <div style="margin-top: 10px; border-top: 1px dashed #000; padding-top: 8px;">
@@ -3134,11 +3858,8 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       `
       : '';
 
-    const isA4 = transaction.documentType === 'FACTURA COMPLETA' ||
-      transaction.documentType === 'FACTURA' ||
-      transaction.documentType === 'PRESUPUESTO';
     const containerStyle = isA4
-      ? 'width: 100%; max-width: 600px; background: #fff; padding: 20px; border: 1px solid #cbd5e1;'
+      ? 'width: 600px; max-width: 600px; background: #fff; padding: 20px; border: 1px solid #cbd5e1;'
       : 'width: 280px; background: #fff; padding: 12px; font-size: 11px;';
 
     const htmlContent = `
@@ -3147,8 +3868,9 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         <head>
           <meta charset="utf-8">
           <style>
-            body { font-family: 'Courier New', Courier, monospace; background-color: #ffffff; color: #000000; margin: 0; padding: 20px; display: flex; justify-content: center; }
-            .container { ${containerStyle} }
+            @page { size: A4; margin: 20px; }
+            body { font-family: 'Courier New', Courier, monospace; background-color: #ffffff; color: #000000; margin: 0; padding: 0; }
+            .container { ${containerStyle} margin: 0 auto; }
             .center { text-align: center; }
             .bold { font-weight: bold; }
             .title { font-size: ${isA4 ? '16px' : '13px'}; font-weight: bold; margin-bottom: 4px; }
@@ -3163,10 +3885,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         </head>
         <body>
           <div class="container">
-            ${logoHtml}
-            <div class="center title">${transaction.issuer.name}</div>
-            <div class="center subtitle">NIF: ${transaction.issuer.nif}</div>
-            <div class="center subtitle">${transaction.issuer.address}</div>
+            ${documentLogo.topHtml}
             <div class="divider"></div>
             <div class="center bold" style="font-size: ${isA4 ? '14px' : '11px'}; margin-bottom: 6px;">${transaction.documentType}</div>
             <div class="subtitle">Ref: <b>${transaction.ticketCode}</b></div>
@@ -3192,20 +3911,22 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
               <span>${formatCurrency(transaction.amount)}</span>
             </div>
             ${qrSectionHtml}
+            ${documentLogo.bottomHtml}
           </div>
         </body>
       </html>
     `;
 
+    const logoHtml = documentLogo.topHtml + documentLogo.bottomHtml;
     console.log('📄 HTML generado, Logo HTML incluido?', logoHtml.length > 0);
     if (logoHtml.length > 0) {
       console.log('   Logo HTML (primeros 100 caracteres):', logoHtml.substring(0, 100));
     }
     console.log('📄 Longitud total HTML:', htmlContent.length);
 
-    const { uri } = await Print.printToFileAsync({ html: htmlContent });
+    const { uri } = await Print.printToFileAsync({ html: htmlContent, ...(isA4 ? { width: 595.28, height: 841.89, margins: { top: 15, bottom: 15, left: 15, right: 15 } } : {}) });
     console.log('✅ PDF generado:', uri);
-    return uri;
+    return copyPdfForExport(uri, filename);
   };
 
   const ensurePublishedTransaction = async (transaction: Transaction): Promise<Transaction> => {
@@ -3257,9 +3978,11 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   };
 
   const sendManagerReportByEmail = async () => {
-    if (!requireSubscription('enviar informes al gestor')) return;
+    const reportLocale = appLocale;
+    const reportTr = (key: string) => translateKey(reportLocale, key);
+    if (!requireSubscription(reportTr('emailReport.manager.feature'))) return;
     if (!startDateInput.trim() || !endDateInput.trim()) {
-      Alert.alert('Fechas requeridas', 'Introduce la fecha de inicio y de fin (formato YYYY-MM-DD o DD/MM/YYYY).');
+      Alert.alert(reportTr('emailReport.datesRequiredTitle'), reportTr('emailReport.datesRequired'));
       return;
     }
 
@@ -3267,12 +3990,12 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     const end = parseDateInput(endDateInput);
 
     if (!start || !end) {
-      Alert.alert('Fecha inválida', 'Comprueba el formato de las fechas introducidas.');
+      Alert.alert(reportTr('emailReport.invalidDateTitle'), reportTr('emailReport.invalidDate'));
       return;
     }
 
     if (start > end) {
-      Alert.alert('Rango inválido', 'La fecha de inicio no puede ser posterior a la fecha de fin.');
+      Alert.alert(reportTr('emailReport.invalidRangeTitle'), reportTr('emailReport.invalidRange'));
       return;
     }
 
@@ -3290,7 +4013,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     });
 
     if (filtered.length === 0 && filteredExpenses.length === 0) {
-      Alert.alert('Sin registros', 'No hay transacciones ni gastos en el rango de fechas seleccionado.');
+      Alert.alert(reportTr('emailReport.emptyTitle'), reportTr('emailReport.manager.empty'));
       return;
     }
 
@@ -3302,100 +4025,44 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     const totalExp = filteredExpenses.reduce((acc, e) => acc + e.amount, 0);
     const netIncome = totalIncome - totalRefunds;
 
-    const reportHtml = `
-      <!DOCTYPE html>
-      <html>
-        <head>
-          <meta charset="utf-8">
-          <style>
-            body { font-family: Helvetica, Arial, sans-serif; padding: 20px; color: #1e293b; }
-            h1 { font-size: 20px; text-align: center; color: #0f172a; }
-            h2 { font-size: 14px; border-bottom: 2px solid #cbd5e1; padding-bottom: 4px; margin-top: 20px; }
-            .summary { background: #f8fafc; padding: 12px; border-radius: 6px; margin-bottom: 20px; }
-            table { width: 100%; border-collapse: collapse; font-size: 11px; margin-top: 10px; }
-            th, td { border: 1px solid #cbd5e1; padding: 6px 8px; text-align: left; }
-            th { background: #e2e8f0; font-weight: bold; }
-          </style>
-        </head>
-        <body>
-          <h1>INFORME DE FACTURACIÓN Y GASTOS PARA TU GESTORÍA</h1>
-          <p style="text-align: center; font-size: 12px; color: #64748b;">Periodo: ${startDateInput} al ${endDateInput}</p>
-          <p style="text-align: center; font-size: 10px; color: #64748b;">Documento preparado para revisión del gestor. Esta aplicación no sustituye a un asesor fiscal ni a una gestoría.</p>
-          
-          <div class="summary">
-            <strong>Emisor:</strong> ${issuer.name} (NIF: ${issuer.nif})<br/>
-            <strong>Total Cobros:</strong> ${formatCurrency(totalIncome)}<br/>
-            <strong>Total Devoluciones:</strong> ${formatCurrency(totalRefunds)}<br/>
-            <strong>Total Gastos:</strong> ${formatCurrency(totalExp)}<br/>
-            <strong>Ventas netas tras devoluciones:</strong> ${formatCurrency(netIncome)}<br/>
-            <strong>Balance Neto tras gastos:</strong> ${formatCurrency(netIncome - totalExp)}
-          </div>
+    const report = buildEmailedReport({
+      locale: reportLocale,
+      kind: 'manager',
+      issuer,
+      range: { start, end },
+      transactions: filtered,
+      expenses: filteredExpenses,
+      totals: { income: totalIncome, refunds: totalRefunds, expenses: totalExp, netIncome, netBalance: netIncome - totalExp },
+    });
 
-          <h2>TRANSACCIONES (${filtered.length})</h2>
-          <table>
-            <tr>
-              <th>Ref</th>
-              <th>Fecha</th>
-              <th>Tipo</th>
-              <th>Cliente</th>
-              <th>Importe</th>
-            </tr>
-            ${filtered.map(t => `
-              <tr>
-                <td>${t.ticketCode}</td>
-                <td>${formatDate(t.createdAt)}</td>
-                <td>${t.type}</td>
-                <td>${t.client?.name || 'General'}</td>
-                <td>${formatCurrency(t.type === 'COBRO' ? (t.originalAmount ?? t.amount) : t.amount)}</td>
-              </tr>
-            `).join('')}
-          </table>
-
-          <h2>GASTOS (${filteredExpenses.length})</h2>
-          <table>
-            <tr>
-              <th>Ref</th>
-              <th>Fecha</th>
-              <th>Proveedor</th>
-              <th>Importe</th>
-            </tr>
-            ${filteredExpenses.map(e => `
-              <tr>
-                <td>${e.expenseCode}</td>
-                <td>${formatDate(e.createdAt)}</td>
-                <td>${e.provider}</td>
-                <td>${formatCurrency(e.amount)}</td>
-              </tr>
-            `).join('')}
-          </table>
-        </body>
-      </html>
-    `;
-
+    const filename = buildReportPdfFilename(reportTr('emailReport.manager.title'), start, end);
     try {
-      const { uri } = await Print.printToFileAsync({ html: reportHtml });
+      const { uri: generatedUri } = await Print.printToFileAsync({ html: report.html });
+      const uri = await copyPdfForExport(generatedUri, filename);
       const isAvailable = await MailComposer.isAvailableAsync();
       if (!isAvailable) {
-        await Sharing.shareAsync(uri);
+        await Sharing.shareAsync(uri, { UTI: '.pdf', mimeType: 'application/pdf' });
         return;
       }
 
       await MailComposer.composeAsync({
         recipients: [issuer.managerEmail || ''],
-        subject: `Informe de facturación y gastos (${startDateInput} a ${endDateInput}) - ${issuer.name}`,
-        body: `Adjunto el informe de facturación y gastos del periodo ${startDateInput} al ${endDateInput}, preparado para revisión del gestor.\n\nAtentamente,\n${issuer.name}`,
+        subject: report.subject,
+        body: report.body,
         attachments: [uri],
       });
       setManagerModalVisible(false);
     } catch {
-      Alert.alert('Error', 'No se pudo generar o enviar el informe al gestor.');
+      Alert.alert(reportTr('validation.error'), reportTr('emailReport.manager.error'));
     }
   };
 
   const sendCombinedReportByEmail = async () => {
-    if (!requireSubscription('enviar informes consolidados')) return;
+    const reportLocale = appLocale;
+    const reportTr = (key: string) => translateKey(reportLocale, key);
+    if (!requireSubscription(reportTr('emailReport.combined.feature'))) return;
     if (!transactionStartDateInput.trim() || !transactionEndDateInput.trim()) {
-      Alert.alert('Fechas requeridas', 'Introduce la fecha de inicio y de fin (formato YYYY-MM-DD).');
+      Alert.alert(reportTr('validation.error'), reportTr('validation.dates'));
       return;
     }
 
@@ -3403,12 +4070,12 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     const end = parseDateInput(transactionEndDateInput);
 
     if (!start || !end) {
-      Alert.alert('Fecha inválida', 'Comprueba el formato de las fechas introducidas.');
+      Alert.alert(reportTr('validation.error'), reportTr('validation.dates'));
       return;
     }
 
     if (start > end) {
-      Alert.alert('Rango inválido', 'La fecha de inicio no puede ser posterior a la fecha de fin.');
+      Alert.alert(reportTr('validation.error'), reportTr('validation.dates'));
       return;
     }
 
@@ -3434,103 +4101,49 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     const netBalance = totalIncome - totalRefunds - totalExpenses;
 
     if (filteredTransactions.length === 0 && filteredExpenses.length === 0) {
-      Alert.alert('Sin registros', 'No hay tickets, facturas ni gastos en el rango indicado.');
+      Alert.alert(reportTr('emailReport.emptyTitle'), reportTr('emailReport.combined.empty'));
       return;
     }
 
-    const reportHtml = `
-      <!DOCTYPE html>
-      <html>
-        <head>
-          <meta charset="utf-8">
-          <style>
-            body { font-family: Helvetica, Arial, sans-serif; padding: 20px; color: #1e293b; }
-            h1 { font-size: 20px; text-align: center; color: #0f172a; }
-            h2 { font-size: 14px; border-bottom: 2px solid #cbd5e1; padding-bottom: 4px; margin-top: 20px; }
-            .summary { background: #f8fafc; padding: 12px; border-radius: 6px; margin-bottom: 20px; }
-            table { width: 100%; border-collapse: collapse; font-size: 11px; margin-top: 10px; }
-            th, td { border: 1px solid #cbd5e1; padding: 6px 8px; text-align: left; }
-            th { background: #e2e8f0; font-weight: bold; }
-          </style>
-        </head>
-        <body>
-          <h1>INFORME CONSOLIDADO DE TICKETS, FACTURAS Y GASTOS</h1>
-          <p style="text-align: center; font-size: 12px; color: #64748b;">Periodo: ${transactionStartDateInput} al ${transactionEndDateInput}</p>
+    const report = buildEmailedReport({
+      locale: reportLocale,
+      kind: 'combined',
+      issuer,
+      range: { start, end },
+      transactions: filteredTransactions,
+      expenses: filteredExpenses,
+      totals: { income: totalIncome, refunds: totalRefunds, expenses: totalExpenses, netIncome: totalIncome - totalRefunds, netBalance },
+    });
 
-          <div class="summary">
-            <strong>Emisor:</strong> ${issuer.name} (NIF: ${issuer.nif})<br/>
-            <strong>Total Cobros:</strong> ${formatCurrency(totalIncome)}<br/>
-            <strong>Total Devoluciones:</strong> ${formatCurrency(totalRefunds)}<br/>
-            <strong>Total Gastos:</strong> ${formatCurrency(totalExpenses)}<br/>
-            <strong>Total con IVA:</strong> ${formatCurrency(netBalance)}
-          </div>
-
-          <h2>TICKETS Y FACTURAS (${filteredTransactions.length})</h2>
-          <table>
-            <tr>
-              <th>Ref</th>
-              <th>Fecha</th>
-              <th>Tipo</th>
-              <th>Cliente</th>
-              <th>Importe</th>
-            </tr>
-            ${filteredTransactions.length === 0 ? '<tr><td colspan="5">Sin transacciones</td></tr>' : filteredTransactions.map(t => `
-              <tr>
-                <td>${t.ticketCode}</td>
-                <td>${formatDate(t.createdAt)}</td>
-                <td>${t.type}</td>
-                <td>${t.client?.name || 'General'}</td>
-                <td>${formatCurrency(t.amount)}</td>
-              </tr>
-            `).join('')}
-          </table>
-
-          <h2>GASTOS (${filteredExpenses.length})</h2>
-          <table>
-            <tr>
-              <th>Ref</th>
-              <th>Fecha</th>
-              <th>Proveedor</th>
-              <th>Importe</th>
-            </tr>
-            ${filteredExpenses.length === 0 ? '<tr><td colspan="4">Sin gastos</td></tr>' : filteredExpenses.map(e => `
-              <tr>
-                <td>${e.expenseCode}</td>
-                <td>${formatDate(e.createdAt)}</td>
-                <td>${e.provider}</td>
-                <td>${formatCurrency(e.amount)}</td>
-              </tr>
-            `).join('')}
-          </table>
-        </body>
-      </html>
-    `;
-
+    const filename = buildReportPdfFilename(reportTr('emailReport.combined.title'), start, end);
     try {
-      const { uri } = await Print.printToFileAsync({ html: reportHtml });
+      const { uri: generatedUri } = await Print.printToFileAsync({ html: report.html });
+      const uri = await copyPdfForExport(generatedUri, filename);
       const isAvailable = await MailComposer.isAvailableAsync();
       if (!isAvailable) {
-        await Sharing.shareAsync(uri);
+        await Sharing.shareAsync(uri, { UTI: '.pdf', mimeType: 'application/pdf' });
         return;
       }
 
       await MailComposer.composeAsync({
         recipients: [issuer.managerEmail || ''],
-        subject: `Informe Consolidado (${transactionStartDateInput} a ${transactionEndDateInput}) - ${issuer.name}`,
-        body: `Adjunto informe consolidado con tickets, facturas y gastos del periodo ${transactionStartDateInput} al ${transactionEndDateInput}.\n\nAtentamente,\n${issuer.name}`,
+        subject: report.subject,
+        body: report.body,
         attachments: [uri],
       });
       setTransactionReportModalVisible(false);
     } catch {
-      Alert.alert('Error', 'No se pudo generar o enviar el informe consolidado.');
+      Alert.alert(reportTr('validation.error'), reportTr('emailReport.combined.error'));
     }
   };
 
   // NUEVA FUNCIÓN: Generar y enviar informe específico desde la pestaña Gastos/Facturación
   const sendExpenseSpecificReport = async () => {
-    if (!requireSubscription('enviar informes de gastos')) return;
+    const reportLocale = appLocale;
+    const reportTr = (key: string) => translateKey(reportLocale, key);
+    if (!requireSubscription(reportTr('emailReport.expenses.feature'))) return;
     if (!expenseStartDateInput.trim() || !expenseEndDateInput.trim()) {
-      Alert.alert('Fechas requeridas', 'Introduce la fecha de inicio y de fin (formato DD/MM/YYYY).');
+      Alert.alert(reportTr('validation.error'), reportTr('validation.dates'));
       return;
     }
 
@@ -3538,12 +4151,12 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     const end = parseDateInput(expenseEndDateInput);
 
     if (!start || !end) {
-      Alert.alert('Fecha inválida', 'Usa el formato DD/MM/YYYY, por ejemplo 07/09/2026.');
+      Alert.alert(reportTr('validation.error'), reportTr('validation.dates'));
       return;
     }
 
     if (start > end) {
-      Alert.alert('Rango inválido', 'La fecha de inicio no puede ser posterior a la fecha de fin.');
+      Alert.alert(reportTr('validation.error'), reportTr('validation.dates'));
       return;
     }
 
@@ -3556,127 +4169,126 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     });
 
     if (filteredExpenses.length === 0) {
-      Alert.alert('Sin gastos', 'No hay gastos registrados en el rango de fechas seleccionado.');
+      Alert.alert(reportTr('report.expenses'), reportTr('report.noExpenses'));
       return;
     }
 
     const totalExp = filteredExpenses.reduce((acc, e) => acc + e.amount, 0);
 
-    const reportHtml = `
-      <!DOCTYPE html>
-      <html>
-        <head>
-          <meta charset="utf-8">
-          <style>
-            body { font-family: Helvetica, Arial, sans-serif; padding: 20px; color: #1e293b; }
-            h1 { font-size: 20px; text-align: center; color: #0f172a; }
-            h2 { font-size: 14px; border-bottom: 2px solid #cbd5e1; padding-bottom: 4px; margin-top: 20px; }
-            .summary { background: #f8fafc; padding: 12px; border-radius: 6px; margin-bottom: 20px; }
-            table { width: 100%; border-collapse: collapse; font-size: 11px; margin-top: 10px; }
-            th, td { border: 1px solid #cbd5e1; padding: 6px 8px; text-align: left; }
-            th { background: #e2e8f0; font-weight: bold; }
-          </style>
-        </head>
-        <body>
-          <h1>INFORME DE GASTOS Y FACTURACIÓN</h1>
-          <p style="text-align: center; font-size: 12px; color: #64748b;">Periodo: ${expenseStartDateInput} al ${expenseEndDateInput}</p>
-          
-          <div class="summary">
-            <strong>Emisor:</strong> ${issuer.name} (NIF: ${issuer.nif})<br/>
-            <strong>Total Gastos en Periodo:</strong> ${formatCurrency(totalExp)}<br/>
-            <strong>Número de Registros:</strong> ${filteredExpenses.length}
-          </div>
+    const report = buildEmailedReport({
+      locale: reportLocale,
+      kind: 'expenses',
+      issuer,
+      range: { start, end },
+      transactions: [],
+      expenses: filteredExpenses,
+      totals: { income: 0, refunds: 0, expenses: totalExp, netIncome: 0, netBalance: 0 },
+    });
 
-          <h2>LISTADO DE GASTOS (${filteredExpenses.length})</h2>
-          <table>
-            <tr>
-              <th>Ref</th>
-              <th>Fecha</th>
-              <th>Proveedor</th>
-              <th>Importe</th>
-            </tr>
-            ${filteredExpenses.map(e => `
-              <tr>
-                <td>${e.expenseCode}</td>
-                <td>${formatDate(e.createdAt)}</td>
-                <td>${e.provider}</td>
-                <td>${formatCurrency(e.amount)}</td>
-              </tr>
-            `).join('')}
-          </table>
-        </body>
-      </html>
-    `;
-
+    const filename = buildReportPdfFilename(reportTr('emailReport.expenses.title'), start, end);
     try {
-      const { uri } = await Print.printToFileAsync({ html: reportHtml });
+      const { uri: generatedUri } = await Print.printToFileAsync({ html: report.html });
+      const uri = await copyPdfForExport(generatedUri, filename);
       const isAvailable = await MailComposer.isAvailableAsync();
       if (!isAvailable) {
-        await Sharing.shareAsync(uri);
+        await Sharing.shareAsync(uri, { UTI: '.pdf', mimeType: 'application/pdf' });
         return;
       }
 
       await MailComposer.composeAsync({
         recipients: [issuer.managerEmail || ''],
-        subject: `Informe de Gastos (${expenseStartDateInput} a ${expenseEndDateInput}) - ${issuer.name}`,
-        body: `Adjunto informe detallado de gastos del periodo ${expenseStartDateInput} al ${expenseEndDateInput}.\n\nAtentamente,\n${issuer.name}`,
+        subject: report.subject,
+        body: report.body,
         attachments: [uri],
       });
       setExpenseReportModalVisible(false);
     } catch {
-      Alert.alert('Error', 'No se pudo generar o enviar el informe de gastos.');
+      Alert.alert(reportTr('validation.error'), reportTr('emailReport.expenses.error'));
     }
   };
 
-  if (authLoading) {
+  if (authLoading || (accessToken && (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope))) {
     return (
       <SafeAreaView style={styles.safeArea}>
         <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24 }}>
-          <Text style={styles.modalTitle}>Cargando sesión...</Text>
+          <Text style={styles.modalTitle}>{tr('auth.loading')}</Text>
         </View>
       </SafeAreaView>
     );
   }
 
   if (!accessToken) {
+    const switchAuthMode = (mode: 'login' | 'register') => { setAuthMode(mode); setAuthError(''); };
+    const authReady = authRegistrationRole !== null && deviceIdStatus === 'ready' && !authSubmitting;
+    const authFieldLabel = { fontSize: 12, fontWeight: '600' as const, color: '#334155', marginTop: 10 };
     return (
       <SafeAreaView style={styles.safeArea}>
-        <ScrollView contentContainerStyle={{ flexGrow: 1, justifyContent: 'center', padding: 24 }}>
+        <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+        <ScrollView contentContainerStyle={{ flexGrow: 1, justifyContent: 'center', padding: 24 }} keyboardShouldPersistTaps="handled">
           <View style={[styles.card, { padding: 20 }]}>
-            <Text style={styles.modalTitle}>TPV & GESTIÓN DE NEGOCIO</Text>
-            <Text style={[styles.modalSubtitle, { marginBottom: 18 }]}>Accede a tu cuenta para continuar</Text>
-            {authMode === 'register' ? (
-              <>
-                <TextInput style={styles.input} placeholder="Nombre completo" placeholderTextColor="#94a3b8" value={authFullName} onChangeText={setAuthFullName} />
-                <View style={styles.rowButtons}>
-                  <Pressable style={[styles.secondaryButton, { flex: 1, backgroundColor: authRegistrationRole === 'principal' ? '#dcfce7' : '#f1f5f9' }]} onPress={() => setAuthRegistrationRole('principal')}>
-                    <Text style={styles.secondaryButtonText}>Soy principal</Text>
+            <Text style={styles.modalTitle}>TPV & GESTIÓN</Text>
+            {authRegistrationRole === null ? (
+                <View style={[styles.rowButtons, { marginTop: 14 }]}>
+                  <Pressable testID="auth-role-principal" accessibilityRole="button" style={[styles.secondaryButton, { flex: 1, backgroundColor: '#dcfce7' }]} onPress={() => selectAuthRole('principal')}>
+                    <Text style={styles.secondaryButtonText}>{tr('auth.rolePrincipal')}</Text>
                   </Pressable>
-                  <Pressable style={[styles.secondaryButton, { flex: 1, marginLeft: 8, backgroundColor: authRegistrationRole === 'empleado' ? '#dbeafe' : '#f1f5f9' }]} onPress={() => setAuthRegistrationRole('empleado')}>
-                    <Text style={styles.secondaryButtonText}>Soy empleado</Text>
+                  <Pressable testID="auth-role-empleado" accessibilityRole="button" style={[styles.secondaryButton, { flex: 1, marginLeft: 8, backgroundColor: '#dbeafe' }]} onPress={() => selectAuthRole('empleado')}>
+                    <Text style={styles.secondaryButtonText}>{tr('auth.roleEmployee')}</Text>
                   </Pressable>
                 </View>
+            ) : (
+              <>
+                <Pressable testID="auth-change-role" accessibilityRole="button" disabled={authSubmitting} style={{ marginTop: 14, marginBottom: 10 }} onPress={() => selectAuthRole(null)}>
+                  <Text style={styles.secondaryButtonText}>{tr('auth.changeRole')}</Text>
+                </Pressable>
                 {authRegistrationRole === 'principal' ? (
-                  <TextInput style={styles.input} placeholder="Nombre de la empresa" placeholderTextColor="#94a3b8" value={authCompanyName} onChangeText={setAuthCompanyName} />
-                ) : (
+                  <View style={styles.rowButtons} accessibilityRole="tablist">
+                    <Pressable testID="auth-tab-login" accessibilityRole="tab" accessibilityState={{ selected: authMode === 'login' }} disabled={authSubmitting} style={[styles.secondaryButton, { flex: 1, backgroundColor: authMode === 'login' ? '#0f172a' : '#f1f5f9' }]} onPress={() => switchAuthMode('login')}>
+                      <Text style={[styles.secondaryButtonText, authMode === 'login' ? { color: '#ffffff' } : null]}>{tr('auth.tabLogin')}</Text>
+                    </Pressable>
+                    <Pressable testID="auth-tab-register" accessibilityRole="tab" accessibilityState={{ selected: authMode === 'register' }} disabled={authSubmitting} style={[styles.secondaryButton, { flex: 1, marginLeft: 8, backgroundColor: authMode === 'register' ? '#0f172a' : '#f1f5f9' }]} onPress={() => switchAuthMode('register')}>
+                      <Text style={[styles.secondaryButtonText, authMode === 'register' ? { color: '#ffffff' } : null]}>{tr('auth.tabRegister')}</Text>
+                    </Pressable>
+                  </View>
+                ) : null}
+                {authRegistrationRole === 'empleado' || authMode === 'register' ? (
                   <>
-                    <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 10 }]}>Introduce el código que te ha dado el usuario principal. Tu cuenta solo tendrá acceso al TPV.</Text>
-                    <TextInput style={styles.input} placeholder="Código de empleado" placeholderTextColor="#94a3b8" autoCapitalize="characters" secureTextEntry value={authEmployeeAccessCode} onChangeText={setAuthEmployeeAccessCode} />
+                    <Text style={authFieldLabel}>{tr('auth.fullName')}</Text>
+                    <TextInput testID="auth-full-name" style={styles.input} placeholder={tr('auth.fullName')} placeholderTextColor="#94a3b8" autoComplete="name" value={authFullName} onChangeText={setAuthFullName} />
                   </>
-                )}
+                ) : null}
+                {authRegistrationRole === 'principal' && authMode === 'register' ? (
+                  <>
+                    <Text style={authFieldLabel}>{tr('auth.companyName')}</Text>
+                    <TextInput testID="auth-company-name" style={styles.input} placeholder={tr('auth.companyName')} placeholderTextColor="#94a3b8" value={authCompanyName} onChangeText={setAuthCompanyName} />
+                  </>
+                ) : null}
+                <Text style={authFieldLabel}>{tr(authRegistrationRole === 'empleado' ? 'auth.companyEmail' : 'auth.email')}</Text>
+                <TextInput testID="auth-email" style={styles.input} placeholder={tr(authRegistrationRole === 'empleado' ? 'auth.companyEmail' : 'auth.email')} placeholderTextColor="#94a3b8" keyboardType="email-address" autoCapitalize="none" autoCorrect={false} value={authEmail} onChangeText={setAuthEmail} />
+                {authRegistrationRole === 'empleado' ? (
+                  <>
+                    <Text style={authFieldLabel}>{tr('registration.additionalCode')}</Text>
+                    <TextInput testID="auth-employee-code" style={styles.input} placeholder={tr('registration.additionalCode')} placeholderTextColor="#94a3b8" autoCapitalize="characters" autoCorrect={false} value={authEmployeeAccessCode} onChangeText={setAuthEmployeeAccessCode} />
+                  </>
+                ) : null}
+                {authRegistrationRole === 'principal' ? (
+                  <>
+                    <Text style={authFieldLabel}>{tr('auth.password')}</Text>
+                    <TextInput testID="auth-password" style={styles.input} placeholder={authMode === 'register' ? tr('auth.passwordHint') : tr('auth.password')} placeholderTextColor="#94a3b8" secureTextEntry value={authPassword} onChangeText={setAuthPassword} />
+                  </>
+                ) : null}
+                {authError ? <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 8 }}>{authError}</Text> : null}
+                {deviceIdStatus === 'unavailable' && !authError ? <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 8 }}>{tr('auth.deviceUnavailable')}</Text> : null}
+                <Pressable testID="auth-submit" disabled={!authReady} style={[styles.primaryButton, { marginTop: 14, opacity: authReady ? 1 : 0.5 }]} onPress={() => void submitAuth()}>
+                  <Text style={styles.primaryButtonText}>
+                    {deviceIdStatus === 'loading' ? tr('auth.preparingDevice') : authSubmitting ? tr('auth.submitting') : authRegistrationRole === 'empleado' || authMode === 'login' ? tr('auth.submitLogin') : tr('auth.submitRegister')}
+                  </Text>
+                </Pressable>
               </>
-            ) : null}
-            <TextInput style={styles.input} placeholder="Email" placeholderTextColor="#94a3b8" keyboardType="email-address" autoCapitalize="none" value={authEmail} onChangeText={setAuthEmail} />
-            <TextInput style={styles.input} placeholder="Contraseña (mínimo 8 caracteres)" placeholderTextColor="#94a3b8" secureTextEntry value={authPassword} onChangeText={setAuthPassword} />
-            {authError ? <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 8 }}>{authError}</Text> : null}
-            <Pressable style={[styles.primaryButton, { marginTop: 14 }]} onPress={() => void submitAuth()}>
-              <Text style={styles.primaryButtonText}>{authMode === 'login' ? 'Iniciar sesión' : 'Crear cuenta'}</Text>
-            </Pressable>
-            <Pressable style={[styles.secondaryButton, { marginTop: 8 }]} onPress={() => { setAuthMode(authMode === 'login' ? 'register' : 'login'); setAuthError(''); }}>
-              <Text style={styles.secondaryButtonText}>{authMode === 'login' ? 'Crear una cuenta nueva' : 'Ya tengo una cuenta'}</Text>
-            </Pressable>
+            )}
           </View>
         </ScrollView>
+        </KeyboardAvoidingView>
       </SafeAreaView>
     );
   }
@@ -3778,7 +4390,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       <View style={styles.header}>
         <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
           <View style={{ flex: 1 }}>
-            <Text style={styles.headerTitle}>TPV & GESTIÓN DE NEGOCIO</Text>
+            <Text style={styles.headerTitle}>TPV & GESTIÓN</Text>
             <Text style={styles.headerSubtitle}>{issuer.name}</Text>
             {/* Estado real de la suscripcion: lo devuelve el backend y antes no se mostraba. */}
             {subscriptionLoading ? (
@@ -3867,17 +4479,17 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         {activeTab === 'gastos_facturacion' && (
           <ScrollView contentContainerStyle={styles.scrollContent}>
             <View style={styles.card}>
-              <Text style={styles.cardTitle}>📥 REGISTRAR NUEVO GASTO</Text>
+              <Text style={styles.cardTitle}>📥 {tr('expense.new')}</Text>
               <TextInput
                 style={styles.input}
-                placeholder="Nombre del Proveedor / Establecimiento"
+                placeholder={tr('expense.providerInput')}
                 placeholderTextColor="#94a3b8"
                 value={expenseProvider}
                 onChangeText={setExpenseProvider}
               />
               <TextInput
                 style={styles.input}
-                placeholder="Importe con IVA (€) ej: 45.90"
+                placeholder={tr('expense.amountInput')}
                 placeholderTextColor="#94a3b8"
                 keyboardType="numeric"
                 value={expenseAmountInput}
@@ -3885,22 +4497,22 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
               />
               <View style={styles.rowButtons}>
                 <Pressable style={styles.secondaryButton} onPress={() => pickExpenseImage(true)}>
-                  <Text style={styles.secondaryButtonText}>📷 Hacer Foto</Text>
+                  <Text style={styles.secondaryButtonText}>📷 {tr('expense.photo')}</Text>
                 </Pressable>
                 <Pressable style={styles.secondaryButton} onPress={() => pickExpenseImage(false)}>
-                  <Text style={styles.secondaryButtonText}>🖼️ Galería</Text>
+                  <Text style={styles.secondaryButtonText}>🖼️ {tr('expense.gallery')}</Text>
                 </Pressable>
               </View>
               {expenseImageUri && (
                 <View style={styles.previewContainer}>
                   <Image source={{ uri: expenseImageUri }} style={styles.previewImage} />
                   <Pressable onPress={() => setExpenseImageUri(null)}>
-                    <Text style={styles.removePhotoText}>Eliminar foto</Text>
+                    <Text style={styles.removePhotoText}>{tr('expense.removePhoto')}</Text>
                   </Pressable>
                 </View>
               )}
               <Pressable style={styles.primaryButton} onPress={saveExpense}>
-                <Text style={styles.primaryButtonText}>Guardar Gasto</Text>
+                <Text style={styles.primaryButtonText}>{tr('expense.save')}</Text>
               </Pressable>
             </View>
 
@@ -3927,22 +4539,22 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
 
             <View style={{ marginBottom: 16 }}>
               <Pressable style={[styles.primaryButton, { backgroundColor: '#0284c7' }]} onPress={() => setTransactionReportModalVisible(true)}>
-                <Text style={styles.primaryButtonText}>📄 Generar Informe Consolidado (Tickets + Gastos)</Text>
+                <Text style={styles.primaryButtonText}>📄 {tr('report.generateCombined')}</Text>
               </Pressable>
             </View>
 
             <View style={styles.card}>
-              <Text style={styles.cardTitle}>📋 LISTADO DE GASTOS REGISTRADOS ({expenses.length})</Text>
+              <Text style={styles.cardTitle}>📋 {tr('expense.list').replace('{count}', String(expenses.length))}</Text>
               {expenses.length === 0 ? (
-                <Text style={styles.emptyText}>No hay gastos registrados todavía.</Text>
+                <Text style={styles.emptyText}>{tr('expense.empty')}</Text>
               ) : (
                 expenses.map((exp) => (
                   <Pressable key={exp.id} style={styles.listItem} onPress={() => setSelectedExpense(exp)}>
                     <View>
                       <Text style={styles.listItemTitle}>{exp.provider}</Text>
-                      <Text style={styles.listItemSubtitle}>{formatDate(exp.createdAt)} • Ref: {exp.expenseCode}</Text>
+                      <Text style={styles.listItemSubtitle}>{formatUiDate(exp.createdAt)} • {tr('workflow.reference')}: {exp.expenseCode}</Text>
                     </View>
-                    <Text style={styles.listItemAmount}>{formatCurrency(exp.amount)}</Text>
+                    <Text style={styles.listItemAmount}>{formatUiCurrency(exp.amount)}</Text>
                   </Pressable>
                 ))
               )}
@@ -3954,8 +4566,8 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         {activeTab === 'tpv' && (
           <View style={styles.tpvContainer}>
             <View style={styles.displayContainer}>
-              <Text style={styles.displayLabel}>IMPORTE A COBRAR / OPERAR</Text>
-              <Text style={styles.displayText}>{formatCurrency(amount)}</Text>
+              <Text style={styles.displayLabel}>{tr('tpv.amount')}</Text>
+              <Text style={styles.displayText}>{formatUiCurrency(amount)}</Text>
             </View>
 
             <View style={styles.keypad}>
@@ -3968,19 +4580,19 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
 
             <View style={styles.actionButtonsContainer}>
               <Pressable style={styles.actionBtnTicket} onPress={() => startPayment('TICKET DE VENTA')}>
-                <Text style={styles.actionBtnText}>Ticket Venta</Text>
+                <Text style={styles.actionBtnText}>{documentTypeLabel('TICKET DE VENTA')}</Text>
               </Pressable>
               <Pressable style={styles.actionBtnFactura} onPress={() => startPayment('FACTURA SIMPLIFICADA')}>
-                <Text style={styles.actionBtnText}>Factura Simplificada</Text>
+                <Text style={styles.actionBtnText}>{documentTypeLabel('FACTURA SIMPLIFICADA')}</Text>
               </Pressable>
               <Pressable style={styles.actionBtnFacturaCompleta} onPress={() => startPayment('FACTURA COMPLETA')}>
-                <Text style={styles.actionBtnText}>Factura Completa</Text>
+                <Text style={styles.actionBtnText}>{documentTypeLabel('FACTURA COMPLETA')}</Text>
               </Pressable>
             </View>
 
             <View style={styles.scanBarRow}>
               <Pressable style={styles.scanBarcodeBtn} onPress={() => setScannerModalVisible(true)}>
-                <Text style={styles.scanBarcodeText}>📷 Escanear Ticket / Código QR para Devolución</Text>
+                <Text style={styles.scanBarcodeText}>📷 {tr('scanner.open')}</Text>
               </Pressable>
             </View>
           </View>
@@ -3988,35 +4600,55 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
 
         {/* PESTAÑA: PRESUPUESTO */}
         {activeTab === 'presupuesto' && (
-          <ScrollView contentContainerStyle={styles.scrollContent}>
+          <KeyboardAvoidingView style={styles.content} behavior="padding" enabled={Platform.OS === 'ios'}>
+          <ScrollView
+            ref={quoteScrollRef}
+            contentContainerStyle={[styles.scrollContent, { paddingBottom: 16 + (Platform.OS === 'android' ? quoteKeyboardHeight : 0) }]}
+            onLayout={scheduleQuoteReveal}
+            onContentSizeChange={scheduleQuoteReveal}
+            onScroll={(event) => { quoteScrollOffsetRef.current = event.nativeEvent.contentOffset.y; }}
+            onScrollBeginDrag={() => { quoteFocusGenerationRef.current += 1; }}
+            scrollEventThrottle={16}
+            keyboardShouldPersistTaps="handled"
+            automaticallyAdjustKeyboardInsets={false}
+          >
             <View style={styles.card}>
-              <Text style={styles.cardTitle}>📑 CREAR Y ENVIAR DOCUMENTO</Text>
+              <Text style={styles.cardTitle}>📑 {tr('quote.create')}</Text>
               <View style={styles.rowButtons}>
                 <Pressable
                   style={[styles.secondaryButton, { flex: 1, backgroundColor: presupuestoDocumentType === 'PRESUPUESTO' ? '#dbeafe' : '#f8fafc' }]}
                   onPress={() => setPresupuestoDocumentType('PRESUPUESTO')}
                 >
-                  <Text style={styles.secondaryButtonText}>Presupuesto</Text>
+                  <Text style={styles.secondaryButtonText}>{documentTypeLabel('PRESUPUESTO')}</Text>
                 </Pressable>
                 <Pressable
                   style={[styles.secondaryButton, { flex: 1, marginLeft: 8, backgroundColor: presupuestoDocumentType === 'FACTURA' ? '#dcfce7' : '#f8fafc' }]}
                   onPress={() => setPresupuestoDocumentType('FACTURA')}
                 >
-                  <Text style={styles.secondaryButtonText}>Factura</Text>
+                  <Text style={styles.secondaryButtonText}>{documentTypeLabel('FACTURA')}</Text>
                 </Pressable>
               </View>
-              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 8 }]}>El documento mantendrá el mismo formato; solo cambiará el título entre presupuesto y factura.</Text>
-              <TextInput style={styles.input} placeholder="Nombre del Cliente" placeholderTextColor="#94a3b8" value={presupuestoClient.name} onChangeText={(t) => setPresupuestoClient(c => ({ ...c, name: t }))} />
-              <TextInput style={styles.input} placeholder="NIF / CIF del Cliente" placeholderTextColor="#94a3b8" value={presupuestoClient.nif} onChangeText={(t) => setPresupuestoClient(c => ({ ...c, nif: t }))} />
-              <TextInput style={styles.input} placeholder="Dirección Fiscal del Cliente" placeholderTextColor="#94a3b8" value={presupuestoClient.address} onChangeText={(t) => setPresupuestoClient(c => ({ ...c, address: t }))} />
-              <TextInput style={styles.input} placeholder="Correo electrónico del cliente" placeholderTextColor="#94a3b8" keyboardType="email-address" value={presupuestoClientEmail} onChangeText={setPresupuestoClientEmail} />
+              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 8 }]}>{tr('quote.format')}</Text>
+              <TextInput style={styles.input} ref={(input) => { quoteInputRefs.current.name = input; }} onFocus={() => revealQuoteInput('name')} onBlur={() => blurQuoteInput('name')} placeholder={tr('quote.name')} placeholderTextColor="#94a3b8" value={presupuestoClient.name} onChangeText={(t) => setPresupuestoClient(c => ({ ...c, name: t }))} />
+              <TextInput style={styles.input} ref={(input) => { quoteInputRefs.current.nif = input; }} onFocus={() => revealQuoteInput('nif')} onBlur={() => blurQuoteInput('nif')} placeholder={tr('workflow.taxId')} placeholderTextColor="#94a3b8" value={presupuestoClient.nif} onChangeText={(t) => setPresupuestoClient(c => ({ ...c, nif: t }))} />
+              <TextInput style={styles.input} ref={(input) => { quoteInputRefs.current.address = input; }} onFocus={() => revealQuoteInput('address')} onBlur={() => blurQuoteInput('address')} placeholder={tr('quote.address')} placeholderTextColor="#94a3b8" value={presupuestoClient.address} onChangeText={(t) => setPresupuestoClient(c => ({ ...c, address: t }))} />
+              <TextInput style={styles.input} ref={(input) => { quoteInputRefs.current.email = input; }} onFocus={() => revealQuoteInput('email')} onBlur={() => blurQuoteInput('email')} placeholder={tr('quote.email')} placeholderTextColor="#94a3b8" keyboardType="email-address" value={presupuestoClientEmail} onChangeText={setPresupuestoClientEmail} />
 
-              <Text style={[styles.cardTitle, { marginTop: 15 }]}>Productos / Servicios</Text>
+              <Text style={[styles.cardTitle, { marginTop: 15 }]}>{tr('quote.products')}</Text>
               {presupuestoItems.map((item, index) => (
                 <View key={item.id} style={styles.invoiceItemRow}>
                   <TextInput
                     style={[styles.input, { flex: 2, marginBottom: 0 }]}
-                    placeholder={`Descripción ${index + 1}`}
+                    placeholder={tr('quote.description').replace('{number}', String(index + 1))}
+                    ref={(input) => {
+                      quoteInputRefs.current[`description-${item.id}`] = input;
+                      if (input && quoteNewLineRef.current === item.id) {
+                        quoteNewLineRef.current = null;
+                        input.focus();
+                      }
+                    }}
+                    onFocus={() => revealQuoteInput(`description-${item.id}`)}
+                    onBlur={() => blurQuoteInput(`description-${item.id}`)}
                     placeholderTextColor="#94a3b8"
                     value={item.description}
                     onChangeText={(text) => {
@@ -4027,7 +4659,10 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                   />
                   <TextInput
                     style={[styles.input, { flex: 1, marginBottom: 0, marginLeft: 6 }]}
-                    placeholder="Precio €"
+                    placeholder={tr('quote.price')}
+                    ref={(input) => { quoteInputRefs.current[`price-${item.id}`] = input; }}
+                    onFocus={() => revealQuoteInput(`price-${item.id}`)}
+                    onBlur={() => blurQuoteInput(`price-${item.id}`)}
                     placeholderTextColor="#94a3b8"
                     keyboardType="numeric"
                     value={item.price}
@@ -4039,13 +4674,20 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                   />
                 </View>
               ))}
-              <Pressable style={styles.secondaryButton} onPress={() => setPresupuestoItems(curr => [...curr, { id: `${Date.now()}`, description: '', price: '' }])}>
-                <Text style={styles.secondaryButtonText}>+ Añadir otro producto</Text>
+              <Pressable style={styles.secondaryButton} onPress={() => {
+                const id = `${Date.now()}`;
+                quoteNewLineRef.current = id;
+                setPresupuestoItems(curr => [...curr, { id, description: '', price: '' }]);
+              }}>
+                <Text style={styles.secondaryButtonText}>+ {tr('quote.add')}</Text>
               </Pressable>
 
               <TextInput
                 style={[styles.input, { marginTop: 10 }]}
-                placeholder="IVA que aplica al cliente (%)"
+                placeholder={tr('quote.vatInput')}
+                ref={(input) => { quoteInputRefs.current.iva = input; }}
+                onFocus={() => revealQuoteInput('iva')}
+                onBlur={() => blurQuoteInput('iva')}
                 placeholderTextColor="#94a3b8"
                 keyboardType="numeric"
                 value={presupuestoIvaInput}
@@ -4053,29 +4695,29 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
               />
 
               <Pressable style={styles.primaryButton} onPress={sendPresupuestoByEmail}>
-                <Text style={styles.primaryButtonText}>Enviar {presupuestoDocumentType === 'FACTURA' ? 'Factura' : 'Presupuesto'} por Email</Text>
+                <Text style={styles.primaryButtonText}>{tr('quote.send').replace('{document}', documentTypeLabel(presupuestoDocumentType))}</Text>
               </Pressable>
             </View>
 
             {cashInvoiceDrafts.length > 0 && (
               <View style={styles.card}>
-                <Text style={styles.cardTitle}>🧾 FACTURAS EN EFECTIVO PENDIENTES ({cashInvoiceDrafts.length})</Text>
-                <Text style={[styles.modalSubtitle, { textAlign: 'left', marginBottom: 10 }]}>Estas facturas aún no están cobradas y no aparecen en el historial del TPV.</Text>
+                <Text style={styles.cardTitle}>🧾 {tr('cash.pending').replace('{count}', String(cashInvoiceDrafts.length))}</Text>
+                <Text style={[styles.modalSubtitle, { textAlign: 'left', marginBottom: 10 }]}>{tr('cash.guidance')}</Text>
                 {cashInvoiceDrafts.map((draft) => (
                   <View key={draft.id} style={[styles.listItem, { flexDirection: 'column', alignItems: 'stretch' }]}>
                     <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
                       <View>
                         <Text style={styles.listItemTitle}>{draft.ticketCode}</Text>
-                        <Text style={styles.listItemSubtitle}>{draft.client?.name || 'Cliente'} · {formatDate(draft.createdAt)}</Text>
+                        <Text style={styles.listItemSubtitle}>{draft.client?.name || tr('workflow.generalClient')} · {formatUiDate(draft.createdAt)}</Text>
                       </View>
-                      <Text style={styles.listItemAmount}>{formatCurrency(draft.amount)}</Text>
+                      <Text style={styles.listItemAmount}>{formatUiCurrency(draft.amount)}</Text>
                     </View>
                     <View style={[styles.rowButtons, { marginTop: 8 }]}>
                       <Pressable style={[styles.primaryButton, { flex: 1, marginTop: 0, backgroundColor: '#16a34a' }]} onPress={() => void markCashInvoiceAsPaid(draft)}>
-                        <Text style={styles.primaryButtonText}>Marcar cobrada</Text>
+                        <Text style={styles.primaryButtonText}>{tr('cash.paid')}</Text>
                       </Pressable>
                       <Pressable style={[styles.secondaryButton, { flex: 1, marginLeft: 8, marginTop: 0, backgroundColor: '#fee2e2' }]} onPress={() => deleteCashInvoiceDraft(draft)}>
-                        <Text style={[styles.secondaryButtonText, { color: '#dc2626' }]}>Eliminar</Text>
+                        <Text style={[styles.secondaryButtonText, { color: '#dc2626' }]}>{tr('workflow.delete')}</Text>
                       </Pressable>
                     </View>
                   </View>
@@ -4083,37 +4725,38 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
               </View>
             )}
           </ScrollView>
+          </KeyboardAvoidingView>
         )}
 
         {/* PESTAÑA: INFORMES Y ESTADÍSTICAS */}
         {activeTab === 'stats' && (
           <ScrollView contentContainerStyle={styles.scrollContent}>
             <View style={styles.card}>
-              <Text style={styles.cardTitle}>📊 RESUMEN CONTABLE GLOBAL</Text>
+              <Text style={styles.cardTitle}>📊 {tr('reports.summary')}</Text>
               <View style={styles.statRow}>
-                <Text style={styles.statLabel}>Total Cobros:</Text>
+                <Text style={styles.statLabel}>{tr('reports.charges')}</Text>
                 <Text style={[styles.statValue, { color: '#16a34a' }]}>{formatCurrency(totals.charges)}</Text>
               </View>
               <View style={styles.statRow}>
-                <Text style={styles.statLabel}>Total Devoluciones / Abonos:</Text>
+                <Text style={styles.statLabel}>{tr('reports.refunds')}</Text>
                 <Text style={[styles.statValue, { color: '#dc2626' }]}>{formatCurrency(totals.refunds)}</Text>
               </View>
               <View style={styles.statRow}>
-                <Text style={styles.statLabel}>Total Gastos Registrados:</Text>
+                <Text style={styles.statLabel}>{tr('reports.expenses')}</Text>
                 <Text style={[styles.statValue, { color: '#ca8a04' }]}>{formatCurrency(totalExpensesAmount)}</Text>
               </View>
               <View style={[styles.statRow, { borderTopWidth: 1, borderColor: '#cbd5e1', paddingTop: 8, marginTop: 4 }]}>
-                <Text style={[styles.statLabel, { fontWeight: 'bold' }]}>Balance Neto:</Text>
+                <Text style={[styles.statLabel, { fontWeight: 'bold' }]}>{tr('reports.net')}</Text>
                 <Text style={[styles.statValue, { fontWeight: 'bold', color: '#0f172a' }]}>{formatCurrency(totals.charges - totals.refunds - totalExpensesAmount)}</Text>
               </View>
 
               <View style={{ marginTop: 12 }}>
-                <Text style={styles.emptyText}>Resumen orientativo para controlar ingresos, devoluciones y gastos por periodo.</Text>
+                <Text style={styles.emptyText}>{tr('reports.guidance')}</Text>
               </View>
             </View>
 
             <View style={styles.card}>
-              <Text style={styles.cardTitle}>📈 EVOLUCIÓN DE GASTOS Y BENEFICIO</Text>
+              <Text style={styles.cardTitle}>📈 {tr('reports.evolution')}</Text>
               <View style={styles.segmentedControl}>
                 {(['day', 'week', 'month'] as const).map((mode) => (
                   <Pressable
@@ -4122,7 +4765,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                     onPress={() => setChartGranularity(mode)}
                   >
                     <Text style={[styles.segmentButtonText, chartGranularity === mode && styles.segmentButtonTextActive]}>
-                      {mode === 'day' ? 'Día' : mode === 'week' ? 'Semana' : 'Mes'}
+                      {tr(`reports.${mode}`)}
                     </Text>
                   </Pressable>
                 ))}
@@ -4135,7 +4778,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                     style={styles.chartColumn}
                     onPress={() => openChartPeriodReport(item)}
                     accessibilityRole="button"
-                    accessibilityLabel={`Abrir informe de ${item.label}`}
+                    accessibilityLabel={tr('reports.openPeriod').replace('{period}', item.label)}
                   >
                     <View style={styles.chartStack}>
                       <View
@@ -4164,11 +4807,11 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
               <View style={styles.chartLegendRow}>
                 <View style={styles.legendItem}>
                   <View style={[styles.legendDot, { backgroundColor: '#22c55e' }]} />
-                  <Text style={styles.legendText}>Beneficio</Text>
+                  <Text style={styles.legendText}>{tr('reports.profit')}</Text>
                 </View>
                 <View style={styles.legendItem}>
                   <View style={[styles.legendDot, { backgroundColor: '#f97316' }]} />
-                  <Text style={styles.legendText}>Gastos</Text>
+                  <Text style={styles.legendText}>{tr('reports.expenseLegend')}</Text>
                 </View>
               </View>
             </View>
@@ -4180,55 +4823,66 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         {activeTab === 'config' && (
           <ScrollView contentContainerStyle={styles.scrollContent}>
             <View style={styles.card}>
-              <Text style={styles.cardTitle}>📦 PLAN TPV & GESTOR</Text>
+              <Text style={styles.cardTitle}>📦 {tr('config.plan')}</Text>
               <View style={styles.statRow}>
-                <Text style={styles.statLabel}>Usuario principal:</Text>
-                <Text style={[styles.statValue, { color: '#0f172a', fontWeight: 'bold' }]}>9,00 € + 21% IVA ({formatCurrency(10.89)})</Text>
+                <Text style={styles.statLabel}>{tr('config.primaryUser')}</Text>
+                <Text style={[styles.statValue, { color: '#0f172a', fontWeight: 'bold' }]}>{formatCurrency(9)} + 21% {tr('config.vat')} ({formatCurrency(10.89)})</Text>
               </View>
               <View style={styles.statRow}>
-                <Text style={styles.statLabel}>Usuario adicional:</Text>
-                <Text style={[styles.statValue, { color: '#0f172a' }]}>2,50 € + 21% IVA ({formatCurrency(3.03)})</Text>
+                <Text style={styles.statLabel}>{tr('config.additionalUser')}</Text>
+                <Text style={[styles.statValue, { color: '#0f172a' }]}>{formatCurrency(2.5)} + 21% {tr('config.vat')} ({formatCurrency(3.03)})</Text>
               </View>
               <View style={[styles.statRow, { borderTopWidth: 1, borderColor: '#cbd5e1', paddingTop: 8, marginTop: 4 }]}>
-                <Text style={[styles.statLabel, { fontWeight: 'bold' }]}>Total mensual con IVA:</Text>
+                <Text style={[styles.statLabel, { fontWeight: 'bold' }]}>{tr('config.monthlyTotal')}</Text>
                 <Text style={[styles.statValue, { color: '#16a34a', fontWeight: 'bold' }]}>{formatCurrency(currentSubscriptionTotal)}</Text>
               </View>
             </View>
 
             <View style={styles.card}>
-              <Text style={styles.cardTitle}>💳 {tr('stripe.cardTitle')}</Text>
+              <Text style={styles.cardTitle}>💳 {tr('connect.title')}</Text>
+              <Text style={{ color: '#0f172a', fontSize: 12, lineHeight: 18 }}>{tr('connect.phase')}</Text>
+              {userRole !== 'principal' ? <Text style={{ fontSize: 12, marginTop: 8 }}>{tr('connect.principalOnly')}</Text> : null}
+              <Text style={{ fontSize: 12, marginTop: 8 }}>{tr('connect.country')}</Text>
+              <Pressable style={[styles.secondaryButton, { marginTop: 6, flexDirection: 'row', alignItems: 'center' }]} onPress={openStripeCountrySelector}
+                disabled={stripeAccountLoading || userRole !== 'principal' || !isLoaded}
+                accessibilityRole="button" accessibilityLabel={tr('connect.chooseCountry')}>
+                <Text style={[styles.secondaryButtonText, { flex: 1 }]}>{stripeCountryConfirmed && stripeCountryConfirmed === normalizeConnectCountry(issuer.country)
+                  ? connectCountryLabel(stripeCountryConfirmed, appLocale) : tr('connect.chooseCountry')}</Text>
+                <MaterialIcons name="expand-more" size={20} color="#0f766e" />
+              </Pressable>
               <Pressable
                 style={[styles.secondaryButton, { marginTop: 8 }]}
                 onPress={openStripeAccountSettings}
-                disabled={stripeAccountLoading}
+                disabled={stripeAccountLoading || userRole !== 'principal' || !isLoaded || !stripeCountryConfirmed ||
+                  stripeCountryConfirmed !== normalizeConnectCountry(issuer.country)}
                 accessibilityRole="button"
-                accessibilityLabel={tr('stripe.accountButton')}
+                accessibilityLabel={tr('connect.continue')}
               >
-                <Text style={styles.secondaryButtonText}>{stripeAccountLoading ? tr('common.checking') : tr('stripe.accountButton')}
+                <Text style={styles.secondaryButtonText}>{stripeAccountLoading ? tr('common.checking') : tr('connect.continue')}
                 </Text>
               </Pressable>
               {stripeMethodsInfo ? (
-                <Text style={{ color: '#0f172a', fontSize: 12, marginTop: 10, lineHeight: 18 }}>{stripeMethodsInfo}</Text>
+                <Text style={{ color: '#0f172a', fontSize: 12, marginTop: 10, lineHeight: 18 }}>{tr(stripeMethodsInfo)}</Text>
               ) : null}
               {stripeMethodsError ? (
-                <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 10 }}>{stripeMethodsError}</Text>
+                <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 10 }}>{tr(stripeMethodsError)}</Text>
               ) : null}
             </View>
               <View style={styles.card}>
                 <Pressable
                   onPress={() => setSeatsPanelOpen((open) => !open)}
                   accessibilityRole="button"
-                  accessibilityLabel="Añadir usuario adicional"
+                  accessibilityLabel={tr('config.addUser')}
                   style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}
                 >
-                  <Text style={styles.cardTitle}>👥 AÑADIR USUARIO ADICIONAL</Text>
+                  <Text style={styles.cardTitle}>👥 {tr('config.addUser')}</Text>
                   <Text style={{ color: '#0f172a', fontSize: 18, fontWeight: 'bold' }}>{seatsPanelOpen ? '−' : '+'}</Text>
                 </Pressable>
                 {seatsPanelOpen ? (
                   <View>
                     <TextInput
                       style={styles.input}
-                      placeholder="Número de usuarios adicionales"
+                      placeholder={tr('config.userCount')}
                       placeholderTextColor="#94a3b8"
                       keyboardType="numeric"
                       value={String(issuer.additionalUsers || 0)}
@@ -4236,10 +4890,10 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                     />
                     <TextInput
                       style={styles.input}
-                      placeholder="Código de acceso (mínimo 8 caracteres)"
+                      placeholder={tr('config.accessCode')}
                       placeholderTextColor="#94a3b8"
                       autoCapitalize="characters"
-                      secureTextEntry
+                      autoCorrect={false}
                       value={employeeAccessCode}
                       onChangeText={setEmployeeAccessCode}
                     />
@@ -4250,14 +4904,14 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                     >
                       <Text style={styles.secondaryButtonText}>
                         {employeeSaveLoading
-                        ? 'Guardando...'
+                        ? tr('config.saving')
                         : Number(issuer.additionalUsers || 0) > 0
-                        ? `Cobrar ${formatCurrency((subscriptionAdditionalUserCents * Number(issuer.additionalUsers || 0)) / 100)} y generar el código`
-                        : 'Generar el código del usuario'}
+                        ? tr('config.chargeAndCode').replace('{amount}', formatCurrency((subscriptionAdditionalUserCents * Number(issuer.additionalUsers || 0)) / 100))
+                        : tr('config.generateCode')}
                       </Text>
                     </Pressable>
                     {seatsSyncLoading ? (
-                      <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 6, color: '#0284c7' }]}>Aplicando el cambio de plazas en Stripe...</Text>
+                      <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 6, color: '#0284c7' }]}>{tr('config.applyingSeats')}</Text>
                     ) : null}
                     {seatsSyncMessage ? (
                       <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 6, color: '#0f172a' }]}>{seatsSyncMessage}</Text>
@@ -4269,7 +4923,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                         disabled={seatsSyncLoading}
                       >
                         <Text style={styles.secondaryButtonText}>
-                          {seatsSyncLoading ? 'Abriendo Stripe...' : 'AÑADIR TARJETA'}
+                          {seatsSyncLoading ? tr('stripe.accountLoading') : tr('config.addCard')}
                         </Text>
                       </Pressable>
                     ) : null}
@@ -4277,45 +4931,47 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                 ) : null}
               </View>
             <View style={styles.card}>
-              <Text style={styles.cardTitle}>⚙️ DATOS DEL NEGOCIO</Text>
-              <TextInput style={styles.input} placeholder="Nombre Comercial / Razón Social" placeholderTextColor="#94a3b8" value={issuer.name} onChangeText={(t) => setIssuer(i => ({ ...i, name: t }))} />
-              <TextInput style={styles.input} placeholder="NIF / CIF" placeholderTextColor="#94a3b8" value={issuer.nif} onChangeText={(t) => setIssuer(i => ({ ...i, nif: t }))} />
-              <TextInput style={styles.input} placeholder="Dirección del negocio" placeholderTextColor="#94a3b8" value={issuer.address} onChangeText={(t) => setIssuer(i => ({ ...i, address: t }))} />
-              <TextInput style={styles.input} placeholder="Correo electrónico del gestor" placeholderTextColor="#94a3b8" keyboardType="email-address" value={issuer.managerEmail || ''} onChangeText={(t) => setIssuer(i => ({ ...i, managerEmail: t }))} />
+              <Text style={styles.cardTitle}>⚙️ {tr('config.business')}</Text>
+              <Text style={styles.statLabel}>{tr('config.businessName')}</Text>
+              <TextInput style={styles.input} placeholder={tr('config.businessName')} placeholderTextColor="#94a3b8" value={issuer.name} onChangeText={(t) => setIssuer(i => ({ ...i, name: t }))} />
+              <Text style={styles.statLabel}>{tr('config.taxId')}</Text>
+              <TextInput style={styles.input} placeholder={tr('config.taxId')} placeholderTextColor="#94a3b8" value={issuer.nif} onChangeText={(t) => setIssuer(i => ({ ...i, nif: t }))} />
+              <Text style={styles.statLabel}>{tr('config.address')}</Text>
+              <TextInput style={styles.input} placeholder={tr('config.address')} placeholderTextColor="#94a3b8" value={issuer.address} onChangeText={(t) => setIssuer(i => ({ ...i, address: t }))} />
+              <Text style={styles.statLabel}>{tr('config.managerEmail')}</Text>
+              <TextInput style={styles.input} placeholder={tr('config.managerEmail')} placeholderTextColor="#94a3b8" keyboardType="email-address" autoCapitalize="none" autoCorrect={false} value={issuer.managerEmail || ''} onChangeText={(t) => setIssuer(i => ({ ...i, managerEmail: t }))} />
 
-              <Text style={[styles.cardTitle, { marginTop: 18 }]}>💳 COBROS CON STRIPE</Text>
-              <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>Las tarjetas online y los cobros por QR se gestionan mediante Stripe. Configura la clave secreta y el webhook en el backend de Render.</Text>
-
-              <Text style={[styles.cardTitle, { marginTop: 15 }]}>🎨 LOGOTIPO DE LA EMPRESA</Text>
+              <Text style={[styles.cardTitle, { marginTop: 15 }]}>🎨 {tr('config.logo')}</Text>
               {issuer.logoUri && (
                 <View style={styles.previewContainer}>
-                  <Image source={{ uri: issuer.logoUri }} style={styles.previewImage} />
-                  <Text style={styles.emptyText}>Logo actual</Text>
+                  <Image source={{ uri: issuer.logoUri }} style={styles.previewImage} resizeMode="contain" />
+                  <Text style={styles.emptyText}>{tr('config.currentLogo')}</Text>
                 </View>
               )}
               {!issuer.logoUri && (
                 <View style={[styles.previewContainer, { backgroundColor: '#f8fafc', borderRadius: 8, padding: 20 }]}>
                   <Text style={{ fontSize: 40, marginBottom: 8 }}>📷</Text>
-                  <Text style={styles.emptyText}>Sin logotipo configurado</Text>
+                  <Text style={styles.emptyText}>{tr('config.noLogo')}</Text>
                 </View>
               )}
               <View style={styles.rowButtons}>
                 <Pressable style={[styles.secondaryButton, { flex: 1 }]} onPress={captureLogoWithCamera}>
-                  <Text style={styles.secondaryButtonText}>📸 Tomar Foto</Text>
+                  <Text style={styles.secondaryButtonText}>📸 {tr('config.takePhoto')}</Text>
                 </Pressable>
                 <Pressable style={[styles.secondaryButton, { flex: 1, marginLeft: 8 }]} onPress={pickLogoImage}>
-                  <Text style={styles.secondaryButtonText}>🖼️ Galería</Text>
+                  <Text style={styles.secondaryButtonText}>🖼️ {tr('config.gallery')}</Text>
                 </Pressable>
               </View>
               {issuer.logoUri && (
                 <Pressable style={[styles.secondaryButton, { backgroundColor: '#fee2e2' }]} onPress={removeLogo}>
-                  <Text style={[styles.secondaryButtonText, { color: '#dc2626' }]}>🗑️ Eliminar Logo</Text>
+                  <Text style={[styles.secondaryButtonText, { color: '#dc2626' }]}>🗑️ {tr('config.removeLogo')}</Text>
                 </Pressable>
               )}
+              <LogoSettings issuer={issuer} locale={appLocale} onChange={settings => setIssuer(current => ({ ...current, ...settings }))} />
 
               <TextInput
                 style={[styles.input, { marginTop: 15 }]}
-                placeholder="IVA por defecto del negocio (%)"
+                placeholder={tr('config.defaultVat')}
                 placeholderTextColor="#94a3b8"
                 keyboardType="numeric"
                 value={ivaPercentage}
@@ -4329,7 +4985,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       {/* MODAL: ESCANEAR CÓDIGO QR / BARRAS */}
       <Modal visible={scannerModalVisible} animationType="slide" transparent={false}>
         <View style={styles.modalContainer}>
-          <Text style={styles.modalTitle}>ESCANEAR TICKET / CÓDIGO QR</Text>
+          <Text style={styles.modalTitle}>{tr('scanner.title')}</Text>
           {hasPermission ? (
             <CameraView
               style={StyleSheet.absoluteFillObject}
@@ -4337,10 +4993,10 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
               onBarcodeScanned={scanned ? undefined : handleBarCodeScanned}
             />
           ) : (
-            <Text style={styles.errorText}>No se concedieron permisos de cámara.</Text>
+            <Text style={styles.errorText}>{tr('scanner.permission')}</Text>
           )}
           <Pressable style={[styles.primaryButton, { position: 'absolute', bottom: 30, left: 20, right: 20, backgroundColor: '#dc2626' }]} onPress={() => setScannerModalVisible(false)}>
-            <Text style={styles.primaryButtonText}>Cerrar Escáner</Text>
+            <Text style={styles.primaryButtonText}>{tr('common.close')}</Text>
           </Pressable>
         </View>
       </Modal>
@@ -4349,10 +5005,10 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       <Modal visible={nfcModalVisible} animationType="fade" transparent={true}>
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
-            <Text style={styles.modalTitle}>💳 COBRO CONTACTLESS</Text>
-            <Text style={styles.modalSubtitle}>Importe total a cobrar: {formatCurrency(pendingInvoice ? pendingInvoice.total : amount)}</Text>
-            <Text style={[styles.modalSubtitle, { marginBottom: 8 }]}>Acepta tarjeta física sin contacto y wallets NFC como Google Pay, Apple Pay o Samsung Pay acercándolos a este móvil.</Text>
-            <Text style={[styles.modalSubtitle, { color: terminalError ? '#b91c1c' : '#166534', fontWeight: 'bold' }]}>{terminalMessage}</Text>
+            <Text style={styles.modalTitle}>💳 {tr('tpv.contactless')}</Text>
+            <Text style={styles.modalSubtitle}>{tr('tpv.amount')}: {formatUiCurrency(pendingInvoice ? pendingInvoice.total : amount)}</Text>
+            <Text style={[styles.modalSubtitle, { marginBottom: 8 }]}>{tr('tpv.contactlessHint')}</Text>
+            <Text style={[styles.modalSubtitle, { color: terminalError ? '#b91c1c' : '#166534', fontWeight: 'bold' }]}>{tr(terminalMessage)}</Text>
 
             {terminalError ? <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 10, textAlign: 'center' }}>{terminalError}</Text> : null}
 
@@ -4376,9 +5032,9 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         <View style={styles.modalOverlay}>
           <View style={[styles.modalContent, { maxHeight: '90%' }]}>
             <ScrollView contentContainerStyle={{ alignItems: 'center' }}>
-              <Text style={styles.modalTitle}>🔗 COBRO CON ENLACE O QR</Text>
+              <Text style={styles.modalTitle}>🔗 {tr('tpv.online')}</Text>
               <Text style={styles.modalSubtitle}>
-                Importe a cobrar: {formatCurrency(pendingInvoice ? pendingInvoice.total : amount)}
+                {tr('tpv.amount')}: {formatUiCurrency(pendingInvoice ? pendingInvoice.total : amount)}
               </Text>
               <Text style={[styles.modalSubtitle, { marginBottom: 8 }]}>
                 {tr('pay.waitBody')}
@@ -4421,6 +5077,33 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                 <Text style={styles.secondaryButtonText}>{tr('pay.back')}</Text>
               </Pressable>
             </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={stripeCountryModalVisible} animationType="slide" transparent={true}
+        onRequestClose={() => { setStripeCountryModalVisible(false); stripeCountryScopeRef.current = null; }}>
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalContent, { maxHeight: '85%' }]}>
+            <Text style={styles.modalTitle}>{tr('connect.country')}</Text>
+            <ScrollView>
+              {CONNECT_EU_COUNTRIES.map(country => (
+                <Pressable key={country} onPress={() => selectStripeConnectCountry(country)}
+                  accessibilityRole="radio" accessibilityState={{ checked: stripeCountryConfirmed === country }}
+                  accessibilityLabel={connectCountryLabel(country, appLocale)}
+                  style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 12, paddingHorizontal: 12,
+                    marginTop: 4, borderRadius: 8, backgroundColor: stripeCountryConfirmed === country ? '#ccfbf1' : '#f1f5f9' }}>
+                  <MaterialIcons name={stripeCountryConfirmed === country ? 'radio-button-checked' : 'radio-button-unchecked'}
+                    size={20} color="#0f766e" style={{ marginRight: 8 }} />
+                  <Text style={{ flex: 1, fontSize: 14, color: '#0f172a' }}>{connectCountryLabel(country, appLocale)}</Text>
+                  <Text style={{ marginLeft: 8, color: '#64748b', fontSize: 12 }}>{country}</Text>
+                </Pressable>
+              ))}
+            </ScrollView>
+            <Pressable style={[styles.secondaryButton, { marginTop: 12 }]}
+              onPress={() => { setStripeCountryModalVisible(false); stripeCountryScopeRef.current = null; }}>
+              <Text style={styles.secondaryButtonText}>{tr('pay.back')}</Text>
+            </Pressable>
           </View>
         </View>
       </Modal>
@@ -4469,17 +5152,17 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         <View style={styles.modalOverlay}>
           <View style={[styles.modalContent, { maxHeight: '85%' }]}>
             <ScrollView>
-              <Text style={styles.modalTitle}>DATOS DE FACTURACIÓN</Text>
-              <TextInput style={styles.input} placeholder="Razón Social / Nombre Cliente" placeholderTextColor="#94a3b8" value={client.name} onChangeText={(t) => setClient(c => ({ ...c, name: t }))} />
-              <TextInput style={styles.input} placeholder="NIF / CIF" placeholderTextColor="#94a3b8" value={client.nif} onChangeText={(t) => setClient(c => ({ ...c, nif: t }))} />
-              <TextInput style={styles.input} placeholder="Dirección Fiscal Completa" placeholderTextColor="#94a3b8" value={client.address} onChangeText={(t) => setClient(c => ({ ...c, address: t }))} />
+              <Text style={styles.modalTitle}>{tr('invoice.billing')}</Text>
+              <TextInput style={styles.input} placeholder={tr('quote.name')} placeholderTextColor="#94a3b8" value={client.name} onChangeText={(t) => setClient(c => ({ ...c, name: t }))} />
+              <TextInput style={styles.input} placeholder={tr('workflow.taxId')} placeholderTextColor="#94a3b8" value={client.nif} onChangeText={(t) => setClient(c => ({ ...c, nif: t }))} />
+              <TextInput style={styles.input} placeholder={tr('quote.address')} placeholderTextColor="#94a3b8" value={client.address} onChangeText={(t) => setClient(c => ({ ...c, address: t }))} />
 
-              <Text style={[styles.cardTitle, { marginTop: 10 }]}>PRODUCTOS / SERVICIOS</Text>
+              <Text style={[styles.cardTitle, { marginTop: 10 }]}>{tr('quote.products')}</Text>
               {invoiceItems.map((item, index) => (
                 <View key={item.id} style={styles.invoiceItemRow}>
                   <TextInput
                     style={[styles.input, { flex: 2, marginBottom: 0 }]}
-                    placeholder={`Descripción ${index + 1}`}
+                    placeholder={tr('quote.description').replace('{number}', String(index + 1))}
                     placeholderTextColor="#94a3b8"
                     value={item.description}
                     onChangeText={(text) => {
@@ -4490,7 +5173,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                   />
                   <TextInput
                     style={[styles.input, { flex: 1, marginBottom: 0, marginLeft: 6 }]}
-                    placeholder="Precio €"
+                    placeholder={tr('quote.price')}
                     placeholderTextColor="#94a3b8"
                     keyboardType="numeric"
                     value={item.price}
@@ -4503,12 +5186,12 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                 </View>
               ))}
               <Pressable style={styles.secondaryButton} onPress={() => setInvoiceItems(curr => [...curr, { id: `${Date.now()}`, description: '', price: '' }])}>
-                <Text style={styles.secondaryButtonText}>+ Añadir otra línea</Text>
+                <Text style={styles.secondaryButtonText}>+ {tr('quote.add')}</Text>
               </Pressable>
 
               <TextInput
                 style={[styles.input, { marginTop: 10 }]}
-                placeholder="IVA que aplica al cliente (%)"
+                placeholder={tr('quote.vatInput')}
                 placeholderTextColor="#94a3b8"
                 keyboardType="numeric"
                 value={invoiceIvaInput}
@@ -4516,10 +5199,10 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
               />
 
               <Pressable style={styles.primaryButton} onPress={submitClientModal}>
-                <Text style={styles.primaryButtonText}>Continuar al Cobro</Text>
+                <Text style={styles.primaryButtonText}>{tr('invoice.continue')}</Text>
               </Pressable>
               <Pressable style={[styles.secondaryButton, { marginTop: 8 }]} onPress={() => setClientModalVisible(false)}>
-                <Text style={styles.secondaryButtonText}>Cancelar</Text>
+                <Text style={styles.secondaryButtonText}>{tr('common.cancel')}</Text>
               </Pressable>
             </ScrollView>
           </View>
@@ -4527,61 +5210,62 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       </Modal>
 
       {/* MODAL: DETALLE DE TICKET SELECCIONADO */}
-      <Modal visible={selectedTicket !== null} animationType="slide" transparent={true}>
+      <Modal visible={selectedTicket !== null} animationType="slide" transparent={true}
+        onRequestClose={() => setSelectedTicket(null)}>
         <View style={styles.modalOverlay}>
           <View style={[styles.modalContent, { maxHeight: '80%' }]}>
             <ScrollView>
               {selectedTicket && (
                 <>
-                  <Text style={styles.modalTitle}>DETALLE DE DOCUMENTO</Text>
-                  <Text style={styles.modalSubtitle}>Ref: {selectedTicket.ticketCode}</Text>
-                  <Text style={styles.modalSubtitle}>Fecha: {formatDate(selectedTicket.createdAt)}</Text>
-                  <Text style={styles.modalSubtitle}>Tipo: {selectedTicket.documentType}</Text>
+                  <Text style={styles.modalTitle}>{tr('ticket.detail')}</Text>
+                  <Text style={styles.modalSubtitle}>{tr('workflow.reference')}: {selectedTicket.ticketCode}</Text>
+                  <Text style={styles.modalSubtitle}>{tr('workflow.date')}: {formatUiDate(selectedTicket.createdAt)}</Text>
+                  <Text style={styles.modalSubtitle}>{tr('workflow.type')}: {documentTypeLabel(selectedTicket.documentType)}</Text>
                   {selectedTicket.refundHistory && selectedTicket.refundHistory.length > 0 && (
                     <View style={{ marginVertical: 8, padding: 8, backgroundColor: '#fff7ed', borderRadius: 4 }}>
-                      <Text style={{ fontWeight: 'bold', fontSize: 11 }}>COMPRA/DEVOLUCIONES</Text>
-                      <Text style={{ fontSize: 10 }}>Importe original: {formatCurrency(selectedTicket.originalAmount ?? selectedTicket.amount)}</Text>
+                      <Text style={{ fontWeight: 'bold', fontSize: 11 }}>{documentTypeLabel('COMPRA/DEVOLUCIONES')}</Text>
+                      <Text style={{ fontSize: 10 }}>{tr('ticket.original')}: {formatUiCurrency(selectedTicket.originalAmount ?? selectedTicket.amount)}</Text>
                       {selectedTicket.refundHistory.map((refund, index) => (
-                        <Text key={`${refund.date}-${index}`} style={{ fontSize: 10 }}>Devolución {index + 1}: -{formatCurrency(refund.amount)}</Text>
+                        <Text key={`${refund.date}-${index}`} style={{ fontSize: 10 }}>{tr('ticket.refundLine').replace('{number}', String(index + 1))}: -{formatUiCurrency(refund.amount)}</Text>
                       ))}
-                      <Text style={{ fontWeight: 'bold', fontSize: 11, marginTop: 3 }}>Saldo restante: {formatCurrency(selectedTicket.amount)}</Text>
+                      <Text style={{ fontWeight: 'bold', fontSize: 11, marginTop: 3 }}>{tr('ticket.balance')}: {formatUiCurrency(selectedTicket.amount)}</Text>
                     </View>
                   )}
                   {selectedTicket.client && (
                     <View style={{ marginVertical: 8, padding: 8, backgroundColor: '#f1f5f9', borderRadius: 4 }}>
-                      <Text style={{ fontWeight: 'bold', fontSize: 11 }}>Cliente: {selectedTicket.client.name}</Text>
-                      <Text style={{ fontSize: 10 }}>NIF: {selectedTicket.client.nif}</Text>
+                      <Text style={{ fontWeight: 'bold', fontSize: 11 }}>{tr('workflow.client')}: {selectedTicket.client.name || tr('workflow.generalClient')}</Text>
+                      <Text style={{ fontSize: 10 }}>{tr('workflow.taxId')}: {selectedTicket.client.nif}</Text>
                       <Text style={{ fontSize: 10 }}>{selectedTicket.client.address}</Text>
                     </View>
                   )}
                   {selectedTicket.items && selectedTicket.items.length > 0 && (
                     <View style={{ marginVertical: 6 }}>
-                      <Text style={{ fontWeight: 'bold', fontSize: 11, marginBottom: 4 }}>Conceptos:</Text>
+                      <Text style={{ fontWeight: 'bold', fontSize: 11, marginBottom: 4 }}>{tr('ticket.items')}:</Text>
                       {selectedTicket.items.map(it => (
-                        <Text key={it.id} style={{ fontSize: 10, color: '#334155' }}>- {it.description}: {formatCurrency(parseFloat(it.price.replace(',', '.')) || 0)}</Text>
+                        <Text key={it.id} style={{ fontSize: 10, color: '#334155' }}>- {it.description}: {formatUiCurrency(parseFloat(it.price.replace(',', '.')) || 0)}</Text>
                       ))}
                     </View>
                   )}
                   <View style={{ borderTopWidth: 1, borderColor: '#cbd5e1', marginTop: 10, paddingTop: 10 }}>
                     {selectedTicket.type === 'DEVOLUCIÓN' && selectedTicket.relatedTicketCode ? (
-                      <Text style={styles.modalSubtitle}>Ticket original: {selectedTicket.relatedTicketCode}</Text>
+                      <Text style={styles.modalSubtitle}>{tr('ticket.originalReceipt')}: {selectedTicket.relatedTicketCode}</Text>
                     ) : null}
                     {selectedTicket.type === 'DEVOLUCIÓN' && selectedTicket.originalAmount !== undefined ? (
                       <>
-                        <Text style={styles.modalSubtitle}>Importe original del ticket: {formatCurrency(selectedTicket.originalAmount)}</Text>
-                        <Text style={styles.modalSubtitle}>Importe devuelto: {formatCurrency(selectedTicket.amount)}</Text>
-                        <Text style={styles.modalSubtitle}>Saldo restante del ticket: {formatCurrency(selectedTicket.originalAmount - selectedTicket.amount)}</Text>
+                        <Text style={styles.modalSubtitle}>{tr('ticket.original')}: {formatUiCurrency(selectedTicket.originalAmount)}</Text>
+                        <Text style={styles.modalSubtitle}>{tr('ticket.refunded')}: {formatUiCurrency(selectedTicket.amount)}</Text>
+                        <Text style={styles.modalSubtitle}>{tr('ticket.balance')}: {formatUiCurrency(selectedTicket.originalAmount - selectedTicket.amount)}</Text>
                       </>
                     ) : null}
-                    <Text style={styles.modalSubtitle}>{selectedTicket.type === 'DEVOLUCIÓN' ? 'Monto devuelto:' : 'Base Imponible:'} {formatCurrency(selectedTicket.subtotal)}</Text>
-                    <Text style={styles.modalSubtitle}>IVA ({selectedTicket.ivaRateApplied}%): {formatCurrency(selectedTicket.iva)}</Text>
+                    <Text style={styles.modalSubtitle}>{tr(selectedTicket.type === 'DEVOLUCIÓN' ? 'ticket.refunded' : 'ticket.taxBase')}: {formatUiCurrency(selectedTicket.subtotal)}</Text>
+                    <Text style={styles.modalSubtitle}>{tr('workflow.vat')} ({selectedTicket.ivaRateApplied}%): {formatUiCurrency(selectedTicket.iva)}</Text>
                     <Text style={[styles.modalSubtitle, { fontWeight: 'bold', fontSize: 13, color: '#0f172a' }]}>
-                      {selectedTicket.type === 'DEVOLUCIÓN' ? 'Importe de la devolución:' : 'Total Restante:'} {formatCurrency(selectedTicket.amount)}
+                      {tr(selectedTicket.type === 'DEVOLUCIÓN' ? 'ticket.refunded' : 'ticket.balance')}: {formatUiCurrency(selectedTicket.amount)}
                     </Text>
                   </View>
 
                   <View style={{ alignItems: 'center', marginTop: 16, paddingTop: 12, borderTopWidth: 1, borderColor: '#cbd5e1' }}>
-                    <Text style={[styles.modalSubtitle, { fontWeight: 'bold', color: '#0f172a' }]}>QR DEL DOCUMENTO</Text>
+                    <Text style={[styles.modalSubtitle, { fontWeight: 'bold', color: '#0f172a' }]}>{tr('ticket.qr')}</Text>
                     {selectedTicket.publicUrl ? (
                       <Image
                         source={{ uri: getTransactionQrUrl(selectedTicket)! }}
@@ -4590,33 +5274,33 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                     ) : (
                       <View style={{ alignItems: 'center', marginVertical: 12 }}>
                         <Text style={[styles.modalSubtitle, { textAlign: 'center', color: terminalError ? '#b91c1c' : '#b45309', fontWeight: 'bold' }]}>
-                          {terminalError ? 'No se pudo generar el QR' : 'Generando QR...'}
+                          {tr(terminalError ? 'ticket.qrFailed' : 'ticket.qrLoading')}
                         </Text>
                         <Text style={[styles.modalSubtitle, { textAlign: 'center', color: '#64748b', marginTop: 4 }]}>
-                          {terminalError ? terminalError : 'Se está publicando el ticket para que el cliente pueda escanearlo.'}
+                          {terminalError || tr('ticket.publishing')}
                         </Text>
                         {terminalError ? (
                           <Pressable
                             style={[styles.secondaryButton, { marginTop: 8 }]}
                             onPress={() => void registerTransactionDocument(selectedTicket)}
                           >
-                            <Text style={styles.secondaryButtonText}>Reintentar publicación</Text>
+                            <Text style={styles.secondaryButtonText}>{tr('ticket.retry')}</Text>
                           </Pressable>
                         ) : null}
                       </View>
                     )}
-                    <Text style={[styles.modalSubtitle, { textAlign: 'center' }]}>Código: {selectedTicket.ticketCode}</Text>
-                    <Text style={[styles.modalSubtitle, { textAlign: 'center', color: '#64748b' }]}>Al escanear el QR se abrirá el ticket completo. También puedes compartir el PDF por WhatsApp o email.</Text>
+                    <Text style={[styles.modalSubtitle, { textAlign: 'center' }]}>{tr('ticket.code')}: {selectedTicket.ticketCode}</Text>
+                    <Text style={[styles.modalSubtitle, { textAlign: 'center', color: '#64748b' }]}>{tr('ticket.qrHint')}</Text>
                   </View>
 
                   <Pressable style={[styles.primaryButton, { marginTop: 15 }]} onPress={() => generateAndSharePdf(selectedTicket)}>
-                    <Text style={styles.primaryButtonText}>📄 Compartir / Imprimir PDF</Text>
+                    <Text style={styles.primaryButtonText}>📄 {tr('ticket.share')}</Text>
                   </Pressable>
                   <Pressable style={[styles.secondaryButton, { marginTop: 8 }]} onPress={() => sendByEmail(selectedTicket)}>
-                    <Text style={styles.secondaryButtonText}>✉️ Enviar al Gestor por Email</Text>
+                    <Text style={styles.secondaryButtonText}>✉️ {tr('ticket.emailManager')}</Text>
                   </Pressable>
                   <Pressable style={[styles.secondaryButton, { marginTop: 8, backgroundColor: '#fee2e2' }]} onPress={() => setSelectedTicket(null)}>
-                    <Text style={[styles.secondaryButtonText, { color: '#dc2626' }]}>Cerrar</Text>
+                    <Text style={[styles.secondaryButtonText, { color: '#dc2626' }]}>{tr('common.close')}</Text>
                   </Pressable>
                 </>
               )}
@@ -4632,21 +5316,21 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
             <ScrollView>
               {selectedExpense && (
                 <>
-                  <Text style={styles.modalTitle}>DETALLE DE GASTO</Text>
-                  <Text style={styles.modalSubtitle}>Ref: {selectedExpense.expenseCode}</Text>
-                  <Text style={styles.modalSubtitle}>Proveedor: {selectedExpense.provider}</Text>
-                  <Text style={styles.modalSubtitle}>Fecha: {formatDate(selectedExpense.createdAt)}</Text>
-                  <Text style={[styles.modalSubtitle, { fontWeight: 'bold', fontSize: 14, color: '#0f172a', marginVertical: 8 }]}>Importe: {formatCurrency(selectedExpense.amount)}</Text>
+                  <Text style={styles.modalTitle}>{tr('expense.detail')}</Text>
+                  <Text style={styles.modalSubtitle}>{tr('workflow.reference')}: {selectedExpense.expenseCode}</Text>
+                  <Text style={styles.modalSubtitle}>{tr('workflow.provider')}: {selectedExpense.provider}</Text>
+                  <Text style={styles.modalSubtitle}>{tr('workflow.date')}: {formatUiDate(selectedExpense.createdAt)}</Text>
+                  <Text style={[styles.modalSubtitle, { fontWeight: 'bold', fontSize: 14, color: '#0f172a', marginVertical: 8 }]}>{tr('workflow.amount')}: {formatUiCurrency(selectedExpense.amount)}</Text>
                   
                   {selectedExpense.imageUri && (
                     <Image source={{ uri: selectedExpense.imageUri }} style={{ width: '100%', height: 250, resizeMode: 'contain', marginVertical: 10, borderRadius: 6 }} />
                   )}
 
                   <Pressable style={[styles.primaryButton, { marginTop: 15 }]} onPress={() => generateAndShareExpensePdf(selectedExpense)}>
-                    <Text style={styles.primaryButtonText}>📄 Compartir Gasto PDF</Text>
+                    <Text style={styles.primaryButtonText}>📄 {tr('expense.share')}</Text>
                   </Pressable>
                   <Pressable style={[styles.secondaryButton, { marginTop: 8, backgroundColor: '#fee2e2' }]} onPress={() => setSelectedExpense(null)}>
-                    <Text style={[styles.secondaryButtonText, { color: '#dc2626' }]}>Cerrar</Text>
+                    <Text style={[styles.secondaryButtonText, { color: '#dc2626' }]}>{tr('common.close')}</Text>
                   </Pressable>
                 </>
               )}
@@ -4727,9 +5411,9 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
             <Text style={styles.modalTitle}>👥 USUARIOS Y PERMISOS</Text>
             <Text style={styles.modalSubtitle}>Ajusta el perfil activo y la seguridad del usuario principal.</Text>
 
-            {ownerPin ? <Text style={[styles.emptyText, { textAlign: 'left', marginTop: 10, color: '#166534' }]}>PIN principal configurado y activo. Los empleados se crean desde Configuración con un código de acceso.</Text> : null}
+            {companyPinConfigured === true ? <Text style={[styles.emptyText, { textAlign: 'left', marginTop: 10, color: '#166534' }]}>PIN principal configurado y activo. Los empleados se crean desde Configuración con un código de acceso.</Text> : null}
 
-            {!ownerPin ? (
+            {!(companyPinConfigured === true || ownerPin) ? (
               <View style={{ marginTop: 12 }}>
                 <Text style={[styles.modalSubtitle, { fontWeight: 'bold', color: '#0f172a' }]}>Crear PIN principal</Text>
                 <TextInput
@@ -4871,30 +5555,30 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       <Modal visible={transactionReportModalVisible} animationType="fade" transparent={true}>
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
-            <Text style={styles.modalTitle}>📄 INFORME CONSOLIDADO DE TICKETS + GASTOS</Text>
-            <Text style={styles.modalSubtitle}>Periodo seleccionado (DD/MM/YYYY):</Text>
+            <Text style={styles.modalTitle}>📄 {tr('report.combined')}</Text>
+            <Text style={styles.modalSubtitle}>{tr('report.periodInput')}</Text>
             <TextInput
               style={styles.input}
-              placeholder="Fecha Inicio (ej: 07/09/2026)"
+              placeholder={tr('report.start')}
               placeholderTextColor="#94a3b8"
               value={transactionStartDateInput}
               onChangeText={setTransactionStartDateInput}
             />
             <TextInput
               style={styles.input}
-              placeholder="Fecha Fin (ej: 30/09/2026)"
+              placeholder={tr('report.end')}
               placeholderTextColor="#94a3b8"
               value={transactionEndDateInput}
               onChangeText={setTransactionEndDateInput}
             />
             <Pressable style={[styles.primaryButton, { backgroundColor: '#0284c7', marginTop: 10 }]} onPress={sendCombinedReportByEmail}>
-              <Text style={styles.primaryButtonText}>Generar y Enviar Informe Consolidado</Text>
+              <Text style={styles.primaryButtonText}>{tr('report.sendCombined')}</Text>
             </Pressable>
             <Pressable style={[styles.secondaryButton, { marginTop: 8 }]} onPress={showPeriodDetails}>
-              <Text style={styles.secondaryButtonText}>Ver detalles del periodo</Text>
+              <Text style={styles.secondaryButtonText}>{tr('report.viewPeriod')}</Text>
             </Pressable>
             <Pressable style={[styles.secondaryButton, { marginTop: 8 }]} onPress={() => setTransactionReportModalVisible(false)}>
-              <Text style={styles.secondaryButtonText}>Cancelar</Text>
+              <Text style={styles.secondaryButtonText}>{tr('common.cancel')}</Text>
             </Pressable>
           </View>
         </View>
@@ -4907,43 +5591,43 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
             <ScrollView>
               {periodDetails && (
                 <>
-                  <Text style={styles.modalTitle}>DETALLES DEL PERIODO</Text>
-                  <Text style={styles.modalSubtitle}>Desde {periodDetails.startLabel} hasta {periodDetails.endLabel}</Text>
+                  <Text style={styles.modalTitle}>{tr('report.periodDetails')}</Text>
+                  <Text style={styles.modalSubtitle}>{tr('report.range').replace('{start}', periodDetails.startLabel).replace('{end}', periodDetails.endLabel)}</Text>
                   <View style={{ marginVertical: 10, padding: 10, backgroundColor: '#f1f5f9', borderRadius: 6 }}>
-                    <Text style={styles.modalSubtitle}>Total cobros: {formatCurrency(periodDetails.totalIncome)}</Text>
-                    <Text style={styles.modalSubtitle}>Total devoluciones: {formatCurrency(periodDetails.totalRefunds)}</Text>
-                    <Text style={styles.modalSubtitle}>Total gastos: {formatCurrency(periodDetails.totalExpenses)}</Text>
-                    <Text style={[styles.modalSubtitle, { fontWeight: 'bold' }]}>Total con IVA: {formatCurrency(periodDetails.totalIncome - periodDetails.totalRefunds - periodDetails.totalExpenses)}</Text>
+                    <Text style={styles.modalSubtitle}>{tr('reports.charges')} {formatUiCurrency(periodDetails.totalIncome)}</Text>
+                    <Text style={styles.modalSubtitle}>{tr('reports.refunds')} {formatUiCurrency(periodDetails.totalRefunds)}</Text>
+                    <Text style={styles.modalSubtitle}>{tr('reports.expenses')} {formatUiCurrency(periodDetails.totalExpenses)}</Text>
+                    <Text style={[styles.modalSubtitle, { fontWeight: 'bold' }]}>{tr('report.totalVat')}: {formatUiCurrency(periodDetails.totalIncome - periodDetails.totalRefunds - periodDetails.totalExpenses)}</Text>
                   </View>
-                  <Text style={styles.cardTitle}>TICKETS Y FACTURAS ({periodDetails.transactions.length})</Text>
+                  <Text style={styles.cardTitle}>{tr('report.documents').replace('{count}', String(periodDetails.transactions.length))}</Text>
                   {periodDetails.transactions.length === 0 ? (
-                    <Text style={styles.emptyText}>No hay tickets ni facturas en este periodo.</Text>
+                    <Text style={styles.emptyText}>{tr('report.noDocuments')}</Text>
                   ) : periodDetails.transactions.map((transaction) => (
                     <View key={transaction.id} style={styles.listItem}>
                       <View style={{ flex: 1 }}>
                         <Text style={styles.listItemTitle}>{transaction.ticketCode}</Text>
-                        <Text style={styles.listItemSubtitle}>{transaction.documentType} · {formatDate(transaction.createdAt)}</Text>
+                        <Text style={styles.listItemSubtitle}>{documentTypeLabel(transaction.documentType)} · {formatUiDate(transaction.createdAt)}</Text>
                         {transaction.refundHistory?.map((refund, index) => (
-                          <Text key={`${refund.date}-${index}`} style={styles.listItemSubtitle}>Devolución {index + 1}: -{formatCurrency(refund.amount)}</Text>
+                          <Text key={`${refund.date}-${index}`} style={styles.listItemSubtitle}>{tr('ticket.refundLine').replace('{number}', String(index + 1))}: -{formatUiCurrency(refund.amount)}</Text>
                         ))}
                       </View>
-                      <Text style={styles.listItemAmount}>{formatCurrency(transaction.type === 'COBRO' ? (transaction.originalAmount ?? transaction.amount) : transaction.amount)}</Text>
+                      <Text style={styles.listItemAmount}>{formatUiCurrency(transaction.type === 'COBRO' ? (transaction.originalAmount ?? transaction.amount) : transaction.amount)}</Text>
                     </View>
                   ))}
-                  <Text style={[styles.cardTitle, { marginTop: 12 }]}>GASTOS ({periodDetails.expenses.length})</Text>
+                  <Text style={[styles.cardTitle, { marginTop: 12 }]}>{tr('expense.list').replace('{count}', String(periodDetails.expenses.length))}</Text>
                   {periodDetails.expenses.length === 0 ? (
-                    <Text style={styles.emptyText}>No hay gastos en este periodo.</Text>
+                    <Text style={styles.emptyText}>{tr('report.noExpenses')}</Text>
                   ) : periodDetails.expenses.map((expense) => (
                     <View key={expense.id} style={styles.listItem}>
                       <View style={{ flex: 1 }}>
                         <Text style={styles.listItemTitle}>{expense.expenseCode}</Text>
-                        <Text style={styles.listItemSubtitle}>{expense.provider} · {formatDate(expense.createdAt)}</Text>
+                        <Text style={styles.listItemSubtitle}>{expense.provider} · {formatUiDate(expense.createdAt)}</Text>
                       </View>
-                      <Text style={styles.listItemAmount}>{formatCurrency(expense.amount)}</Text>
+                      <Text style={styles.listItemAmount}>{formatUiCurrency(expense.amount)}</Text>
                     </View>
                   ))}
                   <Pressable style={[styles.secondaryButton, { marginTop: 12 }]} onPress={() => setPeriodDetails(null)}>
-                    <Text style={styles.secondaryButtonText}>Volver al informe</Text>
+                    <Text style={styles.secondaryButtonText}>{tr('report.back')}</Text>
                   </Pressable>
                 </>
               )}
@@ -4956,38 +5640,38 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       <Modal visible={expenseReportModalVisible} animationType="fade" transparent={true}>
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
-            <Text style={styles.modalTitle}>📄 INFORME DE GASTOS POR FECHAS</Text>
-            <Text style={styles.modalSubtitle}>Selecciona un periodo o escribe las fechas (DD/MM/YYYY):</Text>
+            <Text style={styles.modalTitle}>📄 {tr('report.expenses')}</Text>
+            <Text style={styles.modalSubtitle}>{tr('report.choosePeriod')}</Text>
             <View style={{ flexDirection: 'row', gap: 6, marginVertical: 10 }}>
               <Pressable style={[styles.secondaryButton, { flex: 1, paddingHorizontal: 6 }]} onPress={() => setExpenseReportPeriod('day')}>
-                <Text style={[styles.secondaryButtonText, { fontSize: 12 }]}>Día</Text>
+                <Text style={[styles.secondaryButtonText, { fontSize: 12 }]}>{tr('reports.day')}</Text>
               </Pressable>
               <Pressable style={[styles.secondaryButton, { flex: 1, paddingHorizontal: 6 }]} onPress={() => setExpenseReportPeriod('week')}>
-                <Text style={[styles.secondaryButtonText, { fontSize: 12 }]}>Semana</Text>
+                <Text style={[styles.secondaryButtonText, { fontSize: 12 }]}>{tr('reports.week')}</Text>
               </Pressable>
               <Pressable style={[styles.secondaryButton, { flex: 1, paddingHorizontal: 6 }]} onPress={() => setExpenseReportPeriod('month')}>
-                <Text style={[styles.secondaryButtonText, { fontSize: 12 }]}>Mes</Text>
+                <Text style={[styles.secondaryButtonText, { fontSize: 12 }]}>{tr('reports.month')}</Text>
               </Pressable>
             </View>
             <TextInput
               style={styles.input}
-              placeholder="Fecha inicio (ej: 07/09/2026)"
+              placeholder={tr('report.start')}
               placeholderTextColor="#94a3b8"
               value={expenseStartDateInput}
               onChangeText={setExpenseStartDateInput}
             />
             <TextInput
               style={styles.input}
-              placeholder="Fecha fin (ej: 07/09/2026)"
+              placeholder={tr('report.end')}
               placeholderTextColor="#94a3b8"
               value={expenseEndDateInput}
               onChangeText={setExpenseEndDateInput}
             />
             <Pressable style={[styles.primaryButton, { backgroundColor: '#0284c7', marginTop: 10 }]} onPress={sendExpenseSpecificReport}>
-              <Text style={styles.primaryButtonText}>Generar y Enviar Informe de Gastos</Text>
+              <Text style={styles.primaryButtonText}>{tr('report.sendExpenses')}</Text>
             </Pressable>
             <Pressable style={[styles.secondaryButton, { marginTop: 8 }]} onPress={() => setExpenseReportModalVisible(false)}>
-              <Text style={styles.secondaryButtonText}>Cancelar</Text>
+              <Text style={styles.secondaryButtonText}>{tr('common.cancel')}</Text>
             </Pressable>
           </View>
         </View>

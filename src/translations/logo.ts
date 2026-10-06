@@ -1,0 +1,68 @@
+import type { AppLocale } from '../i18n';
+
+export const logoTranslations: Record<AppLocale, Record<string, string>> = {
+  es: {
+    'logo.move': 'Mover bloque del comercio',
+    'logo.position': 'Posición', 'logo.size': 'Tamaño', 'logo.preview': 'Vista previa',
+    'logo.ticket': 'Ticket', 'logo.invoice': 'Factura A4',
+    'logo.top-left': 'Arriba izquierda', 'logo.top-center': 'Arriba centro', 'logo.top-right': 'Arriba derecha',
+    'logo.bottom-left': 'Abajo izquierda', 'logo.bottom-center': 'Abajo centro', 'logo.bottom-right': 'Abajo derecha',
+    'logo.small': 'Pequeño', 'logo.medium': 'Mediano', 'logo.large': 'Grande',
+  },
+  en: {
+    'logo.move': 'Move business block',
+    'logo.position': 'Position', 'logo.size': 'Size', 'logo.preview': 'Preview',
+    'logo.ticket': 'Receipt', 'logo.invoice': 'A4 invoice',
+    'logo.top-left': 'Top left', 'logo.top-center': 'Top centre', 'logo.top-right': 'Top right',
+    'logo.bottom-left': 'Bottom left', 'logo.bottom-center': 'Bottom centre', 'logo.bottom-right': 'Bottom right',
+    'logo.small': 'Small', 'logo.medium': 'Medium', 'logo.large': 'Large',
+  },
+  fr: {
+    'logo.move': 'Déplacer le bloc du commerce',
+    'logo.position': 'Position', 'logo.size': 'Taille', 'logo.preview': 'Aperçu',
+    'logo.ticket': 'Ticket', 'logo.invoice': 'Facture A4',
+    'logo.top-left': 'Haut gauche', 'logo.top-center': 'Haut centre', 'logo.top-right': 'Haut droite',
+    'logo.bottom-left': 'Bas gauche', 'logo.bottom-center': 'Bas centre', 'logo.bottom-right': 'Bas droite',
+    'logo.small': 'Petit', 'logo.medium': 'Moyen', 'logo.large': 'Grand',
+  },
+  de: {
+    'logo.move': 'Geschäftsblock verschieben',
+    'logo.position': 'Position', 'logo.size': 'Größe', 'logo.preview': 'Vorschau',
+    'logo.ticket': 'Kassenbon', 'logo.invoice': 'A4-Rechnung',
+    'logo.top-left': 'Oben links', 'logo.top-center': 'Oben Mitte', 'logo.top-right': 'Oben rechts',
+    'logo.bottom-left': 'Unten links', 'logo.bottom-center': 'Unten Mitte', 'logo.bottom-right': 'Unten rechts',
+    'logo.small': 'Klein', 'logo.medium': 'Mittel', 'logo.large': 'Groß',
+  },
+  it: {
+    'logo.move': 'Sposta blocco attività',
+    'logo.position': 'Posizione', 'logo.size': 'Dimensione', 'logo.preview': 'Anteprima',
+    'logo.ticket': 'Scontrino', 'logo.invoice': 'Fattura A4',
+    'logo.top-left': 'Alto sinistra', 'logo.top-center': 'Alto centro', 'logo.top-right': 'Alto destra',
+    'logo.bottom-left': 'Basso sinistra', 'logo.bottom-center': 'Basso centro', 'logo.bottom-right': 'Basso destra',
+    'logo.small': 'Piccolo', 'logo.medium': 'Medio', 'logo.large': 'Grande',
+  },
+  pt: {
+    'logo.move': 'Mover bloco do comércio',
+    'logo.position': 'Posição', 'logo.size': 'Tamanho', 'logo.preview': 'Pré-visualização',
+    'logo.ticket': 'Talão', 'logo.invoice': 'Fatura A4',
+    'logo.top-left': 'Topo esquerdo', 'logo.top-center': 'Topo centro', 'logo.top-right': 'Topo direito',
+    'logo.bottom-left': 'Base esquerda', 'logo.bottom-center': 'Base centro', 'logo.bottom-right': 'Base direita',
+    'logo.small': 'Pequeno', 'logo.medium': 'Médio', 'logo.large': 'Grande',
+  },
+  nl: {
+    'logo.move': 'Bedrijfsblok verplaatsen',
+    'logo.position': 'Positie', 'logo.size': 'Formaat', 'logo.preview': 'Voorbeeld',
+    'logo.ticket': 'Kassabon', 'logo.invoice': 'A4-factuur',
+    'logo.top-left': 'Linksboven', 'logo.top-center': 'Middenboven', 'logo.top-right': 'Rechtsboven',
+    'logo.bottom-left': 'Linksonder', 'logo.bottom-center': 'Middenonder', 'logo.bottom-right': 'Rechtsonder',
+    'logo.small': 'Klein', 'logo.medium': 'Middel', 'logo.large': 'Groot',
+  },
+  pl: {
+    'logo.move': 'Przesuń blok firmy',
+    'logo.position': 'Pozycja', 'logo.size': 'Rozmiar', 'logo.preview': 'Podgląd',
+    'logo.ticket': 'Paragon', 'logo.invoice': 'Faktura A4',
+    'logo.top-left': 'Góra lewo', 'logo.top-center': 'Góra środek', 'logo.top-right': 'Góra prawo',
+    'logo.bottom-left': 'Dół lewo', 'logo.bottom-center': 'Dół środek', 'logo.bottom-right': 'Dół prawo',
+    'logo.small': 'Mały', 'logo.medium': 'Średni', 'logo.large': 'Duży',
+  },
+};
