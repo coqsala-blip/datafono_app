@@ -2917,21 +2917,24 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       if (!result || typeof result !== 'object') throw new Error('connect.failed');
       const url = parseConnectOnboardingUrl(result, status.accountId);
       if (!url) {
-        // Si el servidor devolvió un code conocido, úsalo; si no, fallo genérico.
-        throw new Error(connectErrorKey(result));
+        throw new Error(connectErrorKey(result) === 'connect.failed' ? 'connect.linkInvalid' : connectErrorKey(result));
       }
-      try {
-        await WebBrowser.openAuthSessionAsync(url, 'tpvapp://pago-completado');
-      } finally {
-        if (isCurrent()) {
-          setStripeMethodsInfo('');
+      // openBrowserAsync abre Stripe en el navegador del móvil (flujo fiable en Android).
+      await WebBrowser.openBrowserAsync(url, { enableDefaultShareMenuItem: false });
+      if (isCurrent()) {
+        setStripeMethodsInfo('');
+        try {
           await readStatus();
+        } catch {
+          // El alta puede seguir pendiente tras volver; no marcar error si Stripe ya se abrió.
+          if (isCurrent()) setStripeMethodsInfo('connect.pending');
         }
       }
     } catch (error) {
       if (isCurrent()) setStripeMethodsError(error instanceof Error &&
         ['connect.countryRequiresSupport', 'connect.countryNotApproved', 'connect.countryMismatch',
-          'connect.notConnected', 'connect.chargesNotEnabled'].includes(error.message)
+          'connect.notConnected', 'connect.chargesNotEnabled', 'connect.linkInvalid', 'connect.upstream',
+          'connect.sessionRequired', 'connect.chooseCountry', 'connect.principalOnly'].includes(error.message)
         ? error.message : 'connect.failed');
     } finally {
       if (isCurrent()) {

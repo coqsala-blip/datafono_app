@@ -56,9 +56,9 @@ const contextFor = (overrides = {}) => {
     issuer: { country: 'ES' }, stripeCountryConfirmed: 'ES', stripeCountryModalVisible: false,
     stripeCountryScopeRef: { current: null },
     ensureFreshAccessToken: async () => `fresh-token-${++context.tokenCalls}`,
-    WebBrowser: { openAuthSessionAsync: async (url, redirect) => {
-      context.browsers.push({ url, redirect }); return { type: 'cancel' };
-    } },
+    WebBrowser: { openBrowserAsync: async (url) => {
+      context.browsers.push({ url }); return { type: 'dismiss' };
+    }, openAuthSessionAsync: async () => { throw new Error('AuthSession should not be used for Connect'); } },
     Linking: { openURL() { throw new Error('Forbidden fallback'); } },
     fetchWithTimeout: async (url, options) => {
       context.requests.push({ url, options });
@@ -162,7 +162,7 @@ async function run() {
     status({ chargesEnabled: true }), status({ payoutsEnabled: true }), status({ requirementsPending: true }),
     { ...pending, enabled: false }, { ...pending, accountId: 'not-account' }]) equal(helper.parseConnectStatus(value), null);
   for (const value of [link({ ok: false }), link({ livemode: true }), link({ phase: 'live' }),
-    link({ accountId: 'bad' }), link({ expiresAt: null }), link({ expiresAt: 'bad' }), link({ expiresAt: 1 }),
+    link({ accountId: 'bad' }), link({ expiresAt: 'bad' }), link({ expiresAt: 1 }),
     ...['http://onboarding.stripe.com/x', 'https://onboarding.stripe.com.evil.test/x', 'https://user:pass@connect.stripe.com/x',
       'https://connect.stripe.com:444/x', 'https://dashboard.stripe.com/test/dashboard', 'https://evil.accounts.stripe.com/x',
       'javascript:alert(1)', 'tpvapp://pago-completado', '//connect.stripe.com/x'].map(url => link({ url }))]) {
@@ -170,15 +170,18 @@ async function run() {
     const context = contextFor(); respond(context, pending, pending, value);
     await context.openStripeAccountSettings();
     equal(context.browsers, []);
-    equal(context.stripeMethodsError, 'connect.failed');
+    equal(context.stripeMethodsError, 'connect.linkInvalid');
   }
   equal(helper.parseConnectOnboardingUrl(link(), 'acct_foreign'), null);
   equal(helper.parseConnectOnboardingUrl(link({ expiresAt: 9999999999 }), null), link().url);
+  equal(helper.parseConnectOnboardingUrl(link({ expiresAt: null }), null), link({ expiresAt: null }).url);
   equal(helper.parseConnectOnboardingUrl(link({
     url: 'https://accounts.stripe.com/r/acct_fixture#alu_test_token',
   }), null), 'https://accounts.stripe.com/r/acct_fixture#alu_test_token');
   equal(helper.parseConnectOnboardingUrl(link({ url: 'https://connect.stripe.com/x#token' }), null),
     'https://connect.stripe.com/x#token');
+  equal(helper.parseConnectOnboardingUrl(link({ url: 'https://billing.stripe.com/setup' }), null),
+    'https://billing.stripe.com/setup');
   for (const initial of [status({ enabled: false }), status({ livemode: true }), {}, { ...pending, chargesEnabled: 'yes' }]) {
     const context = contextFor(); respond(context, initial);
     await context.openStripeAccountSettings();
@@ -197,18 +200,23 @@ async function run() {
     for (const initial of [status(), pending, ready]) {
       for (const after of [pending, ready, status({ enabled: false }), {}]) {
         const context = contextFor(); respond(context, initial, after);
-        context.WebBrowser.openAuthSessionAsync = async (url, redirect) => {
-          context.browsers.push({ url, redirect });
+        context.WebBrowser.openBrowserAsync = async (url) => {
+          context.browsers.push({ url });
           if (outcome === 'throw') throw new Error('https://secret.test/token');
-          return { type: outcome, url: 'tpvapp://pago-completado?connect=return&success=true' };
+          return { type: outcome };
         };
         await context.openStripeAccountSettings();
-        equal(context.requests.map(request => request.options.method), ['GET', 'POST', 'GET']);
-        equal(context.requests.map(request => request.options.headers.Authorization), ['Bearer fresh-token-1', 'Bearer fresh-token-2', 'Bearer fresh-token-3']);
+        const opened = outcome !== 'throw';
+        equal(context.requests.map(request => request.options.method), opened ? ['GET', 'POST', 'GET'] : ['GET', 'POST']);
+        equal(context.requests.map(request => request.options.headers.Authorization), opened
+          ? ['Bearer fresh-token-1', 'Bearer fresh-token-2', 'Bearer fresh-token-3']
+          : ['Bearer fresh-token-1', 'Bearer fresh-token-2']);
         equal(JSON.parse(context.requests[1].options.body), { country: 'ES' });
-        equal(context.browsers, [{ url: link().url, redirect: 'tpvapp://pago-completado' }]);
-        equal(context.stripeMethodsInfo, helper.parseConnectStatus(after) ? helper.connectStatusKey(after) : '');
-        equal(context.stripeMethodsError, outcome === 'throw' || !helper.parseConnectStatus(after) ? 'connect.failed' : '');
+        equal(context.browsers, [{ url: link().url }]);
+        equal(context.stripeMethodsInfo, !opened
+          ? helper.connectStatusKey(initial)
+          : (helper.parseConnectStatus(after) ? helper.connectStatusKey(after) : 'connect.pending'));
+        equal(context.stripeMethodsError, outcome === 'throw' ? 'connect.failed' : '');
         equal(context.stripeAccountLoading, false);
         equal(context.stripeConnectBusyRef.current, null);
         equal(context.mutations.some(([, value]) => String(value).includes('https:') || String(value).includes('acct_')), false);
@@ -240,10 +248,10 @@ async function run() {
           return post ? link() : pending;
         } };
       };
-      context.WebBrowser.openAuthSessionAsync = async () => {
+      context.WebBrowser.openBrowserAsync = async () => {
         context.browsers.push('opened');
         if (stage === 'browser') { started.resolve(); await gate.promise; }
-        return { type: 'success' };
+        return { type: 'dismiss' };
       };
       const action = context.openStripeAccountSettings();
       await started.promise;
@@ -263,7 +271,7 @@ async function run() {
     }
   }
   const busy = contextFor(); const gate = deferred(); const started = deferred();
-  busy.WebBrowser.openAuthSessionAsync = async () => { started.resolve(); return gate.promise; };
+  busy.WebBrowser.openBrowserAsync = async () => { started.resolve(); return gate.promise; };
   const first = busy.openStripeAccountSettings(); await started.promise;
   await busy.openStripeAccountSettings(); equal(busy.requests.length, 2);
   gate.resolve({ type: 'cancel' }); await first; equal(busy.requests.length, 3);
@@ -283,11 +291,15 @@ async function run() {
       } };
     };
     await context.openStripeAccountSettings();
-    equal(context.stripeMethodsError, 'connect.failed');
+    equal(context.stripeMethodsError, failure === 'return-network' ? ''
+      : failure === 'wrong-account' ? 'connect.linkInvalid' : 'connect.failed');
     equal(context.stripeAccountLoading, false);
     equal(context.stripeConnectBusyRef.current, null);
     if (failure !== 'return-network') equal(context.browsers, []);
-    else equal(context.stripeMethodsInfo, '');
+    else {
+      equal(context.browsers.length, 1);
+      equal(context.stripeMethodsInfo, 'connect.pending');
+    }
   }
   const reset = contextFor();
   for (const node of nodes.filter(candidate => ts.isCallExpression(candidate) && /^set[A-Z]/.test(candidate.expression.getText(ast)))) {

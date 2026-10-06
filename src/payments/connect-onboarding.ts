@@ -26,9 +26,16 @@ export const connectErrorKey = (value: unknown): string => {
     case 'connect_country_mismatch': return 'connect.countryMismatch';
     case 'connect_not_connected': return 'connect.notConnected';
     case 'connect_charges_not_enabled': return 'connect.chargesNotEnabled';
+    case 'connect_link_invalid': return 'connect.linkInvalid';
+    case 'connect_session_unbound': return 'connect.sessionRequired';
+    case 'connect_upstream_unavailable': return 'connect.upstream';
     default: return 'connect.failed';
   }
 };
+
+/** Hosts de Account Link / hosted onboarding de Stripe. */
+export const isStripeOnboardingHost = (hostname: string): boolean =>
+  /^(accounts|onboarding|connect|checkout|billing)\.stripe\.com$/i.test(hostname);
 
 export type ConnectStatusResult = {
   ok: true;
@@ -71,14 +78,17 @@ export const connectStatusKey = (status: ConnectStatusResult): string => {
 export const parseConnectOnboardingUrl = (value: unknown, expectedAccountId: string | null, now = Date.now()): string | null => {
   if (!isRecord(value) || !isTestPhase(value) || !isAccountId(value.accountId) ||
     (expectedAccountId !== null && value.accountId !== expectedAccountId) || typeof value.url !== 'string') return null;
-  const expires = typeof value.expiresAt === 'number' ? value.expiresAt * 1000
-    : typeof value.expiresAt === 'string' ? Date.parse(value.expiresAt) : NaN;
-  if (!Number.isFinite(expires) || expires <= now) return null;
+  // expiresAt opcional: el backend ya validó el link; si llega, debe ser futuro.
+  if (value.expiresAt !== undefined && value.expiresAt !== null) {
+    const expires = typeof value.expiresAt === 'number' ? value.expiresAt * 1000
+      : typeof value.expiresAt === 'string' ? Date.parse(value.expiresAt) : NaN;
+    if (!Number.isFinite(expires) || expires <= now) return null;
+  }
   try {
     const url = new URL(value.url);
-    // Stripe v2: accounts.stripe.com (+ hash). También onboarding/connect. Sin userinfo ni puerto.
+    // Stripe v2 usa accounts.stripe.com (+ hash). Aceptar cualquier *.stripe.com de un label.
     if (url.protocol !== 'https:' || url.username || url.password || url.port ||
-      !['accounts.stripe.com', 'connect.stripe.com', 'onboarding.stripe.com'].includes(url.hostname)) return null;
+      !isStripeOnboardingHost(url.hostname)) return null;
     return url.href;
   } catch {
     return null;
