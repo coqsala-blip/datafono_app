@@ -1193,14 +1193,19 @@ app.post('/api/auth/logout', requireVerifiedToken, async (req, res) => {
 });
 
 app.post('/api/stripe/terminal/connection-token', requireAuth, async (req, res) => {
+  // TokenProvider corre al arrancar: no exigir chargesEnabled (solo cuenta vinculada si existe).
   let connected = null;
   try {
-    connected = await stripeConnect.resolveTerminalContext(req);
+    connected = await stripeConnect.resolveConnectedAccount(req, { requireCharges: false });
   } catch (error) {
-    const mapped = connectChargeError(error);
-    if (mapped) return res.status(mapped.status).json(mapped.body);
-    console.error('Error resolviendo cuenta Connect para Terminal:', error.message);
-    return res.status(502).json({ ok: false, code: 'connect_upstream_unavailable', error: 'No se pudo preparar Stripe Terminal Connect.' });
+    if (error?.code === 'connect_not_connected') {
+      connected = null;
+    } else {
+      const mapped = connectChargeError(error);
+      if (mapped) return res.status(mapped.status).json(mapped.body);
+      console.error('Error resolviendo cuenta Connect para Terminal:', error.message);
+      return res.status(502).json({ ok: false, code: 'connect_upstream_unavailable', error: 'No se pudo preparar Stripe Terminal Connect.' });
+    }
   }
 
   try {
@@ -1211,7 +1216,6 @@ app.post('/api/stripe/terminal/connection-token', requireAuth, async (req, res) 
       ok: true,
       secret: token.secret,
       accountId: connected?.accountId || null,
-      locationId: connected?.locationId || null,
       chargeMode: connected ? 'direct' : 'platform',
     });
   } catch (error) {

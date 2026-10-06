@@ -2914,8 +2914,12 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       if (!isCurrent() || !status?.enabled) return;
       const result = await request(true);
       if (!isCurrent()) return;
+      if (!result || typeof result !== 'object') throw new Error('connect.failed');
       const url = parseConnectOnboardingUrl(result, status.accountId);
-      if (!url) throw new Error();
+      if (!url) {
+        // Si el servidor devolvió un code conocido, úsalo; si no, fallo genérico.
+        throw new Error(connectErrorKey(result));
+      }
       try {
         await WebBrowser.openAuthSessionAsync(url, 'tpvapp://pago-completado');
       } finally {
@@ -2926,7 +2930,8 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       }
     } catch (error) {
       if (isCurrent()) setStripeMethodsError(error instanceof Error &&
-        ['connect.countryRequiresSupport', 'connect.countryNotApproved', 'connect.countryMismatch'].includes(error.message)
+        ['connect.countryRequiresSupport', 'connect.countryNotApproved', 'connect.countryMismatch',
+          'connect.notConnected', 'connect.chargesNotEnabled'].includes(error.message)
         ? error.message : 'connect.failed');
     } finally {
       if (isCurrent()) {

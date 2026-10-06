@@ -164,7 +164,7 @@ async function run() {
   for (const value of [link({ ok: false }), link({ livemode: true }), link({ phase: 'live' }),
     link({ accountId: 'bad' }), link({ expiresAt: null }), link({ expiresAt: 'bad' }), link({ expiresAt: 1 }),
     ...['http://onboarding.stripe.com/x', 'https://onboarding.stripe.com.evil.test/x', 'https://user:pass@connect.stripe.com/x',
-      'https://connect.stripe.com:444/x', 'https://connect.stripe.com/x#token', 'https://dashboard.stripe.com/test/dashboard',
+      'https://connect.stripe.com:444/x', 'https://dashboard.stripe.com/test/dashboard', 'https://evil.accounts.stripe.com/x',
       'javascript:alert(1)', 'tpvapp://pago-completado', '//connect.stripe.com/x'].map(url => link({ url }))]) {
     equal(helper.parseConnectOnboardingUrl(value, null), null);
     const context = contextFor(); respond(context, pending, pending, value);
@@ -174,6 +174,11 @@ async function run() {
   }
   equal(helper.parseConnectOnboardingUrl(link(), 'acct_foreign'), null);
   equal(helper.parseConnectOnboardingUrl(link({ expiresAt: 9999999999 }), null), link().url);
+  equal(helper.parseConnectOnboardingUrl(link({
+    url: 'https://accounts.stripe.com/r/acct_fixture#alu_test_token',
+  }), null), 'https://accounts.stripe.com/r/acct_fixture#alu_test_token');
+  equal(helper.parseConnectOnboardingUrl(link({ url: 'https://connect.stripe.com/x#token' }), null),
+    'https://connect.stripe.com/x#token');
   for (const initial of [status({ enabled: false }), status({ livemode: true }), {}, { ...pending, chargesEnabled: 'yes' }]) {
     const context = contextFor(); respond(context, initial);
     await context.openStripeAccountSettings();

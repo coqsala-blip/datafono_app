@@ -76,8 +76,9 @@ export const parseConnectOnboardingUrl = (value: unknown, expectedAccountId: str
   if (!Number.isFinite(expires) || expires <= now) return null;
   try {
     const url = new URL(value.url);
-    if (url.protocol !== 'https:' || url.username || url.password || url.port || url.hash ||
-      !['connect.stripe.com', 'onboarding.stripe.com'].includes(url.hostname)) return null;
+    // Stripe v2: accounts.stripe.com (+ hash). También onboarding/connect. Sin userinfo ni puerto.
+    if (url.protocol !== 'https:' || url.username || url.password || url.port ||
+      !['accounts.stripe.com', 'connect.stripe.com', 'onboarding.stripe.com'].includes(url.hostname)) return null;
     return url.href;
   } catch {
     return null;

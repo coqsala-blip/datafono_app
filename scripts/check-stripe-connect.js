@@ -366,8 +366,16 @@ const main = async () => {
     equal((await callbacks.call('refresh', { query: { state: signed } })).statusCode, 400);
     callbacks.state.users.get('owner').app_metadata = original;
   }
+  {
+    const fx = fixture({ STRIPE_CONNECT_TEST_COUNTRIES: 'ES' });
+    fx.state.linkUrl = 'https://accounts.stripe.com/r/acct_fixture#alu_test_token';
+    const onboard = await fx.call('onboarding');
+    equal(onboard.statusCode, 200);
+    equal(onboard.body.url, 'https://accounts.stripe.com/r/acct_fixture#alu_test_token');
+  }
   for (const url of ['http://onboarding.stripe.com/x', 'https://onboarding.stripe.com.attacker.test',
-    'https://user:pass@connect.stripe.com/x', 'https://stripe.com/x', 'https://evil.stripe.com/x', 'https://connect.stripe.com:444/x']) {
+    'https://user:pass@connect.stripe.com/x', 'https://stripe.com/x', 'https://evil.stripe.com/x',
+    'https://evil.accounts.stripe.com/x', 'https://connect.stripe.com:444/x']) {
     const unsafe = fixture();
     unsafe.state.linkUrl = url;
     equal((await unsafe.call('onboarding')).statusCode, 502);

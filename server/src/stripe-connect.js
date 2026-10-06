@@ -189,8 +189,9 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
   const safeLink = (link, accountId) => {
     let url;
     try { url = new URL(link?.url); } catch { throw fail(502, 'connect_link_invalid'); }
+    // Stripe v2 suele devolver accounts.stripe.com (a veces con hash); también onboarding/connect.
     if (link.livemode !== false || link.account !== accountId || url.protocol !== 'https:' || url.username || url.password ||
-      url.port || !['onboarding.stripe.com', 'connect.stripe.com'].includes(url.hostname)) {
+      url.port || !['accounts.stripe.com', 'onboarding.stripe.com', 'connect.stripe.com'].includes(url.hostname)) {
       throw fail(502, 'connect_link_invalid');
     }
     return url.href;

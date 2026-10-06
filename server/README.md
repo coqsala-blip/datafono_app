@@ -110,7 +110,7 @@ dueño principal, pais vinculado y sesion/dispositivo activos releidos de Auth. 
 revocado: 400. Return consume el nonce y redirige a
 `tpvapp://pago-completado?connect=return`: volver no demuestra que las capacidades esten activas.
 Refresh rota el nonce, valida otra vez la cuenta y redirige a un nuevo enlace HTTPS, limitado
-a `onboarding.stripe.com` o `connect.stripe.com`, sin usuario/password ni puerto alternativo.
+a `accounts.stripe.com`, `onboarding.stripe.com` o `connect.stripe.com`, sin usuario/password ni puerto alternativo.
 La app consulta status con autenticacion antes y despues del navegador. En Configuracion exige
 seleccionar explicitamente un pais en un modal UE27, lo guarda en `issuer.country` y captura
 el codigo normalizado para la solicitud. No asume confirmado ES por ser el valor inicial.
