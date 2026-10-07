@@ -134,10 +134,22 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
         // Se recrea si la ubicación ya no existe en la cuenta conectada.
       }
     }
+    // Reutilizar una ubicación ya creada en la cuenta conectada.
+    try {
+      const listed = await stripe().terminal.locations.list({ limit: 5 }, { stripeAccount: accountId });
+      const found = Array.isArray(listed?.data) ? listed.data.find((item) => /^tml_[A-Za-z0-9]+$/.test(item?.id || '')) : null;
+      if (found) {
+        await save(owner.id, { stripe_connect_test_terminal_location_id: found.id });
+        return found.id;
+      }
+    } catch (error) {
+      console.warn('Stripe Terminal locations.list (connected) failed:', error?.code || '', error?.message || error);
+    }
     const country = boundCountry(owner);
-    const displayName = typeof owner.user_metadata?.full_name === 'string' && owner.user_metadata.full_name.trim()
-      ? owner.user_metadata.full_name.trim().slice(0, 100)
-      : (typeof owner.email === 'string' ? owner.email.slice(0, 100) : 'TPV');
+    const rawName = typeof owner.user_metadata?.full_name === 'string' && owner.user_metadata.full_name.trim()
+      ? owner.user_metadata.full_name.trim()
+      : 'TPV';
+    const displayName = rawName.replace(/[^\p{L}\p{N} ._-]/gu, '').slice(0, 100) || 'TPV';
     let location;
     try {
       location = await stripe().terminal.locations.create({
@@ -146,7 +158,8 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
       }, { stripeAccount: accountId });
     } catch (error) {
       console.error('Stripe Terminal location create failed:', error?.code || '', error?.message || error);
-      throw fail(502, 'connect_terminal_location_invalid');
+      const detail = typeof error?.message === 'string' ? error.message.slice(0, 180) : '';
+      throw Object.assign(fail(502, 'connect_terminal_location_invalid'), { detail });
     }
     if (typeof location?.id !== 'string' || !/^tml_[A-Za-z0-9]+$/.test(location.id)) {
       throw fail(502, 'connect_terminal_location_invalid');
@@ -154,12 +167,26 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
     await save(owner.id, { stripe_connect_test_terminal_location_id: location.id });
     return location.id;
   };
+  // Solicita capacidades v1 en la cuenta conectada (Bizum + transfers para Terminal destination).
+  const ensureConnectedCapabilities = async (accountId, country) => {
+    const capabilities = {
+      card_payments: { requested: true },
+      transfers: { requested: true },
+    };
+    if (country === 'ES') capabilities.bizum_payments = { requested: true };
+    try {
+      await stripe().accounts.update(accountId, { capabilities });
+    } catch (error) {
+      console.warn('No se pudieron solicitar capacidades Connect:', error?.code || '', error?.message || error);
+    }
+  };
   // Activa Bizum (y locales EU habituales) en la PMC por defecto de la cuenta Connect.
   // Con cobros directos Stripe usa la PMC del comercio, no la de la plataforma.
   const ensureConnectedLocalPaymentMethods = async (accountId, country) => {
     if (country !== 'ES' && country !== 'PT' && country !== 'BE' && country !== 'NL' && country !== 'AT' && country !== 'DE') {
       return;
     }
+    await ensureConnectedCapabilities(accountId, country);
     try {
       const listed = await stripe().paymentMethodConfigurations.list({ limit: 10 }, { stripeAccount: accountId });
       const items = Array.isArray(listed?.data) ? listed.data : [];
@@ -183,11 +210,47 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
       console.warn('No se pudo activar métodos locales en la cuenta Connect:', error?.code || '', error?.message || error);
     }
   };
+  // Ubicación Terminal en la plataforma Connect (sin Stripe-Account). Sirve para destination/on_behalf_of.
+  const ensurePlatformTerminalLocation = async (owner) => {
+    const metadata = owner.app_metadata || {};
+    const existing = metadata.stripe_connect_test_platform_terminal_location_id;
+    if (typeof existing === 'string' && /^tml_[A-Za-z0-9]+$/.test(existing)) {
+      try {
+        await stripe().terminal.locations.retrieve(existing);
+        return existing;
+      } catch {
+        // recrear
+      }
+    }
+    const country = boundCountry(owner);
+    const displayName = typeof owner.user_metadata?.full_name === 'string' && owner.user_metadata.full_name.trim()
+      ? owner.user_metadata.full_name.trim().slice(0, 100)
+      : 'TPV Connect';
+    let location;
+    try {
+      location = await stripe().terminal.locations.create({
+        display_name: displayName.slice(0, 100),
+        address: terminalAddressFor(country),
+      });
+    } catch (error) {
+      console.error('Stripe Terminal platform location create failed:', error?.code || '', error?.message || error);
+      throw fail(502, 'connect_terminal_location_invalid');
+    }
+    if (typeof location?.id !== 'string' || !/^tml_[A-Za-z0-9]+$/.test(location.id)) {
+      throw fail(502, 'connect_terminal_location_invalid');
+    }
+    await save(owner.id, { stripe_connect_test_platform_terminal_location_id: location.id });
+    return location.id;
+  };
   const resolveTerminalContext = async (req) => {
     const connected = await resolveConnectedAccount(req, { requireCharges: true });
     if (!connected) return null;
-    const locationId = await ensureTerminalLocation(connected.owner, connected.accountId);
-    return { ...connected, locationId };
+    // Tap to Pay + Connect: ubicación y ConnectionToken en la plataforma Connect;
+    // el PaymentIntent usa on_behalf_of + transfer_data hacia la cuenta conectada.
+    // Crear Location en la cuenta conectada suele fallar en cuentas nuevas / test.
+    await ensureConnectedCapabilities(connected.accountId, boundCountry(connected.owner));
+    const locationId = await ensurePlatformTerminalLocation(connected.owner);
+    return { ...connected, locationId, terminalMode: 'destination' };
   };
   const sign = (payload) => crypto.createHmac('sha256', env.STRIPE_CONNECT_STATE_SECRET).update(payload).digest('base64url');
   const mintState = async (owner) => {

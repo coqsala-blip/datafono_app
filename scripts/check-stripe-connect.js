@@ -47,15 +47,21 @@ const fixture = (patch = {}) => {
     locations: {
       async retrieve(id, _params, options) {
         state.locationRetrieves = state.locationRetrieves || [];
-        state.locationRetrieves.push({ id, options: clone(options) });
+        state.locationRetrieves.push({ id, options: options ? clone(options) : undefined });
         if (state.failLocationRetrieve) throw new Error('missing location');
         return { id };
       },
       async create(params, options) {
         state.locationCreates = state.locationCreates || [];
-        state.locationCreates.push({ params: clone(params), options: clone(options) });
+        state.locationCreates.push({ params: clone(params), options: options ? clone(options) : undefined });
         if (state.failLocationCreate) throw new Error('invalid address');
-        return { id: 'tml_fixture' };
+        const id = options?.stripeAccount ? 'tml_connected' : 'tml_platform';
+        return { id };
+      },
+      async list(_params, options) {
+        state.locationLists = state.locationLists || [];
+        state.locationLists.push({ options: options ? clone(options) : undefined });
+        return { data: [] };
       },
     },
   },
@@ -68,6 +74,13 @@ const fixture = (patch = {}) => {
     async update(id, params, options) {
       state.pmcUpdates = state.pmcUpdates || [];
       state.pmcUpdates.push({ id, params: clone(params), options: clone(options) });
+      return { id, ...params };
+    },
+  },
+  accounts: {
+    async update(id, params) {
+      state.accountUpdates = state.accountUpdates || [];
+      state.accountUpdates.push({ id, params: clone(params) });
       return { id, ...params };
     },
   },
@@ -479,22 +492,23 @@ const main = async () => {
   // Status con Connect activo marca directCharges.
   equal((await chargeReady.call('status')).body.directCharges, true);
 
-  // Terminal: ubicación en la cuenta conectada (Stripe-Account).
+  // Terminal Connect: ubicación en plataforma + mode destination (on_behalf_of).
   equal(await fixture({ STRIPE_CONNECT_TEST_ENABLED: 'false' }).resolveTerminalContext(), null);
   const terminal = fixture();
   await terminal.call('onboarding');
   terminal.state.accounts.get('acct_fixture').configuration.merchant.capabilities.card_payments.status = 'active';
   const terminalCtx = await terminal.resolveTerminalContext();
-  equal(terminalCtx.locationId, 'tml_fixture');
+  equal(terminalCtx.locationId, 'tml_platform');
   equal(terminalCtx.accountId, 'acct_fixture');
+  equal(terminalCtx.terminalMode, 'destination');
   equal(terminal.state.locationCreates.length, 1);
-  equal(terminal.state.locationCreates[0].options, { stripeAccount: 'acct_fixture' });
+  equal(terminal.state.locationCreates[0].options, undefined);
   equal(terminal.state.locationCreates[0].params.address, {
     line1: 'Calle Provisional 1', city: 'Madrid', postal_code: '28001', country: 'ES',
   });
-  equal(terminal.state.users.get('owner').app_metadata.stripe_connect_test_terminal_location_id, 'tml_fixture');
+  equal(terminal.state.users.get('owner').app_metadata.stripe_connect_test_platform_terminal_location_id, 'tml_platform');
   const terminalReuse = await terminal.resolveTerminalContext();
-  equal(terminalReuse.locationId, 'tml_fixture');
+  equal(terminalReuse.locationId, 'tml_platform');
   equal(terminal.state.locationCreates.length, 1);
   equal(terminal.state.locationRetrieves.length, 1);
   const terminalFail = fixture();
@@ -508,10 +522,11 @@ const main = async () => {
     equal(error.code, 'connect_terminal_location_invalid');
   }
 
-  // Métodos locales (Bizum) en PMC de la cuenta Connect, no de la plataforma.
+  // Métodos locales (Bizum): capacidad + PMC de la cuenta Connect.
   const pmc = fixture();
   await pmc.call('onboarding');
   await pmc.ensureConnectedLocalPaymentMethods('acct_fixture', 'ES');
+  equal(pmc.state.accountUpdates[0].params.capabilities.bizum_payments, { requested: true });
   equal(pmc.state.pmcLists[0].options, { stripeAccount: 'acct_fixture' });
   equal(pmc.state.pmcUpdates[0].params.bizum, { display_preference: { preference: 'on' } });
 
