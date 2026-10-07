@@ -68,12 +68,12 @@ const fixture = (patch = {}) => {
   paymentMethodConfigurations: {
     async list(_params, options) {
       state.pmcLists = state.pmcLists || [];
-      state.pmcLists.push({ options: clone(options) });
+      state.pmcLists.push({ options: options ? clone(options) : undefined });
       return { data: [{ id: 'pmc_fixture', is_default: true, active: true }] };
     },
     async update(id, params, options) {
       state.pmcUpdates = state.pmcUpdates || [];
-      state.pmcUpdates.push({ id, params: clone(params), options: clone(options) });
+      state.pmcUpdates.push({ id, params: clone(params), options: options ? clone(options) : undefined });
       return { id, ...params };
     },
   },
