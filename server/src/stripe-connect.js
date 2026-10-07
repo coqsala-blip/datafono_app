@@ -220,6 +220,47 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
       console.warn('No se pudo activar métodos locales en la cuenta Connect:', error?.code || '', error?.message || error);
     }
   };
+  // Misma activación en la PMC de la plataforma Connect (Checkout destination / sin Stripe-Account).
+  const ensurePlatformLocalPaymentMethods = async (country) => {
+    try {
+      try {
+        const platform = await stripe().accounts.retrieve();
+        if (platform?.id) {
+          await stripe().accounts.update(platform.id, {
+            capabilities: {
+              card_payments: { requested: true },
+              ...(country === 'ES' ? { bizum_payments: { requested: true } } : {}),
+            },
+          });
+        }
+      } catch (capError) {
+        console.warn('Capacidades plataforma Connect:', capError?.code || '', capError?.message || capError);
+      }
+      const listed = await stripe().paymentMethodConfigurations.list({ limit: 10 });
+      const items = Array.isArray(listed?.data) ? listed.data : [];
+      const configuration = items.find((item) => item?.is_default === true)
+        || items.find((item) => item?.active !== false)
+        || items[0];
+      if (!configuration?.id) return;
+      const patch = {
+        card: { display_preference: { preference: 'on' } },
+        klarna: { display_preference: { preference: 'on' } },
+        revolut_pay: { display_preference: { preference: 'on' } },
+        amazon_pay: { display_preference: { preference: 'on' } },
+        link: { display_preference: { preference: 'on' } },
+        wero: { display_preference: { preference: 'on' } },
+        bancontact: { display_preference: { preference: 'on' } },
+        ideal: { display_preference: { preference: 'on' } },
+        eps: { display_preference: { preference: 'on' } },
+        pay_by_bank: { display_preference: { preference: 'on' } },
+      };
+      if (country === 'ES') patch.bizum = { display_preference: { preference: 'on' } };
+      if (country === 'PT') patch.mb_way = { display_preference: { preference: 'on' } };
+      await stripe().paymentMethodConfigurations.update(configuration.id, patch);
+    } catch (error) {
+      console.warn('No se pudo activar métodos locales en la plataforma Connect:', error?.code || '', error?.message || error);
+    }
+  };
   // Ubicación Terminal en la plataforma Connect (sin Stripe-Account). Sirve para destination/on_behalf_of.
   const ensurePlatformTerminalLocation = async (owner) => {
     const metadata = owner.app_metadata || {};
@@ -391,6 +432,7 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
     resolveConnectedAccount,
     resolveTerminalContext,
     ensureConnectedLocalPaymentMethods,
+    ensurePlatformLocalPaymentMethods,
     boundCountry,
     status: handle(async (req, res) => {
       if (!enabled()) return res.json(summary(false));

@@ -78,6 +78,9 @@ const fixture = (patch = {}) => {
     },
   },
   accounts: {
+    async retrieve() {
+      return { id: 'acct_platform', livemode: false };
+    },
     async update(id, params) {
       state.accountUpdates = state.accountUpdates || [];
       state.accountUpdates.push({ id, params: clone(params) });
@@ -129,6 +132,7 @@ const fixture = (patch = {}) => {
   return {
     state, env, call, resolveConnectedAccount, resolveTerminalContext,
     ensureConnectedLocalPaymentMethods: (...args) => handlers.ensureConnectedLocalPaymentMethods(...args),
+    ensurePlatformLocalPaymentMethods: (...args) => handlers.ensurePlatformLocalPaymentMethods(...args),
     restart() { handlers = createConnect(deps); },
     callbackState() {
       return new URL(state.links.at(-1).use_case.account_onboarding.return_url).searchParams.get('state');
@@ -522,13 +526,16 @@ const main = async () => {
     equal(error.code, 'connect_terminal_location_invalid');
   }
 
-  // Métodos locales (Bizum): capacidad + PMC de la cuenta Connect.
+  // Métodos locales (Bizum): capacidad + PMC de la cuenta Connect y de la plataforma.
   const pmc = fixture();
   await pmc.call('onboarding');
   await pmc.ensureConnectedLocalPaymentMethods('acct_fixture', 'ES');
   equal(pmc.state.accountUpdates[0].params.capabilities.bizum_payments, { requested: true });
   equal(pmc.state.pmcLists[0].options, { stripeAccount: 'acct_fixture' });
-  equal(pmc.state.pmcUpdates[0].params.bizum, { display_preference: { preference: 'on' } });
+  equal(pmc.state.pmcUpdates[0].params.bizum.display_preference.preference, 'on');
+  await pmc.ensurePlatformLocalPaymentMethods('ES');
+  equal(pmc.state.pmcLists.some((item) => !item.options || !item.options.stripeAccount), true);
+  equal(pmc.state.pmcUpdates.some((item) => item.params.bizum?.display_preference?.preference === 'on' && !item.options?.stripeAccount), true);
 
   console.log(`Stripe Connect: ${checks} checks passed (mocked, no network).`);
 };

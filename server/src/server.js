@@ -1309,16 +1309,18 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
   }
 
   try {
-    // Métodos dinámicos (Bizum incluido): no se pasa payment_method_types salvo que se configure
-    // una lista explícita en STRIPE_PAYMENT_METHOD_TYPES.
+    // Connect online: Checkout en la plataforma Connect (métodos dinámicos = Bizum, Klarna…)
+    // y destino on_behalf_of + transfer_data hacia la cuenta del comercio.
+    // Cobro directo (Stripe-Account) no ofrece Bizum hasta que la cuenta Connect tenga bizum_payments.
     const ownerId = connected?.ownerId || req.user.app_metadata?.company_owner_id || req.user.id;
-    // Cobro directo: solicitar bizum_payments + activar Bizum en la PMC de la cuenta Connect.
-    let connectCountry = null;
+    const chargeMode = connected ? 'destination' : 'platform';
     if (connected) {
-      connectCountry = typeof stripeConnect.boundCountry === 'function'
+      const connectCountry = typeof stripeConnect.boundCountry === 'function'
         ? stripeConnect.boundCountry(connected.owner)
         : (connected.owner?.app_metadata?.stripe_connect_test_country || 'ES');
       await stripeConnect.ensureConnectedLocalPaymentMethods(connected.accountId, connectCountry);
+      // Bizum y resto en la PMC de la plataforma Connect (la que usa este Checkout).
+      await stripeConnect.ensurePlatformLocalPaymentMethods(connectCountry);
     }
     const requestedPaymentMethodTypes = resolveCheckoutPaymentMethodTypes(amount);
     const checkoutSessionParams = {
@@ -1342,17 +1344,21 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
         order_id: orderId,
         ...(connected ? {
           stripe_connect_account_id: connected.accountId,
-          charge_mode: 'direct',
+          charge_mode: chargeMode,
         } : { charge_mode: 'platform' }),
       },
       payment_intent_data: {
+        ...(connected ? {
+          on_behalf_of: connected.accountId,
+          transfer_data: { destination: connected.accountId },
+        } : {}),
         metadata: {
           supabase_user_id: ownerId,
           operator_user_id: req.user.id,
           order_id: orderId,
           ...(connected ? {
             stripe_connect_account_id: connected.accountId,
-            charge_mode: 'direct',
+            charge_mode: chargeMode,
           } : { charge_mode: 'platform' }),
         },
       },
@@ -1362,7 +1368,8 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
     const { session, paymentMethodTypes } = await createCheckoutSessionWithLocalMethodsFallback(
       checkoutSessionParams,
       requestedPaymentMethodTypes,
-      connected ? { stripeClient: connected.stripe, stripeAccount: connected.accountId } : {},
+      // Sin Stripe-Account: PMC de plataforma (incluye Bizum si está activo en el Dashboard Connect).
+      connected ? { stripeClient: connected.stripe } : {},
     );
 
     const redirectUrl = session.url;
@@ -1379,7 +1386,7 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
       paymentMethods: paymentMethodTypes || 'auto',
       amount,
       accountId: connected?.accountId || null,
-      chargeMode: connected ? 'direct' : 'platform',
+      chargeMode,
       paymentIntentId: typeof session.payment_intent === 'string'
         ? session.payment_intent
         : (session.payment_intent?.id || null),
@@ -1412,11 +1419,19 @@ app.get('/api/stripe/payment/:paymentId', requireAuth, async (req, res) => {
     const retrieveOptions = {
       expand: ['payment_intent.payment_method', 'payment_intent.last_payment_error.payment_method'],
     };
-    const session = connected
-      ? await connected.stripe.checkout.sessions.retrieve(req.params.paymentId, retrieveOptions, {
-        stripeAccount: connected.accountId,
-      })
-      : await requireStripe().checkout.sessions.retrieve(req.params.paymentId, retrieveOptions);
+    // Destination/platform: sesión en la plataforma Connect. Direct legacy: Stripe-Account.
+    let session;
+    if (connected) {
+      try {
+        session = await connected.stripe.checkout.sessions.retrieve(req.params.paymentId, retrieveOptions);
+      } catch (platformErr) {
+        session = await connected.stripe.checkout.sessions.retrieve(req.params.paymentId, retrieveOptions, {
+          stripeAccount: connected.accountId,
+        });
+      }
+    } else {
+      session = await requireStripe().checkout.sessions.retrieve(req.params.paymentId, retrieveOptions);
+    }
     const ownerId = connected?.ownerId || req.user.app_metadata?.company_owner_id || req.user.id;
     const paymentUserId = session.metadata?.supabase_user_id;
     const paymentUser = paymentUserId && paymentUserId !== ownerId ? await fetchAuthoritativeUser(paymentUserId) : null;
@@ -2197,18 +2212,22 @@ const createStripeMoneyRefund = async (document, requestedCents, historyLength) 
   if (!validStripePaymentIntentId(document.stripePaymentIntentId)) {
     return { stripeRefundId: null, stripeRefundStatus: null };
   }
+  const connectClient = process.env.STRIPE_CONNECT_TEST_ENABLED === 'true'
+    && /^sk_test_[A-Za-z0-9]+$/.test(process.env.STRIPE_CONNECT_TEST_SECRET_KEY || '')
+    ? require('stripe')(process.env.STRIPE_CONNECT_TEST_SECRET_KEY)
+    : null;
   const direct = document.chargeMode === 'direct' && validStripeAccountId(document.stripeAccountId);
+  const destination = document.chargeMode === 'destination' && validStripeAccountId(document.stripeAccountId);
   let stripeClient;
   let requestOptions = {};
   if (direct) {
-    // Misma clave Connect que creó el cobro directo.
-    const connected = process.env.STRIPE_CONNECT_TEST_ENABLED === 'true'
-      && /^sk_test_[A-Za-z0-9]+$/.test(process.env.STRIPE_CONNECT_TEST_SECRET_KEY || '')
-      ? require('stripe')(process.env.STRIPE_CONNECT_TEST_SECRET_KEY)
-      : null;
-    if (!connected) throw Object.assign(new Error('connect_refund_client_unavailable'), { status: 503, code: 'connect_refund_client_unavailable' });
-    stripeClient = connected;
+    if (!connectClient) throw Object.assign(new Error('connect_refund_client_unavailable'), { status: 503, code: 'connect_refund_client_unavailable' });
+    stripeClient = connectClient;
     requestOptions = { stripeAccount: document.stripeAccountId };
+  } else if (destination) {
+    // Cobro destination: PI en la plataforma Connect (misma clave que creó el Checkout).
+    if (!connectClient) throw Object.assign(new Error('connect_refund_client_unavailable'), { status: 503, code: 'connect_refund_client_unavailable' });
+    stripeClient = connectClient;
   } else {
     stripeClient = requireStripe();
   }
