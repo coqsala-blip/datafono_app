@@ -1309,8 +1309,9 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
   }
 
   try {
-    // Connect online: preferir destination (PMC plataforma → Bizum) tras asegurar recipient/transfers.
-    // Si Stripe rechaza destination, fallback a cobro directo (Stripe-Account).
+    // Connect online: destination SIN on_behalf_of → la PMC es la de la plataforma (Bizum).
+    // Con on_behalf_of Stripe usaría la PMC de la cuenta conectada, donde Bizum suele no estar.
+    // Si Stripe rechaza destination (falta transfers), fallback a cobro directo.
     const ownerId = connected?.ownerId || req.user.app_metadata?.company_owner_id || req.user.id;
     let connectCountry = null;
     if (connected) {
@@ -1319,6 +1320,9 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
         : (connected.owner?.app_metadata?.stripe_connect_test_country || 'ES');
       await stripeConnect.ensureConnectedLocalPaymentMethods(connected.accountId, connectCountry);
       await stripeConnect.ensurePlatformLocalPaymentMethods(connectCountry);
+      // Tras activar Bizum en la PMC de plataforma, invalidar caché del filtro de métodos.
+      cachedPaymentMethodConfiguration = null;
+      cachedPaymentMethodConfigurationAt = 0;
     }
     const requestedPaymentMethodTypes = resolveCheckoutPaymentMethodTypes(amount);
     const baseLineItems = [
@@ -1334,6 +1338,8 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
     const buildCheckoutParams = (chargeMode) => ({
       mode: 'payment',
       ...(requestedPaymentMethodTypes ? { payment_method_types: requestedPaymentMethodTypes } : {}),
+      // Locale ES ayuda a que Checkout muestre métodos españoles (Bizum) con dynamic PM.
+      ...(connectCountry === 'ES' ? { locale: 'es' } : {}),
       line_items: baseLineItems,
       metadata: {
         supabase_user_id: ownerId,
@@ -1345,8 +1351,9 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
         } : { charge_mode: 'platform' }),
       },
       payment_intent_data: {
+        // Solo transfer_data: el cobro vive en la plataforma Connect (su PMC, con Bizum).
+        // No usar on_behalf_of aquí: cambiaría la PMC a la cuenta conectada.
         ...(chargeMode === 'destination' && connected ? {
-          on_behalf_of: connected.accountId,
           transfer_data: { destination: connected.accountId },
         } : {}),
         metadata: {
@@ -1393,6 +1400,16 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
     const qrDataUrl = redirectUrl
       ? await QRCode.toDataURL(redirectUrl, { width: 420, margin: 2 })
       : null;
+    const sessionMethods = Array.isArray(session?.payment_method_types) && session.payment_method_types.length > 0
+      ? session.payment_method_types
+      : paymentMethodTypes;
+    console.log('Checkout online creado:', {
+      chargeMode,
+      accountId: connected?.accountId || null,
+      paymentMethods: sessionMethods || 'auto',
+      locale: connectCountry === 'ES' ? 'es' : null,
+      amount,
+    });
 
     return res.status(201).json({
       ok: true,
@@ -1400,7 +1417,7 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
       redirectUrl,
       checkoutUrl: redirectUrl,
       qrDataUrl,
-      paymentMethods: paymentMethodTypes || 'auto',
+      paymentMethods: sessionMethods || 'auto',
       amount,
       accountId: connected?.accountId || null,
       chargeMode,
@@ -2408,7 +2425,7 @@ app.post('/api/documents', requireAuth, async (req, res) => {
     type,
     ...(validStripePaymentIntentId(stripePaymentIntentId) ? { stripePaymentIntentId } : {}),
     ...(validStripeAccountId(stripeAccountId) ? { stripeAccountId } : {}),
-    ...(chargeMode === 'direct' || chargeMode === 'platform' ? { chargeMode } : {}),
+    ...(chargeMode === 'direct' || chargeMode === 'destination' || chargeMode === 'platform' ? { chargeMode } : {}),
     ...(typeof stripeCheckoutSessionId === 'string' && /^cs_[A-Za-z0-9_]+$/.test(stripeCheckoutSessionId)
       ? { stripeCheckoutSessionId } : {}),
   };

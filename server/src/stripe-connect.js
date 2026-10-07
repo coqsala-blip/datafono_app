@@ -274,7 +274,14 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
       };
       if (country === 'ES') patch.bizum = { display_preference: { preference: 'on' } };
       if (country === 'PT') patch.mb_way = { display_preference: { preference: 'on' } };
-      await stripe().paymentMethodConfigurations.update(configuration.id, patch);
+      const updated = await stripe().paymentMethodConfigurations.update(configuration.id, patch);
+      if (country === 'ES') {
+        console.log('PMC plataforma Bizum:', {
+          id: configuration.id,
+          available: updated?.bizum?.available ?? null,
+          preference: updated?.bizum?.display_preference?.value ?? null,
+        });
+      }
     } catch (error) {
       console.warn('No se pudo activar métodos locales en la plataforma Connect:', error?.code || '', error?.message || error);
     }

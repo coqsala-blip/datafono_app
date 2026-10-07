@@ -65,14 +65,14 @@ type StripeTerminalPaymentIntentResult = {
   clientSecret?: string;
   accountId?: string | null;
   locationId?: string | null;
-  chargeMode?: 'direct' | 'platform';
+  chargeMode?: 'direct' | 'destination' | 'platform';
   code?: string;
   error?: string;
 };
 type StripePaymentRefs = {
   stripePaymentIntentId?: string;
   stripeAccountId?: string | null;
-  chargeMode?: 'direct' | 'platform';
+  chargeMode?: 'direct' | 'destination' | 'platform';
   stripeCheckoutSessionId?: string | null;
 };
 type StripeOnlinePaymentResult = {
@@ -82,7 +82,7 @@ type StripeOnlinePaymentResult = {
   qrDataUrl?: string | null;
   paymentMethods?: string[] | 'auto';
   accountId?: string | null;
-  chargeMode?: 'direct' | 'platform';
+  chargeMode?: 'direct' | 'destination' | 'platform';
   paymentIntentId?: string | null;
   code?: string;
   error?: string;
@@ -93,7 +93,7 @@ type StripeOnlinePaymentStatusResult = {
   checkoutStatus?: string;
   usedMethod?: string | null;
   accountId?: string | null;
-  chargeMode?: 'direct' | 'platform';
+  chargeMode?: 'direct' | 'destination' | 'platform';
   paymentIntentId?: string | null;
   error?: string;
 };
@@ -158,7 +158,7 @@ interface Transaction {
   publicUrl?: string;
   stripePaymentIntentId?: string;
   stripeAccountId?: string | null;
-  chargeMode?: 'direct' | 'platform';
+  chargeMode?: 'direct' | 'destination' | 'platform';
   stripeCheckoutSessionId?: string | null;
 }
 
@@ -437,7 +437,7 @@ const [seatsPanelOpen, setSeatsPanelOpen] = useState(false);
     checkoutUrl: string;
     qrDataUrl: string | null;
     accountId?: string | null;
-    chargeMode?: 'direct' | 'platform';
+    chargeMode?: 'direct' | 'destination' | 'platform';
     paymentIntentId?: string | null;
   } | null>(null);
   const onlinePaymentConfirmedRef = useRef(false);
@@ -522,7 +522,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     checkoutUrl: string;
     qrDataUrl: string | null;
     accountId?: string | null;
-    chargeMode?: 'direct' | 'platform';
+    chargeMode?: 'direct' | 'destination' | 'platform';
     paymentIntentId?: string | null;
   } | null>(null);
   const createOnlinePaymentRef = useRef<(method: string, paymentAmount: number, paymentRefs?: StripePaymentRefs) => void>(() => {});
@@ -2266,7 +2266,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     paymentIntentId: string;
     accountId: string | null;
     locationId: string | null;
-    chargeMode: 'direct' | 'platform';
+    chargeMode: 'direct' | 'destination' | 'platform';
   }> => {
     if (!accessToken || !configuredDocumentApiUrl) {
       throw new Error('Inicia sesión para poder cobrar con Stripe.');
@@ -2293,7 +2293,11 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       paymentIntentId: result.paymentIntentId,
       accountId: result.accountId || null,
       locationId: result.locationId || null,
-      chargeMode: result.chargeMode === 'direct' ? 'direct' : 'platform',
+      chargeMode: result.chargeMode === 'direct'
+        ? 'direct'
+        : result.chargeMode === 'destination'
+          ? 'destination'
+          : 'platform',
     };
   };
 
@@ -2498,20 +2502,26 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         checkoutUrl,
         qrDataUrl: result.qrDataUrl || null,
         accountId: result.accountId || null,
-        chargeMode: result.chargeMode === 'direct' ? 'direct' : 'platform',
+        chargeMode: result.chargeMode === 'direct'
+          ? 'direct'
+          : result.chargeMode === 'destination'
+            ? 'destination'
+            : 'platform',
         paymentIntentId: result.paymentIntentId || null,
       });
       // Se indican al vendedor los métodos que Stripe ofrece en este cobro concreto.
       const offeredMethods = Array.isArray(result.paymentMethods) && result.paymentMethods.length > 0
         ? result.paymentMethods.join(', ')
         : '';
-      const directHint = result.chargeMode === 'direct'
-        ? ' Cobro directo a tu cuenta Connect de prueba.'
-        : '';
+      const modeHint = result.chargeMode === 'direct'
+        ? ' Cobro directo a tu cuenta Connect.'
+        : result.chargeMode === 'destination'
+          ? ' Cobro destination (métodos de la plataforma Connect, incl. Bizum si está activo).'
+          : '';
       setOnlinePaymentMessage(
         offeredMethods
-          ? `Muestra el QR al cliente o abre el enlace de pago. Métodos en este cobro: ${offeredMethods}.${directHint}`
-          : `Muestra el QR al cliente o abre el enlace de pago. Stripe mostrará los métodos activados en tu cuenta (tarjeta, Bizum...).${directHint}`,
+          ? `Muestra el QR al cliente o abre el enlace de pago. Métodos en este cobro: ${offeredMethods}.${modeHint}`
+          : `Muestra el QR al cliente o abre el enlace de pago. Stripe mostrará los métodos activados (tarjeta, Bizum...).${modeHint}`,
       );
       // Persistir el cobro pendiente: al volver del navegador la app puede remontarse y
       // perder el estado en memoria; asi se reanuda la comprobacion automaticamente.
@@ -2731,7 +2741,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         checkoutUrl?: string;
         qrDataUrl?: string | null;
         accountId?: string | null;
-        chargeMode?: 'direct' | 'platform' | null;
+        chargeMode?: 'direct' | 'destination' | 'platform' | null;
         paymentIntentId?: string | null;
         paymentAmount?: number;
         pendingDocumentType?: DocumentType;
@@ -2763,7 +2773,11 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         checkoutUrl: pending.checkoutUrl,
         qrDataUrl: pending.qrDataUrl || null,
         accountId: pending.accountId || null,
-        chargeMode: pending.chargeMode === 'direct' ? 'direct' : 'platform',
+        chargeMode: pending.chargeMode === 'direct'
+          ? 'direct'
+          : pending.chargeMode === 'destination'
+            ? 'destination'
+            : 'platform',
         paymentIntentId: pending.paymentIntentId || null,
       });
       setOnlinePaymentError('');
@@ -2789,7 +2803,13 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                 {
                   stripePaymentIntentId: payment?.paymentIntentId || pending.paymentIntentId || undefined,
                   stripeAccountId: payment?.accountId || pending.accountId || null,
-                  chargeMode: payment?.chargeMode || (pending.chargeMode === 'direct' ? 'direct' : 'platform'),
+                  chargeMode: payment?.chargeMode || (
+                    pending.chargeMode === 'direct'
+                      ? 'direct'
+                      : pending.chargeMode === 'destination'
+                        ? 'destination'
+                        : 'platform'
+                  ),
                   stripeCheckoutSessionId: pending.paymentId,
                 },
               );
