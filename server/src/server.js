@@ -32,10 +32,6 @@ const SUBSCRIPTION_LOCK_DAYS = 3;
 const SUBSCRIPTION_PAST_DUE_STATES = new Set(['past_due', 'unpaid']);
 
 const EUR_LOCAL_PAYMENT_METHODS = ['bizum', 'mb_way', 'bancontact', 'eps', 'ideal', 'wero'];
-// Métodos habituales en Checkout ES (Connect): Bizum va explícito; el resto se retira si Stripe lo rechaza.
-const CONNECT_ES_CHECKOUT_METHODS = [
-  'card', 'bizum', 'klarna', 'revolut_pay', 'bancontact', 'ideal', 'eps', 'wero', 'amazon_pay', 'pay_by_bank', 'mb_way',
-];
 const stripePaymentMethodTypesSetting = String(process.env.STRIPE_PAYMENT_METHOD_TYPES || 'auto').trim().toLowerCase();
 const stripeDynamicPaymentMethods = stripePaymentMethodTypesSetting === '' || stripePaymentMethodTypesSetting === 'auto';
 const stripePaymentMethodTypes = stripeDynamicPaymentMethods
@@ -46,13 +42,8 @@ const stripePaymentMethodTypes = stripeDynamicPaymentMethods
 const BIZUM_MIN_AMOUNT_CENTS = 50;
 const BIZUM_MAX_AMOUNT_CENTS = 500000;
 
-const resolveCheckoutPaymentMethodTypes = (amountCents, options = {}) => {
-  // Connect ES: forzar lista con Bizum (métodos dinámicos de la cuenta Connect a menudo lo omiten).
-  if (options.connectCountry === 'ES' && amountCents >= BIZUM_MIN_AMOUNT_CENTS && amountCents <= BIZUM_MAX_AMOUNT_CENTS) {
-    return CONNECT_ES_CHECKOUT_METHODS.filter((method) => (
-      method !== 'bizum' || (amountCents >= BIZUM_MIN_AMOUNT_CENTS && amountCents <= BIZUM_MAX_AMOUNT_CENTS)
-    ));
-  }
+const resolveCheckoutPaymentMethodTypes = (amountCents) => {
+  // Métodos dinámicos (auto): Stripe muestra lo activado en la PMC de la cuenta (Klarna, Revolut, Bizum…).
   if (stripeDynamicPaymentMethods) return null;
   const eligible = stripePaymentMethodTypes.filter((method) => (
     method !== 'bizum' || (amountCents >= BIZUM_MIN_AMOUNT_CENTS && amountCents <= BIZUM_MAX_AMOUNT_CENTS)
@@ -71,9 +62,7 @@ const messageMentionsLocalMethod = (method, message) => {
 const isLocalPaymentMethodUnavailableError = (error) => {
   const message = String(error?.message || '').toLowerCase();
   if (EUR_LOCAL_PAYMENT_METHODS.some((method) => messageMentionsLocalMethod(method, message))) return true;
-  if (CONNECT_ES_CHECKOUT_METHODS.some((method) => method !== 'card' && messageMentionsLocalMethod(method, message))) return true;
-  return ['not activated', 'no está activado', 'not enabled', 'not supported', 'invalid payment method',
-    'cannot be used', 'payment method type'].some((text) => message.includes(text));
+  return ['not activated', 'no está activado', 'not enabled', 'not supported', 'invalid payment method'].some((text) => message.includes(text));
 };
 
 // Configuración de métodos de pago de la cuenta (misma fuente que el diagnóstico), cacheada 10
@@ -137,10 +126,7 @@ const createCheckoutSessionWithLocalMethodsFallback = async (params, requestedPa
     : await filterAvailablePaymentMethods(
       Array.isArray(requestedPaymentMethodTypes) ? [...requestedPaymentMethodTypes] : requestedPaymentMethodTypes,
     );
-  const removable = Array.isArray(currentTypes)
-    ? currentTypes.filter((method) => method !== 'card')
-    : EUR_LOCAL_PAYMENT_METHODS;
-  let removalsLeft = removable.length + EUR_LOCAL_PAYMENT_METHODS.length;
+  let removalsLeft = EUR_LOCAL_PAYMENT_METHODS.length;
 
   for (;;) {
     try {
@@ -157,17 +143,17 @@ const createCheckoutSessionWithLocalMethodsFallback = async (params, requestedPa
           : null);
       return { session, paymentMethodTypes: resolvedTypes };
     } catch (error) {
-      if (!Array.isArray(currentTypes) || currentTypes.length <= 1 || removalsLeft <= 0
-        || !isLocalPaymentMethodUnavailableError(error)) {
+      const requestedLocal = Array.isArray(currentTypes) && currentTypes.some((method) => EUR_LOCAL_PAYMENT_METHODS.includes(method));
+      if (!requestedLocal || removalsLeft <= 0 || !isLocalPaymentMethodUnavailableError(error)) {
         throw error;
       }
       removalsLeft -= 1;
 
-      // Retirar el método mencionado; si no, el último no-card. Nunca quitar card del todo.
+      // Retirar el método mencionado en el error SI está en la lista actual; si no, el último
+      // local de la lista. Siempre se retira uno, para que el reintento progrese siempre.
       const lower = String(error?.message || '').toLowerCase();
-      const mentioned = currentTypes.find((method) => method !== 'card' && messageMentionsLocalMethod(method, lower));
-      const toRemove = mentioned || [...currentTypes].reverse().find((method) => method !== 'card');
-      if (!toRemove) throw error;
+      const mentioned = EUR_LOCAL_PAYMENT_METHODS.find((method) => currentTypes.includes(method) && messageMentionsLocalMethod(method, lower));
+      const toRemove = mentioned || [...currentTypes].reverse().find((method) => EUR_LOCAL_PAYMENT_METHODS.includes(method));
       currentTypes = currentTypes.filter((method) => method !== toRemove);
       if (currentTypes.length === 0) currentTypes = ['card'];
       console.warn(`Método ${toRemove} no disponible en tu cuenta de Stripe. Se reintenta con:`, currentTypes.join(', '), '- Actívalo en Settings > Payment methods del Dashboard.');
@@ -1334,7 +1320,7 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
         : (connected.owner?.app_metadata?.stripe_connect_test_country || 'ES');
       await stripeConnect.ensureConnectedLocalPaymentMethods(connected.accountId, connectCountry);
     }
-    const requestedPaymentMethodTypes = resolveCheckoutPaymentMethodTypes(amount, { connectCountry });
+    const requestedPaymentMethodTypes = resolveCheckoutPaymentMethodTypes(amount);
     const checkoutSessionParams = {
       mode: 'payment',
       ...(requestedPaymentMethodTypes ? { payment_method_types: requestedPaymentMethodTypes } : {}),

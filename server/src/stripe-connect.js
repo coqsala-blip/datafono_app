@@ -194,16 +194,26 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
         || items.find((item) => item?.active !== false)
         || items[0];
       if (!configuration?.id) return;
-      const patch = {};
+      // Activar preferencias sin sustituir la lista dinámica de Checkout (Klarna, Revolut, etc.).
+      const patch = {
+        card: { display_preference: { preference: 'on' } },
+        klarna: { display_preference: { preference: 'on' } },
+        revolut_pay: { display_preference: { preference: 'on' } },
+        amazon_pay: { display_preference: { preference: 'on' } },
+        link: { display_preference: { preference: 'on' } },
+      };
       if (country === 'ES') patch.bizum = { display_preference: { preference: 'on' } };
       if (country === 'PT') patch.mb_way = { display_preference: { preference: 'on' } };
       if (country === 'BE') patch.bancontact = { display_preference: { preference: 'on' } };
       if (country === 'NL') patch.ideal = { display_preference: { preference: 'on' } };
       if (country === 'AT') patch.eps = { display_preference: { preference: 'on' } };
-      if (country === 'DE' || country === 'BE' || country === 'NL' || country === 'AT' || country === 'ES' || country === 'PT') {
+      if (['ES', 'PT', 'BE', 'NL', 'AT', 'DE'].includes(country)) {
         patch.wero = { display_preference: { preference: 'on' } };
+        patch.bancontact = patch.bancontact || { display_preference: { preference: 'on' } };
+        patch.ideal = patch.ideal || { display_preference: { preference: 'on' } };
+        patch.eps = patch.eps || { display_preference: { preference: 'on' } };
+        patch.pay_by_bank = { display_preference: { preference: 'on' } };
       }
-      if (!Object.keys(patch).length) return;
       await stripe().paymentMethodConfigurations.update(configuration.id, patch, { stripeAccount: accountId });
     } catch (error) {
       // No bloquea el cobro: Checkout puede seguir con tarjeta y otros métodos ya activos.
