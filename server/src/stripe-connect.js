@@ -112,6 +112,16 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
     if (requireCharges && !status.chargesEnabled) throw fail(409, 'connect_charges_not_enabled');
     return { accountId: account.id, stripe: stripe(), ownerId: owner.id, status, owner };
   };
+  // Dirección placeholder válida por país (Stripe valida CP; "00000" falla en ES).
+  const terminalAddressFor = (country) => {
+    if (country === 'ES') {
+      return { line1: 'Calle Provisional 1', city: 'Madrid', postal_code: '28001', country: 'ES' };
+    }
+    if (country === 'PT') {
+      return { line1: 'Rua Provisoria 1', city: 'Lisboa', postal_code: '1000-001', country: 'PT' };
+    }
+    return { line1: 'Provisional street 1', city: 'City', postal_code: '10115', country };
+  };
   // Ubicación Terminal en la cuenta conectada (Tap to Pay / lectores). Se crea una vez y se reutiliza.
   const ensureTerminalLocation = async (owner, accountId) => {
     const metadata = owner.app_metadata || {};
@@ -128,20 +138,50 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
     const displayName = typeof owner.user_metadata?.full_name === 'string' && owner.user_metadata.full_name.trim()
       ? owner.user_metadata.full_name.trim().slice(0, 100)
       : (typeof owner.email === 'string' ? owner.email.slice(0, 100) : 'TPV');
-    const location = await stripe().terminal.locations.create({
-      display_name: displayName,
-      address: {
-        line1: 'Direccion pendiente',
-        city: 'Ciudad',
-        postal_code: '00000',
-        country,
-      },
-    }, { stripeAccount: accountId });
+    let location;
+    try {
+      location = await stripe().terminal.locations.create({
+        display_name: displayName,
+        address: terminalAddressFor(country),
+      }, { stripeAccount: accountId });
+    } catch (error) {
+      console.error('Stripe Terminal location create failed:', error?.code || '', error?.message || error);
+      throw fail(502, 'connect_terminal_location_invalid');
+    }
     if (typeof location?.id !== 'string' || !/^tml_[A-Za-z0-9]+$/.test(location.id)) {
       throw fail(502, 'connect_terminal_location_invalid');
     }
     await save(owner.id, { stripe_connect_test_terminal_location_id: location.id });
     return location.id;
+  };
+  // Activa Bizum (y locales EU habituales) en la PMC por defecto de la cuenta Connect.
+  // Con cobros directos Stripe usa la PMC del comercio, no la de la plataforma.
+  const ensureConnectedLocalPaymentMethods = async (accountId, country) => {
+    if (country !== 'ES' && country !== 'PT' && country !== 'BE' && country !== 'NL' && country !== 'AT' && country !== 'DE') {
+      return;
+    }
+    try {
+      const listed = await stripe().paymentMethodConfigurations.list({ limit: 10 }, { stripeAccount: accountId });
+      const items = Array.isArray(listed?.data) ? listed.data : [];
+      const configuration = items.find((item) => item?.is_default === true)
+        || items.find((item) => item?.active !== false)
+        || items[0];
+      if (!configuration?.id) return;
+      const patch = {};
+      if (country === 'ES') patch.bizum = { display_preference: { preference: 'on' } };
+      if (country === 'PT') patch.mb_way = { display_preference: { preference: 'on' } };
+      if (country === 'BE') patch.bancontact = { display_preference: { preference: 'on' } };
+      if (country === 'NL') patch.ideal = { display_preference: { preference: 'on' } };
+      if (country === 'AT') patch.eps = { display_preference: { preference: 'on' } };
+      if (country === 'DE' || country === 'BE' || country === 'NL' || country === 'AT' || country === 'ES' || country === 'PT') {
+        patch.wero = { display_preference: { preference: 'on' } };
+      }
+      if (!Object.keys(patch).length) return;
+      await stripe().paymentMethodConfigurations.update(configuration.id, patch, { stripeAccount: accountId });
+    } catch (error) {
+      // No bloquea el cobro: Checkout puede seguir con tarjeta y otros métodos ya activos.
+      console.warn('No se pudo activar métodos locales en la cuenta Connect:', error?.code || '', error?.message || error);
+    }
   };
   const resolveTerminalContext = async (req) => {
     const connected = await resolveConnectedAccount(req, { requireCharges: true });
@@ -277,6 +317,8 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
   return {
     resolveConnectedAccount,
     resolveTerminalContext,
+    ensureConnectedLocalPaymentMethods,
+    boundCountry,
     status: handle(async (req, res) => {
       if (!enabled()) return res.json(summary(false));
       config();

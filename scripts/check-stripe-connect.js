@@ -54,8 +54,21 @@ const fixture = (patch = {}) => {
       async create(params, options) {
         state.locationCreates = state.locationCreates || [];
         state.locationCreates.push({ params: clone(params), options: clone(options) });
+        if (state.failLocationCreate) throw new Error('invalid address');
         return { id: 'tml_fixture' };
       },
+    },
+  },
+  paymentMethodConfigurations: {
+    async list(_params, options) {
+      state.pmcLists = state.pmcLists || [];
+      state.pmcLists.push({ options: clone(options) });
+      return { data: [{ id: 'pmc_fixture', is_default: true, active: true }] };
+    },
+    async update(id, params, options) {
+      state.pmcUpdates = state.pmcUpdates || [];
+      state.pmcUpdates.push({ id, params: clone(params), options: clone(options) });
+      return { id, ...params };
     },
   },
   };
@@ -100,9 +113,14 @@ const fixture = (patch = {}) => {
       authSessionId: options.session || `session-${id}`,
     });
   };
-  return { state, env, call, resolveConnectedAccount, resolveTerminalContext, restart() { handlers = createConnect(deps); }, callbackState() {
-    return new URL(state.links.at(-1).use_case.account_onboarding.return_url).searchParams.get('state');
-  } };
+  return {
+    state, env, call, resolveConnectedAccount, resolveTerminalContext,
+    ensureConnectedLocalPaymentMethods: (...args) => handlers.ensureConnectedLocalPaymentMethods(...args),
+    restart() { handlers = createConnect(deps); },
+    callbackState() {
+      return new URL(state.links.at(-1).use_case.account_onboarding.return_url).searchParams.get('state');
+    },
+  };
 };
 
 const checkWiring = async () => {
@@ -471,11 +489,31 @@ const main = async () => {
   equal(terminalCtx.accountId, 'acct_fixture');
   equal(terminal.state.locationCreates.length, 1);
   equal(terminal.state.locationCreates[0].options, { stripeAccount: 'acct_fixture' });
+  equal(terminal.state.locationCreates[0].params.address, {
+    line1: 'Calle Provisional 1', city: 'Madrid', postal_code: '28001', country: 'ES',
+  });
   equal(terminal.state.users.get('owner').app_metadata.stripe_connect_test_terminal_location_id, 'tml_fixture');
   const terminalReuse = await terminal.resolveTerminalContext();
   equal(terminalReuse.locationId, 'tml_fixture');
   equal(terminal.state.locationCreates.length, 1);
   equal(terminal.state.locationRetrieves.length, 1);
+  const terminalFail = fixture();
+  await terminalFail.call('onboarding');
+  terminalFail.state.accounts.get('acct_fixture').configuration.merchant.capabilities.card_payments.status = 'active';
+  terminalFail.state.failLocationCreate = true;
+  try {
+    await terminalFail.resolveTerminalContext();
+    assert.fail('expected connect_terminal_location_invalid');
+  } catch (error) {
+    equal(error.code, 'connect_terminal_location_invalid');
+  }
+
+  // Métodos locales (Bizum) en PMC de la cuenta Connect, no de la plataforma.
+  const pmc = fixture();
+  await pmc.call('onboarding');
+  await pmc.ensureConnectedLocalPaymentMethods('acct_fixture', 'ES');
+  equal(pmc.state.pmcLists[0].options, { stripeAccount: 'acct_fixture' });
+  equal(pmc.state.pmcUpdates[0].params.bizum, { display_preference: { preference: 'on' } });
 
   console.log(`Stripe Connect: ${checks} checks passed (mocked, no network).`);
 };

@@ -512,7 +512,9 @@ El backend usa **métodos dinámicos** por defecto
 **Stripe quien muestra los métodos activados en Settings → Payment methods del Dashboard** —el modo
 recomendado por Stripe, que garantiza que lo que actives allí salga siempre sin tocar el código
 (tarjeta, Bizum en España, MB WAY en Portugal, Bancontact en Bélgica, EPS en Austria, iDEAL en
-Países Bajos, Wero paneuropeo...). Si prefieres limitar la lista a mano, define
+Países Bajos, Wero paneuropeo...). Con **Connect en cobros directos**, esos métodos se leen de la
+**cuenta Connect del comercio** (no de la plataforma): antes de cada Checkout el backend intenta
+activar Bizum (ES) y otros locales en la PMC de esa cuenta. Si prefieres limitar la lista a mano, define
 `STRIPE_PAYMENT_METHOD_TYPES` con tu propia lista (p. ej. `card,bizum`): en ese caso el backend
 consulta la configuración real de la cuenta antes de cada cobro (cacheada 10 minutos), pide solo los
 métodos disponibles, **excluye Bizum automáticamente** fuera del rango 0,50 €–5.000 € y, si Stripe

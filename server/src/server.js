@@ -640,7 +640,7 @@ const connectChargeError = (error) => {
     connect_company_invalid: 'No se pudo resolver la empresa de la cuenta Connect.',
     connect_account_binding_invalid: 'La cuenta Connect vinculada no es válida.',
     connect_country_mismatch: 'El país de la cuenta Connect no coincide.',
-    connect_terminal_location_invalid: 'No se pudo preparar la ubicación de Stripe Terminal para la cuenta Connect.',
+    connect_terminal_location_invalid: 'No se pudo preparar Stripe Terminal en tu cuenta Connect. Completa la verificación en Stripe y vuelve a intentarlo.',
   };
   return {
     status: error.status,
@@ -1307,6 +1307,13 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
     // Métodos dinámicos (Bizum incluido): no se pasa payment_method_types salvo que se configure
     // una lista explícita en STRIPE_PAYMENT_METHOD_TYPES.
     const ownerId = connected?.ownerId || req.user.app_metadata?.company_owner_id || req.user.id;
+    // Cobro directo: activar Bizum/locales en la PMC de la cuenta Connect (no la de plataforma).
+    if (connected) {
+      const connectCountry = typeof stripeConnect.boundCountry === 'function'
+        ? stripeConnect.boundCountry(connected.owner)
+        : (connected.owner?.app_metadata?.stripe_connect_test_country || 'ES');
+      await stripeConnect.ensureConnectedLocalPaymentMethods(connected.accountId, connectCountry);
+    }
     const requestedPaymentMethodTypes = resolveCheckoutPaymentMethodTypes(amount);
     const checkoutSessionParams = {
       mode: 'payment',
