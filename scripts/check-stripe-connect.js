@@ -35,6 +35,25 @@ const fixture = (patch = {}) => {
       return clone(account);
     },
     async retrieve(id, params) { state.retrieves.push({ id, params }); if (state.failRetrieve) throw new Error('secret'); return clone(state.accounts.get(id)); },
+    async update(id, params) {
+      state.v2AccountUpdates = state.v2AccountUpdates || [];
+      state.v2AccountUpdates.push({ id, params: clone(params) });
+      const current = state.accounts.get(id) || { id };
+      const mergeDeep = (base, patch) => {
+        if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return clone(patch);
+        const out = { ...(base && typeof base === 'object' && !Array.isArray(base) ? base : {}) };
+        for (const [key, value] of Object.entries(patch)) {
+          out[key] = value && typeof value === 'object' && !Array.isArray(value)
+            ? mergeDeep(out[key], value)
+            : clone(value);
+        }
+        return out;
+      };
+      const next = clone(current);
+      if (params.configuration) next.configuration = mergeDeep(current.configuration || {}, params.configuration);
+      state.accounts.set(id, next);
+      return clone(next);
+    },
     async *list(params) { equal(params, { limit: 100 }); for (const account of state.accounts.values()) yield clone(account); },
   }, accountLinks: { async create(params) {
     state.links.push(clone(params));
@@ -289,7 +308,12 @@ const main = async () => {
   const payload = test.state.creates[0].params;
   equal(payload.contact_email, 'owner@example.test');
   equal(payload.display_name, 'Name owner');
-  equal(payload.configuration, { customer: {}, merchant: { capabilities: { card_payments: { requested: true } } } });
+  equal(payload.configuration, {
+    customer: {},
+    merchant: { capabilities: { card_payments: { requested: true } } },
+    recipient: { capabilities: { stripe_balance: { stripe_transfers: { requested: true } } } },
+  });
+  equal(payload.include.includes('configuration.recipient'), true);
   equal(payload.identity, { country: 'ES' });
   equal(payload.dashboard, 'full');
   equal(payload.defaults, { responsibilities: { fees_collector: 'stripe', losses_collector: 'stripe' } });
@@ -530,6 +554,8 @@ const main = async () => {
   const pmc = fixture();
   await pmc.call('onboarding');
   await pmc.ensureConnectedLocalPaymentMethods('acct_fixture', 'ES');
+  equal(pmc.state.v2AccountUpdates[0].params.configuration.recipient.capabilities.stripe_balance.stripe_transfers,
+    { requested: true });
   equal(pmc.state.accountUpdates[0].params.capabilities.bizum_payments, { requested: true });
   equal(pmc.state.pmcLists[0].options, { stripeAccount: 'acct_fixture' });
   equal(pmc.state.pmcUpdates[0].params.bizum.display_preference.preference, 'on');

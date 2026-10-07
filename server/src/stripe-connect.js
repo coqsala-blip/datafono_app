@@ -2,7 +2,14 @@ const crypto = require('node:crypto');
 const { Buffer } = require('node:buffer');
 
 const ACCOUNT_ID = /^acct_[A-Za-z0-9]+$/;
-const INCLUDE = ['configuration.merchant', 'configuration.customer', 'defaults', 'requirements', 'identity'];
+const INCLUDE = ['configuration.merchant', 'configuration.customer', 'configuration.recipient',
+  'defaults', 'requirements', 'identity'];
+const MERCHANT_RECIPIENT_CONFIG = {
+  customer: {},
+  merchant: { capabilities: { card_payments: { requested: true } } },
+  // Necesario para Checkout/Terminal destination (transfer_data / on_behalf_of).
+  recipient: { capabilities: { stripe_balance: { stripe_transfers: { requested: true } } } },
+};
 const EU_COUNTRIES = new Set('AT BE BG HR CY CZ DK EE FI FR DE GR HU IE IT LV LT LU MT NL PL PT RO SK SI ES SE'.split(' '));
 const STATE_TTL = 30 * 60 * 1000;
 const RETRY_WINDOW = 23 * 60 * 60 * 1000;
@@ -167,8 +174,19 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
     await save(owner.id, { stripe_connect_test_terminal_location_id: location.id });
     return location.id;
   };
-  // Solicita capacidades v1 en la cuenta conectada (Bizum + transfers para Terminal destination).
+  // Solicita recipient/transfers (v2) + capacidades v1 (Bizum, transfers) en la cuenta conectada.
   const ensureConnectedCapabilities = async (accountId, country) => {
+    try {
+      await stripe().v2.core.accounts.update(accountId, {
+        configuration: {
+          recipient: { capabilities: { stripe_balance: { stripe_transfers: { requested: true } } } },
+          merchant: { capabilities: { card_payments: { requested: true } } },
+        },
+        include: INCLUDE,
+      });
+    } catch (error) {
+      console.warn('No se pudo actualizar recipient/transfers v2:', error?.code || '', error?.message || error);
+    }
     const capabilities = {
       card_payments: { requested: true },
       transfers: { requested: true },
@@ -177,7 +195,7 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
     try {
       await stripe().accounts.update(accountId, { capabilities });
     } catch (error) {
-      console.warn('No se pudieron solicitar capacidades Connect:', error?.code || '', error?.message || error);
+      console.warn('No se pudieron solicitar capacidades Connect v1:', error?.code || '', error?.message || error);
     }
   };
   // Activa Bizum (y locales EU habituales) en la PMC por defecto de la cuenta Connect.
@@ -353,21 +371,31 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
   const createLink = async (owner, account) => {
     const origin = config();
     const state = await mintState(owner);
-    // La cuenta se crea con merchant (+ customer): el link debe pedir configuraciones compatibles.
+    // La cuenta se crea con merchant + customer + recipient: el link debe pedir configs compatibles.
     let link;
     try {
       link = await stripe().v2.core.accountLinks.create({ account: account.id, use_case: {
-        type: 'account_onboarding', account_onboarding: { configurations: ['merchant', 'customer'],
+        type: 'account_onboarding', account_onboarding: {
+          configurations: ['merchant', 'customer', 'recipient'],
           return_url: `${origin}/api/stripe/connect/return?state=${encodeURIComponent(state)}`,
           refresh_url: `${origin}/api/stripe/connect/refresh?state=${encodeURIComponent(state)}` },
       } });
     } catch (firstError) {
       if (firstError?.code !== 'configs_must_match_to_use_account_links') throw firstError;
-      link = await stripe().v2.core.accountLinks.create({ account: account.id, use_case: {
-        type: 'account_onboarding', account_onboarding: { configurations: ['merchant'],
-          return_url: `${origin}/api/stripe/connect/return?state=${encodeURIComponent(state)}`,
-          refresh_url: `${origin}/api/stripe/connect/refresh?state=${encodeURIComponent(state)}` },
-      } });
+      try {
+        link = await stripe().v2.core.accountLinks.create({ account: account.id, use_case: {
+          type: 'account_onboarding', account_onboarding: { configurations: ['merchant', 'customer'],
+            return_url: `${origin}/api/stripe/connect/return?state=${encodeURIComponent(state)}`,
+            refresh_url: `${origin}/api/stripe/connect/refresh?state=${encodeURIComponent(state)}` },
+        } });
+      } catch (secondError) {
+        if (secondError?.code !== 'configs_must_match_to_use_account_links') throw secondError;
+        link = await stripe().v2.core.accountLinks.create({ account: account.id, use_case: {
+          type: 'account_onboarding', account_onboarding: { configurations: ['merchant'],
+            return_url: `${origin}/api/stripe/connect/return?state=${encodeURIComponent(state)}`,
+            refresh_url: `${origin}/api/stripe/connect/refresh?state=${encodeURIComponent(state)}` },
+        } });
+      }
     }
     await stateOwner(readState(state));
     return { url: safeLink(link, account.id), expiresAt: link.expires_at };
@@ -409,7 +437,7 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
     const idempotencyKey = `connect-test-v1-${crypto.createHash('sha256').update(owner.id).digest('hex')}-${pending.token}`;
     const account = checkAccount(await stripe().v2.core.accounts.create({ contact_email: pending.email, display_name: pending.name,
       identity: { country }, dashboard: 'full', defaults: { responsibilities: { fees_collector: 'stripe', losses_collector: 'stripe' } },
-      configuration: { customer: {}, merchant: { capabilities: { card_payments: { requested: true } } } },
+      configuration: MERCHANT_RECIPIENT_CONFIG,
       metadata: { supabase_owner_id: owner.id, connect_test_creation_token: pending.token }, include: INCLUDE,
     }, { idempotencyKey }), owner, undefined, country);
     await save(owner.id, { stripe_connect_test_account_id: account.id, stripe_connect_test_country: country, stripe_connect_test_creation: null });

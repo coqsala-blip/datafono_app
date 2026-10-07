@@ -1309,35 +1309,32 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
   }
 
   try {
-    // Connect online: Checkout en la plataforma Connect (métodos dinámicos = Bizum, Klarna…)
-    // y destino on_behalf_of + transfer_data hacia la cuenta del comercio.
-    // Cobro directo (Stripe-Account) no ofrece Bizum hasta que la cuenta Connect tenga bizum_payments.
+    // Connect online: preferir destination (PMC plataforma → Bizum) tras asegurar recipient/transfers.
+    // Si Stripe rechaza destination, fallback a cobro directo (Stripe-Account).
     const ownerId = connected?.ownerId || req.user.app_metadata?.company_owner_id || req.user.id;
-    const chargeMode = connected ? 'destination' : 'platform';
+    let connectCountry = null;
     if (connected) {
-      const connectCountry = typeof stripeConnect.boundCountry === 'function'
+      connectCountry = typeof stripeConnect.boundCountry === 'function'
         ? stripeConnect.boundCountry(connected.owner)
         : (connected.owner?.app_metadata?.stripe_connect_test_country || 'ES');
       await stripeConnect.ensureConnectedLocalPaymentMethods(connected.accountId, connectCountry);
-      // Bizum y resto en la PMC de la plataforma Connect (la que usa este Checkout).
       await stripeConnect.ensurePlatformLocalPaymentMethods(connectCountry);
     }
     const requestedPaymentMethodTypes = resolveCheckoutPaymentMethodTypes(amount);
-    const checkoutSessionParams = {
+    const baseLineItems = [
+      {
+        quantity: 1,
+        price_data: {
+          currency: stripeCurrency,
+          unit_amount: amount,
+          product_data: { name: `TPV - ${orderId}` },
+        },
+      },
+    ];
+    const buildCheckoutParams = (chargeMode) => ({
       mode: 'payment',
       ...(requestedPaymentMethodTypes ? { payment_method_types: requestedPaymentMethodTypes } : {}),
-      line_items: [
-        {
-          quantity: 1,
-          price_data: {
-            currency: stripeCurrency,
-            unit_amount: amount,
-            product_data: {
-              name: `TPV - ${orderId}`,
-            },
-          },
-        },
-      ],
+      line_items: baseLineItems,
       metadata: {
         supabase_user_id: ownerId,
         operator_user_id: req.user.id,
@@ -1348,7 +1345,7 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
         } : { charge_mode: 'platform' }),
       },
       payment_intent_data: {
-        ...(connected ? {
+        ...(chargeMode === 'destination' && connected ? {
           on_behalf_of: connected.accountId,
           transfer_data: { destination: connected.accountId },
         } : {}),
@@ -1364,13 +1361,33 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
       },
       success_url: `${PUBLIC_API_URL}/stripe/complete?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${PUBLIC_API_URL}/stripe/cancel?orderId=${encodeURIComponent(orderId)}`,
+    });
+    const isDestinationCapabilityError = (error) => {
+      const message = String(error?.message || '').toLowerCase();
+      return message.includes('destination account needs')
+        || message.includes('stripe_transfers')
+        || (message.includes('transfers') && message.includes('capabilities'));
     };
-    const { session, paymentMethodTypes } = await createCheckoutSessionWithLocalMethodsFallback(
-      checkoutSessionParams,
-      requestedPaymentMethodTypes,
-      // Sin Stripe-Account: PMC de plataforma (incluye Bizum si está activo en el Dashboard Connect).
-      connected ? { stripeClient: connected.stripe } : {},
-    );
+
+    let chargeMode = connected ? 'destination' : 'platform';
+    let session;
+    let paymentMethodTypes;
+    try {
+      ({ session, paymentMethodTypes } = await createCheckoutSessionWithLocalMethodsFallback(
+        buildCheckoutParams(chargeMode),
+        requestedPaymentMethodTypes,
+        connected ? { stripeClient: connected.stripe } : {},
+      ));
+    } catch (destinationError) {
+      if (!connected || !isDestinationCapabilityError(destinationError)) throw destinationError;
+      console.warn('Checkout destination no disponible, fallback a directo:', destinationError.message);
+      chargeMode = 'direct';
+      ({ session, paymentMethodTypes } = await createCheckoutSessionWithLocalMethodsFallback(
+        buildCheckoutParams(chargeMode),
+        requestedPaymentMethodTypes,
+        { stripeClient: connected.stripe, stripeAccount: connected.accountId },
+      ));
+    }
 
     const redirectUrl = session.url;
     const qrDataUrl = redirectUrl
