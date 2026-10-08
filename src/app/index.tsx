@@ -376,6 +376,7 @@ const [seatsPanelOpen, setSeatsPanelOpen] = useState(false);
     initialize,
     isInitialized: isStripeTerminalInitialized,
     connectedReader,
+    disconnectReader,
     easyConnect,
     retrievePaymentIntent,
     collectPaymentMethod,
@@ -2341,7 +2342,18 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       if (error) throw new Error(error.message || 'No se pudo iniciar Stripe Terminal.');
     }
 
-    if (connectedReader) return connectedReader;
+    // Si el lector ya conectado apunta a otra Location (p. ej. tras Connect), reconectar.
+    const readerLocationId = connectedReader?.locationId || connectedReader?.location?.id || null;
+    if (connectedReader && readerLocationId === resolvedLocationId) {
+      return connectedReader;
+    }
+    if (connectedReader) {
+      try {
+        await disconnectReader();
+      } catch {
+        // Continuar e intentar conectar de nuevo.
+      }
+    }
 
     setTerminalMessage('tpv.preparing');
     const connectionResult = await easyConnect({
