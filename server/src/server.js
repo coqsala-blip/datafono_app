@@ -14,7 +14,23 @@ const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 const STRIPE_MAIN_SUBSCRIPTION_PRICE_ID = process.env.STRIPE_MAIN_SUBSCRIPTION_PRICE_ID;
 const STRIPE_ADDITIONAL_USER_PRICE_ID = process.env.STRIPE_ADDITIONAL_USER_PRICE_ID;
-const stripe = STRIPE_SECRET_KEY ? Stripe(STRIPE_SECRET_KEY) : null;
+// Suscripciones / billing usan STRIPE_SECRET_KEY. Si falta en test pero hay clave Connect de
+// plataforma, se reutiliza (misma cuenta sk_test) para no bloquear plazas de empleado.
+const resolvePlatformStripeSecretKey = () => {
+  if (typeof STRIPE_SECRET_KEY === 'string' && /^sk_(test|live)_[A-Za-z0-9]+$/.test(STRIPE_SECRET_KEY)) {
+    return STRIPE_SECRET_KEY;
+  }
+  const connectKey = process.env.STRIPE_CONNECT_TEST_SECRET_KEY;
+  if (process.env.STRIPE_CONNECT_TEST_ENABLED === 'true'
+    && typeof connectKey === 'string'
+    && /^sk_test_[A-Za-z0-9]+$/.test(connectKey)) {
+    console.warn('STRIPE_SECRET_KEY ausente: billing usa STRIPE_CONNECT_TEST_SECRET_KEY (solo test).');
+    return connectKey;
+  }
+  return null;
+};
+const platformStripeSecretKey = resolvePlatformStripeSecretKey();
+const stripe = platformStripeSecretKey ? Stripe(platformStripeSecretKey) : null;
 const stripeCurrency = 'eur';
 
 // Métodos de pago del cobro online (solo cobros puntuales, en EUR).
@@ -243,7 +259,11 @@ const supabaseAuth = createClient(
 
 const requireStripe = () => {
   if (!stripe) {
-    throw new Error('STRIPE_SECRET_KEY no está configurada en el backend.');
+    throw new Error(
+      'STRIPE_SECRET_KEY no está configurada en el backend (Render). '
+      + 'Añade la sk_test/sk_live de la cuenta plataforma, o en test deja STRIPE_CONNECT_TEST_ENABLED=true '
+      + 'con STRIPE_CONNECT_TEST_SECRET_KEY de la misma cuenta.',
+    );
   }
   return stripe;
 };
