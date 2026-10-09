@@ -24,3 +24,19 @@ services:
         sync: false
       - key: STRIPE_ADDITIONAL_USER_PRICE_ID
         sync: false
+      # Fase 1 go-live: Connect sigue en test (sk_test). No activar LIVE y TEST a la vez.
+      - key: STRIPE_CONNECT_TEST_ENABLED
+        sync: false
+      - key: STRIPE_CONNECT_TEST_SECRET_KEY
+        sync: false
+      - key: STRIPE_CONNECT_TEST_COUNTRIES
+        sync: false
+      - key: STRIPE_CONNECT_STATE_SECRET
+        sync: false
+      # Fase 2: Connect live (apagar TEST_ENABLED al activar).
+      - key: STRIPE_CONNECT_LIVE_ENABLED
+        sync: false
+      - key: STRIPE_CONNECT_LIVE_SECRET_KEY
+        sync: false
+      - key: STRIPE_CONNECT_LIVE_COUNTRIES
+        sync: false

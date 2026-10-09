@@ -94,6 +94,7 @@ const loadServer = () => {
   vm.runInNewContext(fs.readFileSync(path.join(root, 'server/src/server.js'), 'utf8'), {
     require(name) {
       if (name === './stripe-connect') return require('../server/src/stripe-connect');
+      if (name === './stripe-connect-env') return require('../server/src/stripe-connect-env');
       assert.ok(name in modules, `Unexpected module: ${name}`); return modules[name];
     },
     process: { env: { PUBLIC_API_URL: 'http://localhost:4000', NODE_ENV: 'test', SUPABASE_URL: 'http://supabase.test', SUPABASE_SECRET_KEY: 'test' } },

@@ -21,12 +21,14 @@ const fixture = (patch = {}) => {
   state.users.set('employee', user('employee', 'empleado', 'owner'));
   const env = { STRIPE_CONNECT_TEST_ENABLED: 'true', STRIPE_CONNECT_TEST_SECRET_KEY: 'sk_test_fixture',
     STRIPE_CONNECT_STATE_SECRET: 'fixture-state-secret-with-at-least-32-bytes', PUBLIC_API_URL: 'https://api.example.test', ...patch };
+  const expectLive = env.STRIPE_CONNECT_LIVE_ENABLED === 'true';
+  const expectedSecret = expectLive ? (env.STRIPE_CONNECT_LIVE_SECRET_KEY || 'sk_live_fixture') : 'sk_test_fixture';
   const client = { v2: { core: { accounts: {
     async create(params, options) {
       state.creates.push(clone({ params, options }));
       if (state.tokenRequired) throw Object.assign(new Error('sensitive upstream details'), { code: 'account_token_required' });
       if (state.failCreate) throw new Error('sensitive credentials');
-      const account = { id: 'acct_fixture', livemode: false, identity: params.identity, dashboard: params.dashboard, defaults: params.defaults,
+      const account = { id: 'acct_fixture', livemode: expectLive, identity: params.identity, dashboard: params.dashboard, defaults: params.defaults,
         metadata: params.metadata, configuration: { merchant: { capabilities: { card_payments: { status: 'inactive' },
           stripe_balance: { payouts: { status: 'pending' } } } } }, requirements: { entries: [{ awaiting_action_from: 'user' }] } };
       Object.assign(account, state.accountPatch);
@@ -59,7 +61,7 @@ const fixture = (patch = {}) => {
     state.links.push(clone(params));
     if (state.failLink) throw new Error('secret link credentials');
     if (state.beforeLink) state.beforeLink();
-    return { account: params.account, livemode: false, url: state.linkUrl || 'https://onboarding.stripe.com/setup/test',
+    return { account: params.account, livemode: expectLive, url: state.linkUrl || 'https://onboarding.stripe.com/setup/test',
       expires_at: '2026-10-05T10:00:00Z', ...state.linkPatch };
   } } } },
   terminal: {
@@ -108,7 +110,7 @@ const fixture = (patch = {}) => {
   },
   };
   const locks = new Map();
-  const deps = { env, now: () => state.now, stripeFactory(key) { equal(key, 'sk_test_fixture'); state.factories += 1; return client; },
+  const deps = { env, now: () => state.now, stripeFactory(key) { equal(key, expectedSecret); state.factories += 1; return client; },
     async fetchAuthoritativeUser(id) { return state.users.has(id) ? clone(state.users.get(id)) : null; },
     async updateUserAppMetadata(id, metadata) {
       state.writes += 1;
@@ -172,7 +174,10 @@ const checkWiring = async () => {
     admin: { async getUserById() { return { data: { user: clone(owner) } }; } } } };
   const modules = { dotenv: { config() {} }, express, crypto, qrcode: {},
     stripe: () => { throw new Error('Stripe must not initialize when disabled'); },
-    '@supabase/supabase-js': { createClient: () => client }, './stripe-connect': createConnect };
+    '@supabase/supabase-js': { createClient: () => client },
+    './stripe-connect': createConnect,
+    './stripe-connect-env': require('../server/src/stripe-connect-env'),
+  };
   const source = fs.readFileSync(path.join(root, 'server/src/server.js'), 'utf8');
   vm.runInNewContext(source, { require(name) { assert.ok(name in modules); return modules[name]; },
     process: { env: { NODE_ENV: 'test', PUBLIC_API_URL: 'https://api.example.test',
@@ -562,6 +567,24 @@ const main = async () => {
   await pmc.ensurePlatformLocalPaymentMethods('ES');
   equal(pmc.state.pmcLists.some((item) => !item.options || !item.options.stripeAccount), true);
   equal(pmc.state.pmcUpdates.some((item) => item.params.bizum?.display_preference?.preference === 'on' && !item.options?.stripeAccount), true);
+
+  // Connect live (XOR test): livemode true + sk_live.
+  const liveConnect = fixture({
+    STRIPE_CONNECT_TEST_ENABLED: 'false',
+    STRIPE_CONNECT_LIVE_ENABLED: 'true',
+    STRIPE_CONNECT_LIVE_SECRET_KEY: 'sk_live_fixture',
+  });
+  const liveOnboard = await liveConnect.call('onboarding');
+  equal(liveOnboard.statusCode, 200);
+  equal(liveOnboard.body.livemode, true);
+  equal(liveOnboard.body.phase, 'connect_live');
+  equal(liveConnect.state.creates[0].options.idempotencyKey.startsWith('connect-live-v1-'), true);
+  const bothModes = fixture({
+    STRIPE_CONNECT_TEST_ENABLED: 'true',
+    STRIPE_CONNECT_LIVE_ENABLED: 'true',
+    STRIPE_CONNECT_LIVE_SECRET_KEY: 'sk_live_fixture',
+  });
+  equal((await bothModes.call('status')).body.code, 'connect_mode_ambiguous');
 
   console.log(`Stripe Connect: ${checks} checks passed (mocked, no network).`);
 };

@@ -175,6 +175,7 @@ const loadServer = () => {
   vm.runInNewContext(source, {
     require: (name) => {
       if (name === './stripe-connect') return require('../server/src/stripe-connect');
+      if (name === './stripe-connect-env') return require('../server/src/stripe-connect-env');
       if (!(name in modules)) throw new Error(`Módulo no simulado: ${name}`);
       return modules[name];
     },

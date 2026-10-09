@@ -5,6 +5,7 @@ const QRCode = require('qrcode');
 const Stripe = require('stripe');
 const { createClient } = require('@supabase/supabase-js');
 const createStripeConnect = require('./stripe-connect');
+const { resolveConnectMode, createConnectStripeClient } = require('./stripe-connect-env');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -508,7 +509,18 @@ if (NODE_ENV === 'production') {
 app.get('/health', (req, res) => {
   // RENDER_GIT_COMMIT lo inyecta Render automaticamente en cada despliegue: permite verificar
   // desde fuera que el backend servido corresponde exactamente al commit desplegado.
-  res.json({ ok: true, service: 'TPV & GESTOR backend', commit: process.env.RENDER_GIT_COMMIT || null });
+  // stripeModes: Fase 1 = billing live + connect test; no expone secretos.
+  const billingKey = platformStripeSecretKey || '';
+  const connect = resolveConnectMode(process.env);
+  res.json({
+    ok: true,
+    service: 'TPV & GESTOR backend',
+    commit: process.env.RENDER_GIT_COMMIT || null,
+    stripeModes: {
+      billing: billingKey.startsWith('sk_live_') ? 'live' : (billingKey.startsWith('sk_test_') ? 'test' : 'missing'),
+      connect: connect.enabled ? (connect.livemode ? 'live' : 'test') : 'off',
+    },
+  });
 });
 
 // Diagnóstico de la conexión con Supabase. NUNCA devuelve la clave: solo su tipo (prefijo) y si
@@ -651,11 +663,13 @@ const connectChargeError = (error) => {
   const messages = {
     connect_not_connected: 'Completa el alta de Stripe Connect antes de cobrar.',
     connect_charges_not_enabled: 'Tu cuenta Connect aún no puede cobrar. Completa la verificación en Stripe.',
-    connect_test_disabled: 'Stripe Connect test no está habilitado.',
+    connect_test_disabled: 'Stripe Connect no está habilitado.',
     connect_test_key_invalid: 'Stripe Connect test no está configurado correctamente.',
-    connect_state_secret_missing: 'Stripe Connect test no está configurado correctamente.',
-    connect_public_origin_invalid: 'Stripe Connect test no está configurado correctamente.',
-    connect_country_config_invalid: 'Stripe Connect test no está configurado correctamente.',
+    connect_live_key_invalid: 'Stripe Connect live no está configurado correctamente (falta sk_live).',
+    connect_mode_ambiguous: 'Connect test y live no pueden estar activos a la vez. Deja solo uno.',
+    connect_state_secret_missing: 'Stripe Connect no está configurado correctamente.',
+    connect_public_origin_invalid: 'Stripe Connect no está configurado correctamente.',
+    connect_country_config_invalid: 'Stripe Connect no está configurado correctamente.',
     connect_session_invalid: 'La sesión no es válida o ha caducado.',
     connect_principal_required: 'No tienes permiso para operar con la cuenta Connect de la empresa.',
     connect_company_invalid: 'No se pudo resolver la empresa de la cuenta Connect.',
@@ -2276,10 +2290,7 @@ const createStripeMoneyRefund = async (document, requestedCents, historyLength) 
   if (!validStripePaymentIntentId(document.stripePaymentIntentId)) {
     return { stripeRefundId: null, stripeRefundStatus: null };
   }
-  const connectClient = process.env.STRIPE_CONNECT_TEST_ENABLED === 'true'
-    && /^sk_test_[A-Za-z0-9]+$/.test(process.env.STRIPE_CONNECT_TEST_SECRET_KEY || '')
-    ? require('stripe')(process.env.STRIPE_CONNECT_TEST_SECRET_KEY)
-    : null;
+  const connectClient = createConnectStripeClient(process.env);
   const direct = document.chargeMode === 'direct' && validStripeAccountId(document.stripeAccountId);
   const destination = document.chargeMode === 'destination' && validStripeAccountId(document.stripeAccountId);
   let stripeClient;

@@ -364,34 +364,41 @@ El archivo `render.yaml` de la raíz configura este backend como un Web Service 
 
 No subas el archivo `server/.env` ni copies sus secretos al repositorio.
 
-### Pasar a producción (Stripe en modo real)
+### Pasar a producción (Stripe en modo real, por fases)
 
-Los ingresos de las suscripciones se cobran con Stripe Checkout y se liquidan en la cuenta Stripe que
-corresponde a la clave secreta configurada en el backend. Para cobrar de verdad:
+**Fase 1 — solo suscripciones live (recomendado primero).** Connect/TPV del comercio puede
+seguir en test (`STRIPE_CONNECT_TEST_ENABLED=true` + `sk_test`). No actives test y live Connect a la vez.
 
-1. Activa la cuenta de Stripe (modo real) completando la verificación del negocio (datos fiscales, CIF/NIF,
-   titular y cuenta bancaria/IBAN para las transferencias). Sin esto Stripe no puede liquidar el dinero.
-2. En el Dashboard de Stripe, **desactiva el modo de prueba** (interruptor "Test mode") y crea allí los productos:
-   - Cuenta principal: 9,00 € + 21% IVA = **10,89 € / mes** (IVA incluido).
-   - Usuario adicional: 2,50 € + 21% IVA = **3,03 € / mes** (IVA incluido).
-   Copia los `price_...` generados en **modo real**.
-3. Copia la clave secreta real (`sk_live_...`) de *Developers → API keys*.
-4. En Stripe, *Developers → Webhooks → Add endpoint*, URL `https://TU-SERVICIO.onrender.com/api/stripe/webhook`,
-   eventos `checkout.session.completed` y `checkout.session.async_payment_succeeded`, y copia el
-   `whsec_...` del endpoint (modo real).
-5. En Render, actualiza las variables (o añádelas si no existen) en *Environment*:
-   `STRIPE_SECRET_KEY=sk_live_...`, `STRIPE_WEBHOOK_SECRET=whsec_...`,
-   `STRIPE_MAIN_SUBSCRIPTION_PRICE_ID=price_...` (real) y, si aplica,
-   `STRIPE_ADDITIONAL_USER_PRICE_ID=price_...` (real).
-6. Guarda los cambios y deja que Render redespliegue. Comprueba `GET /health` y que
-   `POST /api/billing/checkout` devuelve una `checkoutUrl` de Stripe.
-7. Si usas Stripe Terminal (Tap to Pay / lectores), crea también una **ubicación en modo real** y
-   actualiza `EXPO_PUBLIC_STRIPE_TERMINAL_LOCATION_ID` en `.env.local` y `eas.json`, y regenera el build.
-8. Haz una suscripción real de prueba con una tarjeta propia y verifica en el Dashboard
-   (*Payments* y *Billing → Subscriptions*) que el cobro entra en la cuenta real.
+1. Activa la cuenta de Stripe (modo real): datos fiscales, CIF/NIF, IBAN. Sin esto no hay liquidación.
+2. Dashboard → **Live** (Test OFF). Clave `sk_live_...` en *Developers → API keys*.
+3. Crea precios live (10,89 € y 3,03 €/mes IVA incl.) a mano, o con:
+   `STRIPE_SECRET_KEY=sk_live_... node scripts/provision-stripe-billing-prices.js`
+4. Webhook **live** → `https://TU-SERVICIO.onrender.com/api/stripe/webhook`
+   (p. ej. `checkout.session.completed`, `checkout.session.async_payment_succeeded`) → `whsec_...` live.
+5. En Render (*Environment*), actualiza **solo billing**:
+   - `STRIPE_SECRET_KEY=sk_live_...`
+   - `STRIPE_WEBHOOK_SECRET=whsec_...` (live)
+   - `STRIPE_MAIN_SUBSCRIPTION_PRICE_ID` / `STRIPE_ADDITIONAL_USER_PRICE_ID` (prices live)
+   - Deja Connect en test: `STRIPE_CONNECT_TEST_ENABLED=true`, `STRIPE_CONNECT_TEST_SECRET_KEY=sk_test_...`,
+     `STRIPE_CONNECT_TEST_COUNTRIES=ES` (nombre exacto), `STRIPE_CONNECT_STATE_SECRET=...`
+   - No pongas `sk_live` en `STRIPE_CONNECT_TEST_SECRET_KEY`.
+6. Redeploy. `GET /health` debe mostrar `"stripeModes":{"billing":"live","connect":"test"}`.
+7. Valida env (sin secretos): `node scripts/check-stripe-go-live.js --phase1-env`
+8. Suscripción real de prueba + cambio de plazas → deben verse en Dashboard **Live**.
 
-Los importes que muestra la app son solo informativos: lo que se cobra es el importe del `price_...`
-creado en Stripe, así que los precios reales deben coincidir con 10,89 € y 3,03 € (IVA incluido).
+**Fase 2 — Connect / TPV live (después).** Requiere código ya preparado (`STRIPE_CONNECT_LIVE_*`).
+Apaga test Connect y activa live:
+
+- `STRIPE_CONNECT_TEST_ENABLED=false` (o elimínalo)
+- `STRIPE_CONNECT_LIVE_ENABLED=true`
+- `STRIPE_CONNECT_LIVE_SECRET_KEY=sk_live_...` (misma plataforma)
+- `STRIPE_CONNECT_LIVE_COUNTRIES=ES`
+- Location Terminal live + PMC Bizum en live; rebuild APK si hace falta.
+
+`GET /health` → `"connect":"live"`. No combines `LIVE_ENABLED` y `TEST_ENABLED` a true
+(`connect_mode_ambiguous`).
+
+Los importes de la UI son informativos: cobra el `price_...` de Stripe (10,89 € / 3,03 €).
 
 ### Plazas de empleado (usuarios adicionales)
 

@@ -1,5 +1,6 @@
 const crypto = require('node:crypto');
 const { Buffer } = require('node:buffer');
+const { resolveConnectMode } = require('./stripe-connect-env');
 
 const ACCOUNT_ID = /^acct_[A-Za-z0-9]+$/;
 const INCLUDE = ['configuration.merchant', 'configuration.customer', 'configuration.recipient',
@@ -21,15 +22,22 @@ const principal = (user) => Boolean(user?.id &&
 module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, updateUserAppMetadata, withAccountLock,
   stripeFactory = (key) => require('stripe')(key), now = Date.now }) {
   let client;
-  const enabled = () => env.STRIPE_CONNECT_TEST_ENABLED === 'true';
+  let clientKey;
+  const connectMode = () => resolveConnectMode(env);
+  const enabled = () => connectMode().enabled === true;
+  const expectLivemode = () => Boolean(connectMode().livemode);
   const config = () => {
-    if (!enabled()) throw fail(503, 'connect_test_disabled');
-    const approved = (env.STRIPE_CONNECT_TEST_COUNTRIES ?? 'ES').split(',').map((country) => country.trim());
-    if (!approved.length || approved.some((country) => !EU_COUNTRIES.has(country))) {
-      throw fail(503, 'connect_country_config_invalid');
+    const mode = connectMode();
+    if (!mode.enabled) {
+      if (mode.code === 'connect_mode_ambiguous') throw fail(503, 'connect_mode_ambiguous');
+      if (mode.code === 'connect_live_key_invalid') throw fail(503, 'connect_live_key_invalid');
+      if (mode.code === 'connect_test_key_invalid') throw fail(503, 'connect_test_key_invalid');
+      throw fail(503, 'connect_test_disabled');
     }
-    if (!/^sk_test_[A-Za-z0-9]+$/.test(env.STRIPE_CONNECT_TEST_SECRET_KEY || '')) {
-      throw fail(503, 'connect_test_key_invalid');
+    const approved = String(mode.countries ?? 'ES').split(',').map((country) => country.trim());
+    // Entradas vacías (p. ej. "ES,") o códigos no UE → inválido.
+    if (!approved.length || approved.some((country) => !country || !EU_COUNTRIES.has(country))) {
+      throw fail(503, 'connect_country_config_invalid');
     }
     if (typeof env.STRIPE_CONNECT_STATE_SECRET !== 'string' || Buffer.byteLength(env.STRIPE_CONNECT_STATE_SECRET) < 32) {
       throw fail(503, 'connect_state_secret_missing');
@@ -46,7 +54,11 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
   };
   const stripe = () => {
     config();
-    client ||= stripeFactory(env.STRIPE_CONNECT_TEST_SECRET_KEY);
+    const mode = connectMode();
+    if (!client || clientKey !== mode.secretKey) {
+      clientKey = mode.secretKey;
+      client = stripeFactory(mode.secretKey);
+    }
     return client;
   };
   const save = async (ownerId, patch) => {
@@ -78,8 +90,9 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
     return pending?.country === undefined ? 'ES' : pending.country;
   };
   const checkAccount = (account, owner, expectedId, country = boundCountry(owner)) => {
-    if (!account || !ACCOUNT_ID.test(account.id) || (expectedId && account.id !== expectedId) || account.livemode !== false ||
-      account.metadata?.supabase_owner_id !== owner.id || account.dashboard !== 'full' ||
+    if (!account || !ACCOUNT_ID.test(account.id) || (expectedId && account.id !== expectedId)
+      || account.livemode !== expectLivemode()
+      || account.metadata?.supabase_owner_id !== owner.id || account.dashboard !== 'full' ||
       account.defaults?.responsibilities?.fees_collector !== 'stripe' ||
       account.defaults?.responsibilities?.losses_collector !== 'stripe') {
       throw fail(409, 'connect_account_binding_invalid');
@@ -93,16 +106,17 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
   };
   const summary = (isEnabled, account = null) => {
     const capabilities = account?.configuration?.merchant?.capabilities;
+    const livemode = isEnabled ? expectLivemode() : false;
     return {
-      ok: true, enabled: isEnabled, livemode: false, connected: Boolean(account), accountId: account?.id || null,
+      ok: true, enabled: isEnabled, livemode, connected: Boolean(account), accountId: account?.id || null,
       chargesEnabled: capabilities?.card_payments?.status === 'active',
       payoutsEnabled: capabilities?.stripe_balance?.payouts?.status === 'active',
       requirementsPending: Boolean(account && (!account.requirements || !Array.isArray(account.requirements.entries) ||
         account.requirements.entries.length || account.requirements.summary?.minimum_deadline?.status ||
         capabilities?.card_payments?.status !== 'active' || capabilities?.stripe_balance?.payouts?.status !== 'active')),
-      // Con Connect test activo los cobros online van a la cuenta conectada (sin fallback a plataforma).
+      // Con Connect activo los cobros online van a la cuenta conectada (sin fallback a plataforma).
       directCharges: isEnabled,
-      phase: 'onboarding_only',
+      phase: livemode ? 'connect_live' : 'onboarding_only',
     };
   };
   // Resuelve la cuenta conectada del principal para cobros/consultas.
@@ -389,7 +403,7 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
     let url;
     try { url = new URL(link?.url); } catch { throw fail(502, 'connect_link_invalid'); }
     // Stripe v2: accounts.stripe.com (+ hash). También onboarding/connect/checkout/billing.
-    if (link.livemode !== false || link.account !== accountId || url.protocol !== 'https:' || url.username || url.password ||
+    if (link.livemode !== expectLivemode() || link.account !== accountId || url.protocol !== 'https:' || url.username || url.password ||
       url.port || !/^(accounts|onboarding|connect|checkout|billing)\.stripe\.com$/i.test(url.hostname)) {
       throw fail(502, 'connect_link_invalid');
     }
@@ -433,7 +447,8 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
       throw fail(409, 'connect_country_mismatch');
     }
     if (country === 'FR') throw fail(503, 'connect_country_requires_supported_onboarding');
-    if (!(env.STRIPE_CONNECT_TEST_COUNTRIES ?? 'ES').split(',').map((value) => value.trim()).includes(country)) {
+    const approvedCountries = String(connectMode().countries || 'ES').split(',').map((value) => value.trim());
+    if (!approvedCountries.includes(country)) {
       throw fail(503, 'connect_country_not_approved');
     }
     if (metadata.stripe_connect_test_account_id) return retrieve(owner, metadata.stripe_connect_test_account_id, country);
@@ -461,7 +476,8 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
       }
       if (now() - pending.started >= RETRY_WINDOW || pending.started > now()) throw fail(409, 'connect_creation_recovery_required');
     }
-    const idempotencyKey = `connect-test-v1-${crypto.createHash('sha256').update(owner.id).digest('hex')}-${pending.token}`;
+    const keyPrefix = expectLivemode() ? 'connect-live-v1' : 'connect-test-v1';
+    const idempotencyKey = `${keyPrefix}-${crypto.createHash('sha256').update(owner.id).digest('hex')}-${pending.token}`;
     const account = checkAccount(await stripe().v2.core.accounts.create({ contact_email: pending.email, display_name: pending.name,
       identity: { country }, dashboard: 'full', defaults: { responsibilities: { fees_collector: 'stripe', losses_collector: 'stripe' } },
       configuration: MERCHANT_RECIPIENT_CONFIG,
@@ -490,7 +506,10 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
     ensurePlatformLocalPaymentMethods,
     boundCountry,
     status: handle(async (req, res) => {
-      if (!enabled()) return res.json(summary(false));
+      const mode = connectMode();
+      // Flags mal puestos (test+live, sk inválida) → 503; sin flags → enabled:false.
+      if (mode.code && mode.code !== 'connect_disabled') throw fail(503, mode.code);
+      if (!mode.enabled) return res.json(summary(false));
       config();
       const actor = await freshActor(req);
       const owner = await ownerFor(actor);
@@ -513,7 +532,13 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
         const account = await ensureAccount(fresh, country);
         const current = await ownerFor(await freshActor(req), true);
         const link = await createLink(current, account);
-        return res.json({ ok: true, livemode: false, phase: 'onboarding_only', accountId: account.id, ...link });
+        return res.json({
+          ok: true,
+          livemode: expectLivemode(),
+          phase: expectLivemode() ? 'connect_live' : 'onboarding_only',
+          accountId: account.id,
+          ...link,
+        });
       });
     }),
     return: handle(async (req, res) => {

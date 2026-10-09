@@ -99,6 +99,7 @@ const loadServer = () => {
   vm.runInNewContext(fs.readFileSync(path.join(root, 'server/src/server.js'), 'utf8'), {
     require(name) {
       if (name === './stripe-connect') return require('../server/src/stripe-connect');
+      if (name === './stripe-connect-env') return require('../server/src/stripe-connect-env');
       if (!(name in modules)) throw new Error(`Unexpected module: ${name}`);
       return modules[name];
     },
