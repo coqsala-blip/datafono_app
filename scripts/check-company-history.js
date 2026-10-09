@@ -206,7 +206,9 @@ const main = async () => {
   equal(state.queries.at(-1).limit, 1, 'Requested limit preserved');
   for (const route of ['/api/stripe/payment-intent', '/api/stripe/payment']) {
     equal((await call('POST', route, { userId: 'employee-a', body: { amount: 12, orderId: 'test-order', supabase_user_id: 'owner-b' } })).statusCode, 201, 'Payment created');
-    equal(state.stripeCalls.at(-1).metadata, { supabase_user_id: 'owner-a', operator_user_id: 'employee-a', order_id: 'test-order' }, 'Payment owned by company with separate operator');
+    equal(state.stripeCalls.at(-1).metadata, {
+      supabase_user_id: 'owner-a', operator_user_id: 'employee-a', order_id: 'test-order', charge_mode: 'platform',
+    }, 'Payment owned by company with separate operator');
     if (route === '/api/stripe/payment') equal(state.stripeCalls.at(-1).payment_intent_data.metadata, state.stripeCalls.at(-1).metadata, 'Intent inherits owner metadata');
   }
   for (const paymentOwner of ['owner-a', 'employee-a', 'owner-b', 'employee-b', undefined]) {
