@@ -295,22 +295,42 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
         await stripe().terminal.locations.retrieve(existing);
         return existing;
       } catch {
-        // recrear
+        // tml_ obsoleto (p. ej. tras cambiar de cuenta plataforma): se limpia y recrea.
+        try {
+          await save(owner.id, { stripe_connect_test_platform_terminal_location_id: null });
+        } catch {
+          // no bloquea
+        }
       }
     }
+    // Reutilizar una Location ya existente en la plataforma (evita fallos al recrear).
+    try {
+      const listed = await stripe().terminal.locations.list({ limit: 10 });
+      const found = Array.isArray(listed?.data)
+        ? listed.data.find((item) => /^tml_[A-Za-z0-9]+$/.test(item?.id || ''))
+        : null;
+      if (found) {
+        await save(owner.id, { stripe_connect_test_platform_terminal_location_id: found.id });
+        return found.id;
+      }
+    } catch (error) {
+      console.warn('Stripe Terminal locations.list (platform) failed:', error?.code || '', error?.message || error);
+    }
     const country = boundCountry(owner);
-    const displayName = typeof owner.user_metadata?.full_name === 'string' && owner.user_metadata.full_name.trim()
-      ? owner.user_metadata.full_name.trim().slice(0, 100)
+    const rawName = typeof owner.user_metadata?.full_name === 'string' && owner.user_metadata.full_name.trim()
+      ? owner.user_metadata.full_name.trim()
       : 'TPV Connect';
+    const displayName = rawName.replace(/[^\p{L}\p{N} ._-]/gu, '').slice(0, 100) || 'TPV Connect';
     let location;
     try {
       location = await stripe().terminal.locations.create({
-        display_name: displayName.slice(0, 100),
+        display_name: displayName,
         address: terminalAddressFor(country),
       });
     } catch (error) {
       console.error('Stripe Terminal platform location create failed:', error?.code || '', error?.message || error);
-      throw fail(502, 'connect_terminal_location_invalid');
+      const detail = typeof error?.message === 'string' ? error.message.slice(0, 220) : '';
+      throw Object.assign(fail(502, 'connect_terminal_location_invalid'), { detail });
     }
     if (typeof location?.id !== 'string' || !/^tml_[A-Za-z0-9]+$/.test(location.id)) {
       throw fail(502, 'connect_terminal_location_invalid');

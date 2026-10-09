@@ -26,6 +26,7 @@ export const connectErrorKey = (value: unknown): string => {
     case 'connect_country_mismatch': return 'connect.countryMismatch';
     case 'connect_not_connected': return 'connect.notConnected';
     case 'connect_charges_not_enabled': return 'connect.chargesNotEnabled';
+    case 'connect_terminal_location_invalid': return 'connect.terminalLocationInvalid';
     case 'connect_link_invalid': return 'connect.linkInvalid';
     case 'connect_session_unbound': return 'connect.sessionRequired';
     case 'connect_upstream_unavailable': return 'connect.upstream';
