@@ -5,7 +5,13 @@ const QRCode = require('qrcode');
 const Stripe = require('stripe');
 const { createClient } = require('@supabase/supabase-js');
 const createStripeConnect = require('./stripe-connect');
-const { resolveConnectMode, createConnectStripeClient } = require('./stripe-connect-env');
+const {
+  resolveConnectMode,
+  createConnectStripeClient,
+  normalizeSecretKey,
+  flagEnabled,
+  buildStripeDiagnostics,
+} = require('./stripe-connect-env');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -18,13 +24,12 @@ const STRIPE_ADDITIONAL_USER_PRICE_ID = process.env.STRIPE_ADDITIONAL_USER_PRICE
 // Suscripciones / billing usan STRIPE_SECRET_KEY. Si falta en test pero hay clave Connect de
 // plataforma, se reutiliza (misma cuenta sk_test) para no bloquear plazas de empleado.
 const resolvePlatformStripeSecretKey = () => {
-  if (typeof STRIPE_SECRET_KEY === 'string' && /^sk_(test|live)_[A-Za-z0-9]+$/.test(STRIPE_SECRET_KEY)) {
-    return STRIPE_SECRET_KEY;
+  const billingKey = normalizeSecretKey(STRIPE_SECRET_KEY);
+  if (/^sk_(test|live)_[A-Za-z0-9]+$/.test(billingKey)) {
+    return billingKey;
   }
-  const connectKey = process.env.STRIPE_CONNECT_TEST_SECRET_KEY;
-  if (process.env.STRIPE_CONNECT_TEST_ENABLED === 'true'
-    && typeof connectKey === 'string'
-    && /^sk_test_[A-Za-z0-9]+$/.test(connectKey)) {
+  const connectKey = normalizeSecretKey(process.env.STRIPE_CONNECT_TEST_SECRET_KEY);
+  if (flagEnabled(process.env.STRIPE_CONNECT_TEST_ENABLED) && /^sk_test_[A-Za-z0-9]+$/.test(connectKey)) {
     console.warn('STRIPE_SECRET_KEY ausente: billing usa STRIPE_CONNECT_TEST_SECRET_KEY (solo test).');
     return connectKey;
   }
@@ -509,9 +514,30 @@ if (NODE_ENV === 'production') {
 app.get('/health', (req, res) => {
   // RENDER_GIT_COMMIT lo inyecta Render automaticamente en cada despliegue: permite verificar
   // desde fuera que el backend servido corresponde exactamente al commit desplegado.
-  // stripeModes: Fase 1 = billing live + connect test; no expone secretos.
+  // stripeModes / stripeDiagnostics: Fase 1 = billing live + connect test; no expone secretos.
   const billingKey = platformStripeSecretKey || '';
   const connect = resolveConnectMode(process.env);
+  const problems = [];
+  const diagnostics = buildStripeDiagnostics(process.env);
+  if (diagnostics.billingKey.issue) {
+    problems.push(`STRIPE_SECRET_KEY: ${diagnostics.billingKey.issue}`);
+  }
+  if (!diagnostics.webhookSecret.accepted) {
+    problems.push(`STRIPE_WEBHOOK_SECRET: ${diagnostics.webhookSecret.issue}`);
+  }
+  if (!diagnostics.mainPriceId.accepted) problems.push('STRIPE_MAIN_SUBSCRIPTION_PRICE_ID: invalid_or_unset');
+  if (!diagnostics.additionalPriceId.accepted) problems.push('STRIPE_ADDITIONAL_USER_PRICE_ID: invalid_or_unset');
+  if (!diagnostics.connectTestEnabled.isTrue) {
+    problems.push('STRIPE_CONNECT_TEST_ENABLED: not_true (Fase 1 necesita true)');
+  } else if (diagnostics.connectTestKey.issue) {
+    problems.push(`STRIPE_CONNECT_TEST_SECRET_KEY: ${diagnostics.connectTestKey.issue}`);
+  }
+  if (diagnostics.connectCode === 'connect_mode_ambiguous') {
+    problems.push('Connect test y live activos a la vez (connect_mode_ambiguous)');
+  }
+  if (diagnostics.connectCode && !diagnostics.connectEnabled) {
+    problems.push(`connect: ${diagnostics.connectCode}`);
+  }
   res.json({
     ok: true,
     service: 'TPV & GESTOR backend',
@@ -520,6 +546,8 @@ app.get('/health', (req, res) => {
       billing: billingKey.startsWith('sk_live_') ? 'live' : (billingKey.startsWith('sk_test_') ? 'test' : 'missing'),
       connect: connect.enabled ? (connect.livemode ? 'live' : 'test') : 'off',
     },
+    stripeProblems: problems,
+    stripeDiagnostics: diagnostics,
   });
 });
 
