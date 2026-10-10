@@ -519,6 +519,15 @@ app.get('/health', (req, res) => {
   const connect = resolveConnectMode(process.env);
   const problems = [];
   const diagnostics = buildStripeDiagnostics(process.env);
+  const billingMode = billingKey.startsWith('sk_live_') ? 'live' : (billingKey.startsWith('sk_test_') ? 'test' : 'missing');
+  const connectModeLabel = connect.enabled ? (connect.livemode ? 'live' : 'test') : 'off';
+  // Fase billing: suscripciones live + Connect off a propósito. Fase TPV: Connect test|live.
+  const billingOnlyOk = billingMode === 'live'
+    && diagnostics.webhookSecret.accepted
+    && diagnostics.mainPriceId.accepted
+    && diagnostics.additionalPriceId.accepted
+    && !diagnostics.connectEnabled
+    && diagnostics.connectCode === 'connect_disabled';
   if (diagnostics.billingKey.issue) {
     problems.push(`STRIPE_SECRET_KEY: ${diagnostics.billingKey.issue}`);
   }
@@ -527,15 +536,13 @@ app.get('/health', (req, res) => {
   }
   if (!diagnostics.mainPriceId.accepted) problems.push('STRIPE_MAIN_SUBSCRIPTION_PRICE_ID: invalid_or_unset');
   if (!diagnostics.additionalPriceId.accepted) problems.push('STRIPE_ADDITIONAL_USER_PRICE_ID: invalid_or_unset');
-  if (!diagnostics.connectTestEnabled.isTrue) {
-    problems.push('STRIPE_CONNECT_TEST_ENABLED: not_true (Fase 1 necesita true)');
-  } else if (diagnostics.connectTestKey.issue) {
-    problems.push(`STRIPE_CONNECT_TEST_SECRET_KEY: ${diagnostics.connectTestKey.issue}`);
-  }
   if (diagnostics.connectCode === 'connect_mode_ambiguous') {
     problems.push('Connect test y live activos a la vez (connect_mode_ambiguous)');
-  }
-  if (diagnostics.connectCode && !diagnostics.connectEnabled) {
+  } else if (diagnostics.connectTestEnabled.isTrue && diagnostics.connectTestKey.issue) {
+    problems.push(`STRIPE_CONNECT_TEST_SECRET_KEY: ${diagnostics.connectTestKey.issue}`);
+  } else if (diagnostics.connectLiveEnabled.isTrue && diagnostics.connectLiveKey.issue) {
+    problems.push(`STRIPE_CONNECT_LIVE_SECRET_KEY: ${diagnostics.connectLiveKey.issue}`);
+  } else if (diagnostics.connectCode && !diagnostics.connectEnabled && diagnostics.connectCode !== 'connect_disabled') {
     problems.push(`connect: ${diagnostics.connectCode}`);
   }
   res.json({
@@ -543,11 +550,21 @@ app.get('/health', (req, res) => {
     service: 'TPV & GESTOR backend',
     commit: process.env.RENDER_GIT_COMMIT || null,
     stripeModes: {
-      billing: billingKey.startsWith('sk_live_') ? 'live' : (billingKey.startsWith('sk_test_') ? 'test' : 'missing'),
-      connect: connect.enabled ? (connect.livemode ? 'live' : 'test') : 'off',
+      billing: billingMode,
+      connect: connectModeLabel,
     },
+    stripePhase: billingOnlyOk
+      ? 'billing_live_connect_off'
+      : (billingMode === 'live' && connectModeLabel === 'test'
+        ? 'billing_live_connect_test'
+        : (billingMode === 'live' && connectModeLabel === 'live' ? 'billing_live_connect_live' : 'other')),
     stripeProblems: problems,
-    stripeDiagnostics: diagnostics,
+    stripeDiagnostics: {
+      ...diagnostics,
+      note: billingOnlyOk
+        ? 'Fase suscripciones OK (billing live, Connect off). Para Bizum/Terminal/QR: activa Connect TEST en Render.'
+        : diagnostics.note,
+    },
   });
 });
 
@@ -808,6 +825,7 @@ const connectChargeError = (error) => {
   const messages = {
     connect_not_connected: 'Completa el alta de Stripe Connect antes de cobrar.',
     connect_charges_not_enabled: 'Tu cuenta Connect aún no puede cobrar. Completa la verificación en Stripe.',
+    connect_disabled: 'Los cobros del TPV (Bizum, QR, Terminal) requieren Stripe Connect. Actívalo en test en el servidor; las suscripciones live no usan Connect.',
     connect_test_disabled: 'Stripe Connect no está habilitado.',
     connect_test_key_invalid: 'Stripe Connect test no está configurado correctamente.',
     connect_live_key_invalid: 'Stripe Connect live no está configurado correctamente (falta sk_live).',
@@ -1385,6 +1403,7 @@ app.post('/api/auth/logout', requireVerifiedToken, async (req, res) => {
 app.post('/api/stripe/terminal/connection-token', requireAuth, async (req, res) => {
   // TokenProvider corre al arrancar: no exigir chargesEnabled.
   // Con Connect, el token es de la plataforma Connect (destino/on_behalf_of), no Stripe-Account.
+  // Sin Connect no se usa la clave de billing live: evitamos Tap to Pay "production" por accidente.
   let connected = null;
   try {
     connected = await stripeConnect.resolveConnectedAccount(req, { requireCharges: false });
@@ -1399,14 +1418,25 @@ app.post('/api/stripe/terminal/connection-token', requireAuth, async (req, res) 
     }
   }
 
+  const connect = resolveConnectMode(process.env);
+  if (!connected && !connect.enabled) {
+    return res.status(503).json({
+      ok: false,
+      code: 'connect_disabled',
+      error: 'Stripe Terminal requiere Connect. Activa STRIPE_CONNECT_TEST_ENABLED=true y STRIPE_CONNECT_TEST_SECRET_KEY (sk_test) en Render para cobrar en prueba.',
+    });
+  }
+
   try {
     const stripeClient = connected?.stripe || requireStripe();
     const token = await stripeClient.terminal.connectionTokens.create({});
+    const livemode = connect.enabled ? connect.livemode === true : String(platformStripeSecretKey || '').startsWith('sk_live_');
     return res.status(201).json({
       ok: true,
       secret: token.secret,
       accountId: connected?.accountId || null,
       chargeMode: connected ? 'destination' : 'platform',
+      livemode,
     });
   } catch (error) {
     console.error('Error creando token Stripe Terminal:', error.message);
@@ -1435,36 +1465,41 @@ app.post('/api/stripe/payment-intent', requireAuth, async (req, res) => {
     return res.status(502).json({ ok: false, code: 'connect_upstream_unavailable', error: 'No se pudo preparar el cobro Terminal Connect.' });
   }
 
+  if (!connected) {
+    return res.status(503).json({
+      ok: false,
+      code: 'connect_disabled',
+      error: 'El cobro presencial requiere Stripe Connect (test). Actívalo en Render; no uses la clave de suscripciones live para Terminal.',
+    });
+  }
+
   try {
-    const ownerId = connected?.ownerId || req.user.app_metadata?.company_owner_id || req.user.id;
-    const stripeClient = connected?.stripe || requireStripe();
-    const terminalMode = connected?.terminalMode || (connected ? 'destination' : 'platform');
+    const ownerId = connected.ownerId || req.user.app_metadata?.company_owner_id || req.user.id;
+    const stripeClient = connected.stripe;
+    const terminalMode = connected.terminalMode || 'destination';
     const paymentIntent = await stripeClient.paymentIntents.create({
       amount,
       currency: stripeCurrency,
       payment_method_types: ['card_present'],
       capture_method: 'automatic',
-      ...(connected ? {
-        on_behalf_of: connected.accountId,
-        transfer_data: { destination: connected.accountId },
-      } : {}),
+      on_behalf_of: connected.accountId,
+      transfer_data: { destination: connected.accountId },
       metadata: {
         supabase_user_id: ownerId,
         operator_user_id: req.user.id,
         order_id: orderId,
-        ...(connected ? {
-          stripe_connect_account_id: connected.accountId,
-          charge_mode: terminalMode,
-        } : { charge_mode: 'platform' }),
+        stripe_connect_account_id: connected.accountId,
+        charge_mode: terminalMode,
       },
     });
     return res.status(201).json({
       ok: true,
       paymentIntentId: paymentIntent.id,
       clientSecret: paymentIntent.client_secret,
-      accountId: connected?.accountId || null,
-      locationId: connected?.locationId || null,
-      chargeMode: connected ? terminalMode : 'platform',
+      accountId: connected.accountId,
+      locationId: connected.locationId || null,
+      chargeMode: terminalMode,
+      livemode: paymentIntent.livemode === true,
     });
   } catch (error) {
     console.error('Error creando PaymentIntent Stripe Terminal:', error.message);
@@ -1488,7 +1523,7 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
 
   let connected = null;
   try {
-    // Connect activo: cobro directo en la cuenta del comercio. Sin fallback a la plataforma.
+    // Connect activo: cobro destination/directo. Sin Connect no se cobra en la plataforma de billing live.
     connected = await stripeConnect.resolveConnectedAccount(req, { requireCharges: true });
   } catch (error) {
     const mapped = connectChargeError(error);
@@ -1497,22 +1532,27 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
     return res.status(502).json({ ok: false, code: 'connect_upstream_unavailable', error: 'No se pudo preparar el cobro Connect.' });
   }
 
+  if (!connected) {
+    return res.status(503).json({
+      ok: false,
+      code: 'connect_disabled',
+      error: 'Bizum / enlace / QR del TPV requieren Stripe Connect en test. Activa Connect TEST en Render (las suscripciones live siguen aparte).',
+    });
+  }
+
   try {
     // Connect online: destination SIN on_behalf_of → la PMC es la de la plataforma (Bizum).
     // Con on_behalf_of Stripe usaría la PMC de la cuenta conectada, donde Bizum suele no estar.
     // Si Stripe rechaza destination (falta transfers), fallback a cobro directo.
-    const ownerId = connected?.ownerId || req.user.app_metadata?.company_owner_id || req.user.id;
-    let connectCountry = null;
-    if (connected) {
-      connectCountry = typeof stripeConnect.boundCountry === 'function'
-        ? stripeConnect.boundCountry(connected.owner)
-        : (connected.owner?.app_metadata?.stripe_connect_test_country || 'ES');
-      await stripeConnect.ensureConnectedLocalPaymentMethods(connected.accountId, connectCountry);
-      await stripeConnect.ensurePlatformLocalPaymentMethods(connectCountry);
-      // Tras activar Bizum en la PMC de plataforma, invalidar caché del filtro de métodos.
-      cachedPaymentMethodConfiguration = null;
-      cachedPaymentMethodConfigurationAt = 0;
-    }
+    const ownerId = connected.ownerId || req.user.app_metadata?.company_owner_id || req.user.id;
+    const connectCountry = typeof stripeConnect.boundCountry === 'function'
+      ? stripeConnect.boundCountry(connected.owner)
+      : (connected.owner?.app_metadata?.stripe_connect_test_country || 'ES');
+    await stripeConnect.ensureConnectedLocalPaymentMethods(connected.accountId, connectCountry);
+    await stripeConnect.ensurePlatformLocalPaymentMethods(connectCountry);
+    // Tras activar Bizum en la PMC de plataforma, invalidar caché del filtro de métodos.
+    cachedPaymentMethodConfiguration = null;
+    cachedPaymentMethodConfigurationAt = 0;
     const requestedPaymentMethodTypes = resolveCheckoutPaymentMethodTypes(amount);
     const baseLineItems = [
       {
@@ -1534,25 +1574,21 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
         supabase_user_id: ownerId,
         operator_user_id: req.user.id,
         order_id: orderId,
-        ...(connected ? {
-          stripe_connect_account_id: connected.accountId,
-          charge_mode: chargeMode,
-        } : { charge_mode: 'platform' }),
+        stripe_connect_account_id: connected.accountId,
+        charge_mode: chargeMode,
       },
       payment_intent_data: {
         // Solo transfer_data: el cobro vive en la plataforma Connect (su PMC, con Bizum).
         // No usar on_behalf_of aquí: cambiaría la PMC a la cuenta conectada.
-        ...(chargeMode === 'destination' && connected ? {
+        ...(chargeMode === 'destination' ? {
           transfer_data: { destination: connected.accountId },
         } : {}),
         metadata: {
           supabase_user_id: ownerId,
           operator_user_id: req.user.id,
           order_id: orderId,
-          ...(connected ? {
-            stripe_connect_account_id: connected.accountId,
-            charge_mode: chargeMode,
-          } : { charge_mode: 'platform' }),
+          stripe_connect_account_id: connected.accountId,
+          charge_mode: chargeMode,
         },
       },
       success_url: `${PUBLIC_API_URL}/stripe/complete?session_id={CHECKOUT_SESSION_ID}`,
@@ -1565,17 +1601,17 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
         || (message.includes('transfers') && message.includes('capabilities'));
     };
 
-    let chargeMode = connected ? 'destination' : 'platform';
+    let chargeMode = 'destination';
     let session;
     let paymentMethodTypes;
     try {
       ({ session, paymentMethodTypes } = await createCheckoutSessionWithLocalMethodsFallback(
         buildCheckoutParams(chargeMode),
         requestedPaymentMethodTypes,
-        connected ? { stripeClient: connected.stripe } : {},
+        { stripeClient: connected.stripe },
       ));
     } catch (destinationError) {
-      if (!connected || !isDestinationCapabilityError(destinationError)) throw destinationError;
+      if (!isDestinationCapabilityError(destinationError)) throw destinationError;
       console.warn('Checkout destination no disponible, fallback a directo:', destinationError.message);
       chargeMode = 'direct';
       ({ session, paymentMethodTypes } = await createCheckoutSessionWithLocalMethodsFallback(
@@ -1594,7 +1630,7 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
       : paymentMethodTypes;
     console.log('Checkout online creado:', {
       chargeMode,
-      accountId: connected?.accountId || null,
+      accountId: connected.accountId,
       paymentMethods: sessionMethods || 'auto',
       locale: connectCountry === 'ES' ? 'es' : null,
       amount,

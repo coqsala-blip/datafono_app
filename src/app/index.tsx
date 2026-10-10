@@ -66,6 +66,7 @@ type StripeTerminalPaymentIntentResult = {
   accountId?: string | null;
   locationId?: string | null;
   chargeMode?: 'direct' | 'destination' | 'platform';
+  livemode?: boolean;
   code?: string;
   error?: string;
 };
@@ -2268,6 +2269,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     accountId: string | null;
     locationId: string | null;
     chargeMode: 'direct' | 'destination' | 'platform';
+    livemode: boolean;
   }> => {
     if (!accessToken || !configuredDocumentApiUrl) {
       throw new Error('Inicia sesión para poder cobrar con Stripe.');
@@ -2283,7 +2285,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     }, 15000);
     const result = await response.json() as StripeTerminalPaymentIntentResult;
     if (!response.ok || !result.clientSecret || !result.paymentIntentId) {
-      if (result.code && ['connect_not_connected', 'connect_charges_not_enabled', 'connect_terminal_location_invalid'].includes(result.code)) {
+      if (result.code && ['connect_not_connected', 'connect_charges_not_enabled', 'connect_terminal_location_invalid', 'connect_disabled', 'connect_test_disabled'].includes(result.code)) {
         throw new Error(result.error || tr(connectErrorKey(result)));
       }
       throw new Error(result.error || 'Stripe no devolvió un PaymentIntent para cobro presencial.');
@@ -2299,6 +2301,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         : result.chargeMode === 'destination'
           ? 'destination'
           : 'platform',
+      livemode: result.livemode === true,
     };
   };
 
@@ -2330,7 +2333,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     createOnlinePaymentRef.current = createTransactionFromConfirmedPayment;
   });
 
-  const ensureTapToPayReader = async (locationId?: string | null) => {
+  const ensureTapToPayReader = async (locationId?: string | null, options?: { livemode?: boolean }) => {
     const resolvedLocationId = (typeof locationId === 'string' && locationId.trim()) || STRIPE_TERMINAL_LOCATION_ID;
     if (!resolvedLocationId) {
       throw new Error('Falta la ubicación de Stripe Terminal. Completa Connect o configura EXPO_PUBLIC_STRIPE_TERMINAL_LOCATION_ID.');
@@ -2344,7 +2347,10 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
 
     // Si el lector ya conectado apunta a otra Location (p. ej. tras Connect), reconectar.
     const readerLocationId = connectedReader?.locationId || connectedReader?.location?.id || null;
-    if (connectedReader && readerLocationId === resolvedLocationId) {
+    // En Connect test (o __DEV__) usamos lector simulado: Android con Opciones de desarrollador
+    // bloquea el Tap to Pay de producción.
+    const preferSimulated = __DEV__ || options?.livemode === false;
+    if (connectedReader && readerLocationId === resolvedLocationId && !preferSimulated) {
       return connectedReader;
     }
     if (connectedReader) {
@@ -2355,18 +2361,32 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       }
     }
 
-    setTerminalMessage('tpv.preparing');
-    const connectionResult = await easyConnect({
+    const connectTapToPay = async (simulated: boolean) => easyConnect({
       discoveryMethod: 'tapToPay',
-      // Stripe no permite el lector Tap to Pay real en una app depurable.
-      // El lector simulado solo se activa durante el desarrollo local.
-      simulated: __DEV__,
+      simulated,
       locationId: resolvedLocationId,
       merchantDisplayName: issuer.name,
       autoReconnectOnUnexpectedDisconnect: true,
     });
+
+    setTerminalMessage('tpv.preparing');
+    let connectionResult = await connectTapToPay(preferSimulated);
+    const developerOptionsBlocked = /Developer Options must not be enabled/i.test(
+      connectionResult.error?.message || '',
+    );
+    if (connectionResult.error && !preferSimulated && developerOptionsBlocked) {
+      // APK release + Opciones de desarrollador: reintentar con lector simulado.
+      connectionResult = await connectTapToPay(true);
+    }
     if (connectionResult.error) {
-      throw new Error(connectionResult.error.message || 'No se pudo conectar Tap to Pay.');
+      const message = connectionResult.error.message || 'No se pudo conectar Tap to Pay.';
+      if (/Developer Options must not be enabled/i.test(message)) {
+        throw new Error(
+          'Tap to Pay real no funciona con «Opciones de desarrollador» activadas. '
+          + 'Desactívalas en Ajustes del móvil, o usa Connect en test (lector simulado).',
+        );
+      }
+      throw new Error(message);
     }
 
     return connectionResult.reader;
@@ -2387,7 +2407,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     try {
       // Primero el PaymentIntent (y location Connect); después el lector Tap to Pay.
       const intent = await createStripeTerminalPaymentIntent(paymentAmount, orderId);
-      await ensureTapToPayReader(intent.locationId);
+      await ensureTapToPayReader(intent.locationId, { livemode: intent.livemode });
       const retrievedResult = await retrievePaymentIntent(intent.clientSecret);
       if (retrievedResult.error || !retrievedResult.paymentIntent) {
         throw new Error(retrievedResult.error?.message || 'No se pudo preparar el cobro presencial.');
@@ -2503,8 +2523,8 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       if (cacheGenerationRef.current !== generation) return;
       const checkoutUrl = result.checkoutUrl || result.redirectUrl;
       if (!response.ok || !checkoutUrl || !result.paymentId) {
-        if (result.code && ['connect_not_connected', 'connect_charges_not_enabled'].includes(result.code)) {
-          throw new Error(tr(connectErrorKey(result)));
+        if (result.code && ['connect_not_connected', 'connect_charges_not_enabled', 'connect_disabled', 'connect_test_disabled'].includes(result.code)) {
+          throw new Error(result.error || tr(connectErrorKey(result)));
         }
         throw new Error(result.error || `Stripe no devolvió un enlace de pago (HTTP ${response.status}).`);
       }
