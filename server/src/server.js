@@ -498,7 +498,7 @@ app.use(express.urlencoded({ extended: true }));
 
 if (NODE_ENV === 'production') {
   app.use((req, res, next) => {
-    if (req.path === '/health' || req.secure) {
+    if (req.path === '/health' || req.path === '/privacy' || req.path === '/terms' || req.secure) {
       return next();
     }
 
@@ -521,6 +521,123 @@ app.get('/health', (req, res) => {
       connect: connect.enabled ? (connect.livemode ? 'live' : 'test') : 'off',
     },
   });
+});
+
+// Páginas legales públicas para Stripe Live (Settings → Public details / branding).
+const legalContactEmail = typeof process.env.LEGAL_CONTACT_EMAIL === 'string' && process.env.LEGAL_CONTACT_EMAIL.includes('@')
+  ? process.env.LEGAL_CONTACT_EMAIL.trim()
+  : null;
+const legalPage = (title, sections) => `<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${title} — TPV &amp; GESTIÓN</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;line-height:1.55;color:#0f172a;background:#f8fafc;margin:0;padding:24px}
+    main{max-width:720px;margin:0 auto;background:#fff;padding:28px 24px;border-radius:12px;box-shadow:0 1px 3px rgba(15,23,42,.08)}
+    h1{font-size:1.5rem;margin:0 0 8px}
+    h2{font-size:1.05rem;margin:1.4em 0 .5em}
+    p,li{color:#334155;font-size:.95rem}
+    .meta{color:#64748b;font-size:.85rem;margin-bottom:1.5rem}
+    a{color:#0f766e}
+    ul{padding-left:1.2rem}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>${title}</h1>
+    <p class="meta">Aplicación <strong>TPV &amp; GESTIÓN</strong>. Última actualización: 10 de octubre de 2026.</p>
+    ${sections}
+    <p class="meta">Contacto:
+      ${legalContactEmail
+    ? `<a href="mailto:${legalContactEmail}">${legalContactEmail}</a>`
+    : 'a través del soporte de la aplicación TPV &amp; GESTIÓN.'}
+    </p>
+  </main>
+</body>
+</html>`;
+
+app.get('/privacy', (_req, res) => {
+  res.type('html').send(legalPage('Política de Privacidad', `
+    <p>Esta Política describe cómo la aplicación <strong>TPV &amp; GESTIÓN</strong> trata los datos personales
+    cuando usas el servicio de punto de venta, facturación y suscripciones.</p>
+    <h2>1. Responsable</h2>
+    <p>El responsable del tratamiento es el operador de la plataforma TPV &amp; GESTIÓN
+    (el titular de la cuenta Stripe de la plataforma y del backend del servicio).</p>
+    <h2>2. Datos que tratamos</h2>
+    <ul>
+      <li>Datos de cuenta: correo, nombre, empresa y rol (principal o empleado).</li>
+      <li>Datos de uso de la app: tickets, facturas, gastos e historial asociados a tu empresa.</li>
+      <li>Datos de pago y facturación: gestionados por <strong>Stripe</strong> (suscripciones del plan,
+      métodos de pago guardados y, si aplica, cobros Connect del comercio).</li>
+      <li>Datos técnicos necesarios para la seguridad de la sesión (dispositivo y sesión activa).</li>
+    </ul>
+    <h2>3. Finalidad</h2>
+    <p>Prestar el servicio de TPV y gestión, cobrar la suscripción del software, permitir cobros a
+    clientes del comercio, emitir documentos y cumplir obligaciones legales y de seguridad.</p>
+    <h2>4. Encargados y terceros</h2>
+    <p>Utilizamos proveedores que tratan datos en nuestro nombre, en particular:</p>
+    <ul>
+      <li><strong>Stripe</strong> — pagos, suscripciones y, en su caso, Stripe Connect / Terminal.</li>
+      <li><strong>Supabase</strong> — autenticación y almacenamiento de datos de la aplicación.</li>
+      <li>El hosting del backend (p. ej. Render) para operar la API.</li>
+    </ul>
+    <p>Stripe trata datos de pago conforme a su propia política:
+    <a href="https://stripe.com/privacy" rel="noopener noreferrer">stripe.com/privacy</a>.</p>
+    <h2>5. Base legal y conservación</h2>
+    <p>Tratamos los datos para ejecutar el contrato del servicio, cumplir obligaciones legales
+    (p. ej. facturación) y, cuando proceda, por interés legítimo de seguridad. Conservamos los datos
+    mientras la cuenta esté activa y el tiempo exigido por la normativa aplicable.</p>
+    <h2>6. Tus derechos</h2>
+    <p>Puedes solicitar acceso, rectificación, supresión, limitación u oposición, y la portabilidad
+    de tus datos, contactando con nosotros. También puedes reclamar ante la autoridad de protección
+    de datos competente (en España, la AEPD).</p>
+    <h2>7. Seguridad</h2>
+    <p>Aplicamos medidas técnicas y organizativas razonables (HTTPS, control de sesión, claves en
+    el servidor). Ningún sistema es 100&nbsp;% seguro; te pedimos proteger tus credenciales.</p>
+  `));
+});
+
+app.get('/terms', (_req, res) => {
+  res.type('html').send(legalPage('Condiciones de Servicio', `
+    <p>Estas Condiciones regulan el uso de la aplicación <strong>TPV &amp; GESTIÓN</strong>
+    (software de punto de venta, documentos y suscripción).</p>
+    <h2>1. El servicio</h2>
+    <p>TPV &amp; GESTIÓN permite gestionar cobros, tickets/facturas, gastos, empleados adicionales
+    y la suscripción al software. Algunas funciones de cobro usan <strong>Stripe</strong>
+    (Checkout, suscripciones, Connect y/o Terminal según configuración).</p>
+    <h2>2. Cuenta y uso</h2>
+    <ul>
+      <li>Debes facilitar datos veraces y mantener la confidencialidad de tu acceso.</li>
+      <li>El usuario principal es responsable de los empleados vinculados a su empresa.</li>
+      <li>Queda prohibido un uso ilícito, fraudulento o que vulnere derechos de terceros.</li>
+    </ul>
+    <h2>3. Suscripción y pagos</h2>
+    <p>El acceso al plan de software puede requerir una suscripción de pago. Los importes, renovaciones
+    y plazas de empleado se cobran a través de Stripe según los precios configurados en la plataforma.
+    Los cobros a clientes finales del comercio (TPV) se procesan según la cuenta Stripe Connect
+    o de plataforma habilitada; el comercio es responsable de sus obligaciones fiscales frente a sus clientes.</p>
+    <h2>4. Disponibilidad</h2>
+    <p>Nos esforzamos por mantener el servicio operativo, pero no garantizamos disponibilidad
+    ininterrumpida (mantenimientos, fallos de red o de terceros como Stripe o el hosting).</p>
+    <h2>5. Propiedad intelectual</h2>
+    <p>La aplicación, marcas y contenidos del software pertenecen a sus titulares. Se te concede
+    una licencia de uso limitada, no exclusiva y revocable mientras cumplas estas condiciones
+    y mantengas la suscripción cuando sea exigible.</p>
+    <h2>6. Limitación de responsabilidad</h2>
+    <p>En la medida permitida por la ley, no seremos responsables de daños indirectos, pérdida de
+    beneficios o datos derivados del uso del servicio o de interrupciones de terceros de pago.
+    Tu responsabilidad incluye la correcta emisión de facturas y el cumplimiento fiscal de tu negocio.</p>
+    <h2>7. Suspensión y resolución</h2>
+    <p>Podemos suspender o terminar el acceso ante impago, uso abusivo o incumplimiento grave.
+    Puedes dejar de usar el servicio; la cancelación de la suscripción se gestiona según las
+    reglas de Stripe y la configuración de tu plan.</p>
+    <h2>8. Ley aplicable</h2>
+    <p>Salvo norma imperativa en contrario, estas condiciones se interpretan conforme a la
+    legislación española. Los tribunales del domicilio del responsable serán competentes,
+    sin perjuicio de los derechos de consumidores que correspondan.</p>
+  `));
 });
 
 // Diagnóstico de la conexión con Supabase. NUNCA devuelve la clave: solo su tipo (prefijo) y si

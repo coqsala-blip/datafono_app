@@ -357,6 +357,9 @@ El archivo `render.yaml` de la raíz configura este backend como un Web Service 
 2. Introduce en el panel las variables marcadas como secretas en `render.yaml`.
 3. Cuando Render asigne la URL del servicio, configura `PUBLIC_API_URL` con esa URL completa usando `https://`.
 4. Comprueba que `https://TU-SERVICIO.onrender.com/health` responde con `ok: true`.
+   Para Stripe Live también necesitas páginas públicas:
+   `https://TU-SERVICIO.onrender.com/privacy` y `https://TU-SERVICIO.onrender.com/terms`
+   (opc. `LEGAL_CONTACT_EMAIL` en Environment).
 5. Añade `STRIPE_SECRET_KEY` en Render con la clave secreta de prueba o producción correspondiente.
 6. Crea en Stripe dos precios recurrentes mensuales: uno para la cuenta principal y otro para usuarios adicionales.
 7. Añade en Render `STRIPE_MAIN_SUBSCRIPTION_PRICE_ID` con el precio principal y `STRIPE_ADDITIONAL_USER_PRICE_ID` con el precio de usuario adicional.
