@@ -164,11 +164,23 @@ async function run() {
   equal(helper.connectStatusKey(status()), 'connect.notConnected');
   equal(helper.connectStatusKey(pending), 'connect.pending');
   equal(helper.connectStatusKey(ready), 'connect.ready');
+  const liveStatus = (patch = {}) => status({ livemode: true, phase: 'connect_live', ...patch });
+  const livePending = liveStatus({ connected: true, accountId: 'acct_fixture', requirementsPending: true });
+  const liveReady = { ...livePending, chargesEnabled: true, payoutsEnabled: true, requirementsPending: false };
+  const liveLink = (patch = {}) => link({ livemode: true, phase: 'connect_live', ...patch });
+  equal(helper.parseConnectStatus(liveStatus()) !== null, true);
+  equal(helper.connectStatusKey(liveStatus()), 'connect.notConnected');
+  equal(helper.connectStatusKey(livePending), 'connect.pending');
+  equal(helper.connectStatusKey(liveReady), 'connect.ready');
+  equal(helper.parseConnectOnboardingUrl(liveLink(), null), liveLink().url);
   for (const value of [null, [], {}, status({ ok: false }), status({ livemode: true }), status({ phase: 'payments' }),
+    status({ livemode: true, phase: 'onboarding_only' }), status({ livemode: false, phase: 'connect_live' }),
     status({ enabled: 'true' }), status({ connected: true }), status({ accountId: 'acct_foreign' }),
     status({ chargesEnabled: true }), status({ payoutsEnabled: true }), status({ requirementsPending: true }),
-    { ...pending, enabled: false }, { ...pending, accountId: 'not-account' }]) equal(helper.parseConnectStatus(value), null);
+    { ...pending, enabled: false }, { ...pending, accountId: 'not-account' },
+    { ...livePending, enabled: false }, { ...livePending, accountId: 'not-account' }]) equal(helper.parseConnectStatus(value), null);
   for (const value of [link({ ok: false }), link({ livemode: true }), link({ phase: 'live' }),
+    liveLink({ phase: 'onboarding_only' }), liveLink({ livemode: false }),
     link({ accountId: 'bad' }), link({ expiresAt: 'bad' }), link({ expiresAt: 1 }),
     ...['http://onboarding.stripe.com/x', 'https://onboarding.stripe.com.evil.test/x', 'https://user:pass@connect.stripe.com/x',
       'https://connect.stripe.com:444/x', 'https://dashboard.stripe.com/test/dashboard', 'https://evil.accounts.stripe.com/x',
@@ -178,6 +190,14 @@ async function run() {
     await context.openStripeAccountSettings();
     equal(context.browsers, []);
     equal(context.stripeMethodsError, 'connect.linkInvalid');
+  }
+  {
+    const context = contextFor();
+    respond(context, liveStatus(), livePending, liveLink());
+    await context.openStripeAccountSettings();
+    equal(context.browsers, [{ url: liveLink().url }]);
+    equal(context.stripeMethodsError, '');
+    equal(context.stripeMethodsInfo, 'connect.pending');
   }
   equal(helper.parseConnectOnboardingUrl(link(), 'acct_foreign'), null);
   equal(helper.parseConnectOnboardingUrl(link({ expiresAt: 9999999999 }), null), link().url);
@@ -340,7 +360,7 @@ async function run() {
   const translation = load('src/i18n.ts');
   for (const [locale, dictionary] of Object.entries(connectTranslations)) {
     equal(Object.keys(dictionary).sort(), keys);
-    equal(dictionary['connect.phase'].includes('TEST ONLY'), true);
+    equal(dictionary['connect.phase'].includes('TEST ONLY'), false);
     for (const key of keys) {
       equal(typeof dictionary[key] === 'string' && dictionary[key].length > 0, true);
       equal(translation.t(locale, key), dictionary[key]);

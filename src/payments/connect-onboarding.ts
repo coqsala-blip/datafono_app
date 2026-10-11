@@ -43,27 +43,30 @@ export const isStripeOnboardingHost = (hostname: string): boolean =>
 export type ConnectStatusResult = {
   ok: true;
   enabled: boolean;
-  livemode: false;
+  livemode: boolean;
   connected: boolean;
   accountId: string | null;
   chargesEnabled: boolean;
   payoutsEnabled: boolean;
   requirementsPending: boolean;
   directCharges?: boolean;
-  phase: 'onboarding_only';
+  phase: 'onboarding_only' | 'connect_live';
 };
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
-const isTestPhase = (value: Record<string, unknown>) =>
-  value.ok === true && value.livemode === false && value.phase === 'onboarding_only';
+/** Test XOR live: fase y livemode deben coincidir (como en el backend). */
+const isConnectPhase = (value: Record<string, unknown>) =>
+  value.ok === true
+  && ((value.livemode === false && value.phase === 'onboarding_only')
+    || (value.livemode === true && value.phase === 'connect_live'));
 
 const isAccountId = (value: unknown): value is string =>
   typeof value === 'string' && /^acct_[A-Za-z0-9]+$/.test(value);
 
 export const parseConnectStatus = (value: unknown): ConnectStatusResult | null => {
-  if (!isRecord(value) || !isTestPhase(value) ||
+  if (!isRecord(value) || !isConnectPhase(value) ||
     !['enabled', 'connected', 'chargesEnabled', 'payoutsEnabled', 'requirementsPending']
       .every((key) => typeof value[key] === 'boolean')) return null;
   if (value.connected ? !value.enabled || !isAccountId(value.accountId)
@@ -79,7 +82,7 @@ export const connectStatusKey = (status: ConnectStatusResult): string => {
 };
 
 export const parseConnectOnboardingUrl = (value: unknown, expectedAccountId: string | null, now = Date.now()): string | null => {
-  if (!isRecord(value) || !isTestPhase(value) || !isAccountId(value.accountId) ||
+  if (!isRecord(value) || !isConnectPhase(value) || !isAccountId(value.accountId) ||
     (expectedAccountId !== null && value.accountId !== expectedAccountId) || typeof value.url !== 'string') return null;
   // expiresAt opcional: el backend ya validó el link; si llega, debe ser futuro.
   if (value.expiresAt !== undefined && value.expiresAt !== null) {
