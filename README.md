@@ -1,6 +1,6 @@
-# Welcome to your Expo app 👋
+# TPV & GESTIÓN (Expo)
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+App de datáfono / gestión. Backend: Render. Cobros: Stripe (billing + Connect).
 
 ## Get started
 
@@ -15,6 +15,16 @@ This is an [Expo](https://expo.dev) project created with [`create-expo-app`](htt
    ```bash
    npx expo start
    ```
+
+### Actualizaciones para usuarios (OTA)
+
+Parches de JS sin reenviar APK a cada país: ver **[UPDATES.md](./UPDATES.md)**.
+
+```bash
+npm run update:production -- "Descripción del arreglo"
+```
+
+Importante: hace falta **una** build nueva con `expo-updates` (ya configurado). Los APK antiguos no reciben OTA.
 
 In the output, you'll find options to open the app in a
 

@@ -7,6 +7,7 @@
     "development": {
       "developmentClient": true,
       "distribution": "internal",
+      "channel": "development",
       "env": {
         "EXPO_PUBLIC_DOCUMENT_API_URL": "https://tpv-gestor-backend.onrender.com",
         "EXPO_PUBLIC_STRIPE_TERMINAL_LOCATION_ID": "tml_GqEKaQ4ZWVckG0"
@@ -14,6 +15,10 @@
     },
     "preview": {
       "distribution": "internal",
+      "channel": "preview",
+      "android": {
+        "buildType": "apk"
+      },
       "env": {
         "EXPO_PUBLIC_DOCUMENT_API_URL": "https://tpv-gestor-backend.onrender.com",
         "EXPO_PUBLIC_STRIPE_TERMINAL_LOCATION_ID": "tml_GqEKaQ4ZWVckG0"
@@ -21,6 +26,10 @@
     },
     "production": {
       "autoIncrement": true,
+      "channel": "production",
+      "android": {
+        "buildType": "apk"
+      },
       "env": {
         "EXPO_PUBLIC_DOCUMENT_API_URL": "https://tpv-gestor-backend.onrender.com",
         "EXPO_PUBLIC_STRIPE_TERMINAL_LOCATION_ID": "tml_GqEKaQ4ZWVckG0"
