@@ -306,8 +306,40 @@ const checkCompletion = async () => {
   scenarios += 1;
 };
 
+const checkHistoryPartition = () => {
+  for (const name of ['isQuoteDocument', 'isUnpaidCashInvoice', 'isSalesHistoryDocument', 'partitionSalesDocuments', 'mergeCashInvoiceDrafts']) {
+    assert.ok(declarations.has(name), name);
+  }
+  const ctx = {};
+  for (const name of ['isQuoteDocument', 'isUnpaidCashInvoice', 'isSalesHistoryDocument', 'partitionSalesDocuments', 'mergeCashInvoiceDrafts']) {
+    ctx[name] = evaluate(declarations.get(name), ctx);
+  }
+  assert.equal(ctx.isQuoteDocument({ documentType: 'PRESUPUESTO' }), true);
+  assert.equal(ctx.isUnpaidCashInvoice({ documentType: 'FACTURA', method: 'Factura' }), true);
+  assert.equal(ctx.isUnpaidCashInvoice({ documentType: 'FACTURA', method: 'Efectivo' }), false);
+  assert.equal(ctx.isSalesHistoryDocument({ documentType: 'FACTURA', method: 'Efectivo' }), true);
+  assert.equal(ctx.isSalesHistoryDocument({ documentType: 'PRESUPUESTO', method: 'Presupuesto' }), false);
+  const quote = { id: 'q1', ticketCode: 'PRES-1', documentType: 'PRESUPUESTO', method: 'Presupuesto' };
+  const unpaid = { id: 'f1', ticketCode: 'FAC-1', documentType: 'FACTURA', method: 'Factura' };
+  const paid = { id: 'f2', ticketCode: 'FAC-2', documentType: 'FACTURA', method: 'Efectivo' };
+  const ticket = { id: 't1', ticketCode: 'TK-1', documentType: 'TICKET DE VENTA', method: 'Stripe' };
+  const { history, unpaidInvoices } = ctx.partitionSalesDocuments([quote, unpaid, paid, ticket]);
+  assert.equal(history.length, 2);
+  assert.equal(history[0], paid);
+  assert.equal(history[1], ticket);
+  assert.equal(unpaidInvoices.length, 1);
+  assert.equal(unpaidInvoices[0], unpaid);
+  const merged = ctx.mergeCashInvoiceDrafts([], [unpaid], [paid, { id: 'f1', ticketCode: 'FAC-1', documentType: 'FACTURA', method: 'Efectivo' }]);
+  assert.equal(merged.length, 0, 'paid same id must not reappear as draft');
+  const drafts = ctx.mergeCashInvoiceDrafts([{ id: 'keep', ticketCode: 'FAC-9', documentType: 'FACTURA', method: 'Factura' }], [unpaid], [paid]);
+  assert.equal(drafts.length, 2);
+  assert.equal(drafts[0], unpaid);
+  scenarios += 1;
+};
+
 (async () => {
   checkGeometry();
+  checkHistoryPartition();
   await checkCompletion();
   console.log(`Quote form: ${scenarios} real AST/VM scenarios passed.`);
 })().catch(error => { console.error(error); process.exitCode = 1; });

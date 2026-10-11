@@ -184,6 +184,48 @@ interface CashInvoiceDraft extends Transaction {
   documentType: 'FACTURA';
 }
 
+/** Presupuesto: solo email/PDF; nunca entra en Gastos/Facturas. */
+const isQuoteDocument = (doc: { documentType?: string }): boolean =>
+  doc.documentType === 'PRESUPUESTO';
+
+/** Factura enviada por email y aún no marcada como cobrada (method "Factura"). */
+const isUnpaidCashInvoice = (doc: { documentType?: string; method?: string }): boolean =>
+  doc.documentType === 'FACTURA' && doc.method === 'Factura';
+
+const isSalesHistoryDocument = (doc: Transaction): boolean =>
+  !isQuoteDocument(doc) && !isUnpaidCashInvoice(doc);
+
+const partitionSalesDocuments = (docs: Transaction[]): {
+  history: Transaction[];
+  unpaidInvoices: CashInvoiceDraft[];
+} => {
+  const history: Transaction[] = [];
+  const unpaidInvoices: CashInvoiceDraft[] = [];
+  for (const doc of docs) {
+    if (isQuoteDocument(doc)) continue;
+    if (isUnpaidCashInvoice(doc)) unpaidInvoices.push(doc as CashInvoiceDraft);
+    else history.push(doc);
+  }
+  return { history, unpaidInvoices };
+};
+
+const mergeCashInvoiceDrafts = (
+  current: CashInvoiceDraft[],
+  incoming: CashInvoiceDraft[],
+  history: Transaction[] = [],
+): CashInvoiceDraft[] => {
+  const paidKeys = new Set(history.flatMap((doc) => [doc.id, doc.ticketCode]));
+  const keys = new Set(current.flatMap((doc) => [doc.id, doc.ticketCode]));
+  const additions = incoming.filter((doc) => {
+    if (paidKeys.has(doc.id) || paidKeys.has(doc.ticketCode)) return false;
+    if (keys.has(doc.id) || keys.has(doc.ticketCode)) return false;
+    keys.add(doc.id);
+    keys.add(doc.ticketCode);
+    return true;
+  });
+  return [...additions, ...current];
+};
+
 const initialIssuer: Issuer = {
   name: '',
   nif: '',
@@ -834,9 +876,16 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
             }
           });
 
-          setTransactions(sales);
+          // Presupuestos y facturas pendientes no pertenecen al historial de cobros.
+          const { history, unpaidInvoices } = partitionSalesDocuments(sales);
+          const localDrafts = storedCashInvoiceDrafts
+            ? (JSON.parse(storedCashInvoiceDrafts) as CashInvoiceDraft[])
+            : [];
+          setTransactions(history);
+          setCashInvoiceDrafts(mergeCashInvoiceDrafts(localDrafts, unpaidInvoices, history));
+        } else if (storedCashInvoiceDrafts) {
+          setCashInvoiceDrafts(JSON.parse(storedCashInvoiceDrafts) as CashInvoiceDraft[]);
         }
-        if (storedCashInvoiceDrafts) setCashInvoiceDrafts(JSON.parse(storedCashInvoiceDrafts) as CashInvoiceDraft[]);
         if (storedExpenses) setExpenses(JSON.parse(storedExpenses));
         if (storedOwnerPin) setOwnerPin(storedOwnerPin);
         if (storedRecoveryEmail) setOwnerRecoveryEmail(storedRecoveryEmail);
@@ -1705,7 +1754,10 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     if (!isLoaded || !accessToken || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope || transactionsRef.current.length === 0) return;
     const generation = cacheGenerationRef.current;
     const transactionsNeedingPublication = transactionsRef.current.filter((transaction) =>
-      !transaction.publicUrl && !transaction.refundHistory?.length && transaction.documentType !== 'COMPRA/DEVOLUCIONES'
+      isSalesHistoryDocument(transaction)
+      && !transaction.publicUrl
+      && !transaction.refundHistory?.length
+      && transaction.documentType !== 'COMPRA/DEVOLUCIONES'
     );
     if (transactionsNeedingPublication.length === 0) return;
 
@@ -1764,9 +1816,10 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   const amount = Number(digits) / 100;
 
   const filteredTransactions = useMemo(() => {
+    const historyOnly = transactions.filter(isSalesHistoryDocument);
     const query = searchQuery.trim().toLocaleLowerCase('es-ES');
-    if (!query) return transactions;
-    return transactions.filter(({ ticketCode, client: transactionClient }) =>
+    if (!query) return historyOnly;
+    return historyOnly.filter(({ ticketCode, client: transactionClient }) =>
       ticketCode.toLocaleLowerCase('es-ES').includes(query) ||
       transactionClient?.name.toLocaleLowerCase('es-ES').includes(query),
     );
@@ -1776,7 +1829,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     setTransactionHistory(filteredTransactions);
   }, [filteredTransactions]);
 
-  const totals = useMemo(() => transactions.reduce(
+  const totals = useMemo(() => transactions.filter(isSalesHistoryDocument).reduce(
     (result, transaction) => {
       if (transaction.type === 'COBRO') {
         const originalAmount = transaction.originalAmount ?? transaction.amount;
@@ -1970,6 +2023,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     const endExclusive = new Date(end);
     endExclusive.setHours(23, 59, 59, 999);
     const periodTransactions = transactions.filter((transaction) => {
+      if (!isSalesHistoryDocument(transaction)) return false;
       const date = new Date(transaction.createdAt);
       return date >= start && date <= endExclusive;
     });
@@ -3175,6 +3229,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       }
 
       // 3) Restaurar tickets/facturas sin duplicar (se comparan por id y codigo de ticket).
+      // Presupuestos se ignoran en historial; facturas method "Factura" vuelven a pendientes de cobro.
       const restoredDocs = (Array.isArray(result.documents) ? result.documents : [])
         .filter((doc) => doc && doc.id && doc.ticketCode)
         .map((doc) => ({
@@ -3184,17 +3239,30 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
           publicUrl: doc.publicUrl,
           createdAt: doc.createdAt,
         }) as unknown as Transaction);
+      const { history: cloudHistory, unpaidInvoices: cloudUnpaidInvoices } = partitionSalesDocuments(restoredDocs);
+      const localHistory = partitionSalesDocuments(transactions).history;
       // El recuento se calcula fuera del setState: si se calcula dentro, el aviso podría decir
       // "todavía no hay historial" aunque los tickets sí se hayan recuperado.
-      const mergedDocs = mergeCloudTransactions(transactions, restoredDocs);
+      const mergedDocs = mergeCloudTransactions(localHistory, cloudHistory);
       const restoredDocsCount = mergedDocs.filter((document) => {
-        const previous = transactions.find((item) => item.id === document.id);
+        const previous = localHistory.find((item) => item.id === document.id);
         return !previous || JSON.stringify(previous) !== JSON.stringify(document);
       }).length;
-      setTransactions((current) => cacheGenerationRef.current === generation ? mergeCloudTransactions(current, restoredDocs) : current);
-      setSelectedTicket((current) => current && cacheGenerationRef.current === generation
-        ? mergeCloudTransactions([current], restoredDocs).find((document) => document.id === current.id) ?? current
-        : current);
+      setTransactions((current) => {
+        if (cacheGenerationRef.current !== generation) return current;
+        const cleaned = partitionSalesDocuments(current).history;
+        return mergeCloudTransactions(cleaned, cloudHistory);
+      });
+      setCashInvoiceDrafts((current) => {
+        if (cacheGenerationRef.current !== generation) return current;
+        const nextHistory = mergeCloudTransactions(localHistory, cloudHistory);
+        return mergeCashInvoiceDrafts(current, cloudUnpaidInvoices, nextHistory);
+      });
+      setSelectedTicket((current) => {
+        if (!current || cacheGenerationRef.current !== generation) return current;
+        if (isQuoteDocument(current) || isUnpaidCashInvoice(current)) return null;
+        return mergeCloudTransactions([current], cloudHistory).find((document) => document.id === current.id) ?? current;
+      });
 
       // 4) Restaurar gastos (los datos si; la foto no se sube a la nube).
       const restoredExpenses = (Array.isArray(result.expenses) ? result.expenses : [])
@@ -4066,6 +4134,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     endExclusive.setHours(23, 59, 59, 999);
 
     const filtered = transactions.filter(t => {
+      if (!isSalesHistoryDocument(t)) return false;
       const d = new Date(t.createdAt);
       return d >= start && d <= endExclusive;
     });
@@ -4146,6 +4215,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     endExclusive.setHours(23, 59, 59, 999);
 
     const filteredTransactions = transactions.filter(t => {
+      if (!isSalesHistoryDocument(t)) return false;
       const d = new Date(t.createdAt);
       return d >= start && d <= endExclusive;
     });
