@@ -188,9 +188,11 @@ interface CashInvoiceDraft extends Transaction {
 const isQuoteDocument = (doc: { documentType?: string }): boolean =>
   doc.documentType === 'PRESUPUESTO';
 
-/** Factura enviada por email y aún no marcada como cobrada (method "Factura"). */
+/** Factura del formulario Presupuesto/Factura aún no marcada como cobrada.
+ * Solo pasa a Gastos/Facturas cuando method es "Efectivo" (Marcar cobrada).
+ * Sin method (docs antiguos en la nube) se trata como pendiente. */
 const isUnpaidCashInvoice = (doc: { documentType?: string; method?: string }): boolean =>
-  doc.documentType === 'FACTURA' && doc.method === 'Factura';
+  doc.documentType === 'FACTURA' && doc.method !== 'Efectivo';
 
 const isSalesHistoryDocument = (doc: Transaction): boolean =>
   !isQuoteDocument(doc) && !isUnpaidCashInvoice(doc);
@@ -3469,10 +3471,21 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         refundHistory: [],
       };
 
-      const publishedDocument = await registerTransactionDocument(tempPresupuestoTransaction);
+      // Publicar para QR/enlace del PDF; si falla, la factura pendiente igual se queda en esta pestaña.
+      let publishedDocument = tempPresupuestoTransaction;
+      try {
+        publishedDocument = await registerTransactionDocument(tempPresupuestoTransaction);
+      } catch (publishError) {
+        console.warn('No se pudo publicar presupuesto/factura; se continúa con PDF local.', publishError);
+      }
 
       if (presupuestoDocumentType === 'FACTURA') {
-        setCashInvoiceDrafts((current) => [publishedDocument as CashInvoiceDraft, ...current]);
+        // Solo lista pendiente aquí (Marcar cobrada / Eliminar). No entra en Gastos/Facturas.
+        setCashInvoiceDrafts((current) => {
+          const next = publishedDocument as CashInvoiceDraft;
+          const withoutDup = current.filter((item) => item.id !== next.id && item.ticketCode !== next.ticketCode);
+          return [next, ...withoutDup];
+        });
       }
 
       const pdfUri = await generatePdfFileUri(publishedDocument);

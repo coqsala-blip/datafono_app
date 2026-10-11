@@ -280,10 +280,25 @@ const checkCompletion = async () => {
     if (failure === 'pdf') harness.context.generatePdfFileUri = fail;
     if (failure === 'composer') harness.context.MailComposer.composeAsync = fail;
     await harness.context.sendPresupuestoByEmail();
-    assert.equal(harness.dismissals(), 0, failure);
-    assert.equal(harness.context.presupuestoIvaInput, '10', failure);
+    if (failure === 'publish') {
+      // Publicar es opcional: si falla, igual se abre el correo y (si es FACTURA) queda pendiente.
+      assert.equal(harness.mailed.length, 1, failure);
+      assert.equal(harness.alerts.length, 0, failure);
+    } else {
+      assert.equal(harness.dismissals(), 0, failure);
+      assert.equal(harness.context.presupuestoIvaInput, '10', failure);
+    }
     scenarios += 1;
   }
+  const invoiceDraftHarness = createHarness();
+  invoiceDraftHarness.context.presupuestoDocumentType = 'FACTURA';
+  invoiceDraftHarness.context.registerTransactionDocument = async () => { throw new Error('offline'); };
+  await invoiceDraftHarness.context.sendPresupuestoByEmail();
+  assert.equal(invoiceDraftHarness.context.cashInvoiceDrafts.length, 1);
+  assert.equal(invoiceDraftHarness.context.cashInvoiceDrafts[0].documentType, 'FACTURA');
+  assert.equal(invoiceDraftHarness.context.cashInvoiceDrafts[0].method, 'Factura');
+  assert.equal(invoiceDraftHarness.context.transactions.length, 0);
+  scenarios += 1;
   const paid = createHarness();
   const draft = { id: 'draft', documentType: 'FACTURA', client: { name: 'Client' }, items: [{ description: 'Product', price: '12' }], publicUrl: 'old', amount: 13.2 };
   const other = { id: 'other' };
@@ -316,6 +331,7 @@ const checkHistoryPartition = () => {
   }
   assert.equal(ctx.isQuoteDocument({ documentType: 'PRESUPUESTO' }), true);
   assert.equal(ctx.isUnpaidCashInvoice({ documentType: 'FACTURA', method: 'Factura' }), true);
+  assert.equal(ctx.isUnpaidCashInvoice({ documentType: 'FACTURA' }), true, 'legacy cloud docs without method');
   assert.equal(ctx.isUnpaidCashInvoice({ documentType: 'FACTURA', method: 'Efectivo' }), false);
   assert.equal(ctx.isSalesHistoryDocument({ documentType: 'FACTURA', method: 'Efectivo' }), true);
   assert.equal(ctx.isSalesHistoryDocument({ documentType: 'PRESUPUESTO', method: 'Presupuesto' }), false);

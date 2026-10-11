@@ -2615,7 +2615,7 @@ const isRefundDocument = (document) => (
 app.post('/api/documents', requireAuth, async (req, res) => {
   const {
     id, ticketCode, documentType, amount, originalAmount, relatedTicketCode, refundHistory, isRefunded,
-    createdAt, issuer, client, items, subtotal, iva, ivaRateApplied, type,
+    createdAt, issuer, client, items, subtotal, iva, ivaRateApplied, type, method,
     stripePaymentIntentId, stripeAccountId, chargeMode, stripeCheckoutSessionId,
   } = req.body;
 
@@ -2645,6 +2645,8 @@ app.post('/api/documents', requireAuth, async (req, res) => {
     iva,
     ivaRateApplied,
     type,
+    // method distingue factura pendiente ("Factura") de cobrada en efectivo ("Efectivo").
+    ...(typeof method === 'string' && method.trim() ? { method: method.trim() } : {}),
     ...(validStripePaymentIntentId(stripePaymentIntentId) ? { stripePaymentIntentId } : {}),
     ...(validStripeAccountId(stripeAccountId) ? { stripeAccountId } : {}),
     ...(chargeMode === 'direct' || chargeMode === 'destination' || chargeMode === 'platform' ? { chargeMode } : {}),
