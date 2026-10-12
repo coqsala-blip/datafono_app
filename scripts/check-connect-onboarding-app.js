@@ -57,6 +57,7 @@ const contextFor = (overrides = {}) => {
     issuer: { country: 'ES' }, stripeCountryConfirmed: 'ES', stripeCountryModalVisible: false,
     stripeCountryScopeRef: { current: null },
     ensureFreshAccessToken: async () => `fresh-token-${++context.tokenCalls}`,
+    Alert: { alert() {} },
     WebBrowser: { openBrowserAsync: async (url) => {
       context.browsers.push({ url }); return { type: 'dismiss' };
     }, openAuthSessionAsync: async () => { throw new Error('AuthSession should not be used for Connect'); } },
@@ -320,7 +321,9 @@ async function run() {
     };
     await context.openStripeAccountSettings();
     equal(context.stripeMethodsError, failure === 'return-network' ? ''
-      : failure === 'wrong-account' ? 'connect.linkInvalid' : 'connect.failed');
+      : failure === 'wrong-account' ? 'connect.linkInvalid'
+      : failure === 'json' ? 'connect.upstream'
+      : 'connect.failed');
     equal(context.stripeAccountLoading, false);
     equal(context.stripeConnectBusyRef.current, null);
     if (failure !== 'return-network') equal(context.browsers, []);
