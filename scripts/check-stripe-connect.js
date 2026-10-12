@@ -329,9 +329,16 @@ const main = async () => {
     recipient: { capabilities: { stripe_balance: { stripe_transfers: { requested: true } } } },
   });
   equal(payload.include.includes('configuration.recipient'), true);
-  equal(payload.identity, { country: 'ES' });
+  equal(payload.identity, {
+    country: 'ES',
+    entity_type: 'individual',
+    business_details: { registered_name: 'Name owner' },
+  });
   equal(payload.dashboard, 'full');
-  equal(payload.defaults, { responsibilities: { fees_collector: 'stripe', losses_collector: 'stripe' } });
+  equal(payload.defaults, {
+    currency: 'eur',
+    responsibilities: { fees_collector: 'stripe', losses_collector: 'stripe' },
+  });
   equal(Object.keys(test.state.creates[0].options), ['idempotencyKey']);
   equal(test.state.users.get('employee').app_metadata.stripe_connect_test_account_id, undefined);
   equal((await test.call('status', { id: 'employee' })).body, (await test.call('status')).body);
@@ -500,6 +507,8 @@ const main = async () => {
   const sanitized = await upstream.call('onboarding');
   equal(sanitized.body.code, 'connect_upstream_unavailable');
   equal(JSON.stringify(sanitized.body).includes('credentials'), false);
+  equal(typeof sanitized.body.hint === 'string' && sanitized.body.hint.includes('secret link'), true);
+  equal(sanitized.body.hint.includes('***'), true);
   equal(sanitized.headers['Cache-Control'], 'no-store');
   equal(sanitized.headers['Referrer-Policy'], 'no-referrer');
   const badEmployee = fixture();

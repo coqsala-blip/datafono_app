@@ -3008,7 +3008,13 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       }, 30000);
       const result: unknown = await response.json();
       if (!isCurrent()) return null;
-      if (!response.ok) throw new Error(connectErrorKey(result));
+      if (!response.ok) {
+        const key = connectErrorKey(result);
+        const record = result && typeof result === 'object' ? result as Record<string, unknown> : {};
+        const hint = typeof record.hint === 'string' ? record.hint : '';
+        const stripeCode = typeof record.stripeCode === 'string' ? record.stripeCode : '';
+        throw Object.assign(new Error(key), { hint, stripeCode });
+      }
       return result;
     };
     const readStatus = async () => {
@@ -3042,12 +3048,25 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         }
       }
     } catch (error) {
-      if (isCurrent()) setStripeMethodsError(error instanceof Error &&
-        ['connect.countryRequiresSupport', 'connect.countryNotApproved', 'connect.countryMismatch',
-          'connect.notConnected', 'connect.chargesNotEnabled', 'connect.linkInvalid', 'connect.upstream',
-          'connect.sessionRequired', 'connect.chooseCountry', 'connect.principalOnly',
-          'connect.profileRequired', 'connect.modeMismatch', 'connect.serverMisconfigured'].includes(error.message)
-        ? error.message : 'connect.failed');
+      if (isCurrent()) {
+        const message = error instanceof Error ? error.message : '';
+        setStripeMethodsError(
+          ['connect.countryRequiresSupport', 'connect.countryNotApproved', 'connect.countryMismatch',
+            'connect.notConnected', 'connect.chargesNotEnabled', 'connect.linkInvalid', 'connect.upstream',
+            'connect.sessionRequired', 'connect.chooseCountry', 'connect.principalOnly',
+            'connect.profileRequired', 'connect.modeMismatch', 'connect.serverMisconfigured'].includes(message)
+            ? message : 'connect.failed');
+        const hint = error && typeof error === 'object' && 'hint' in error && typeof (error as { hint?: unknown }).hint === 'string'
+          ? (error as { hint: string }).hint
+          : '';
+        const stripeCode = error && typeof error === 'object' && 'stripeCode' in error
+          && typeof (error as { stripeCode?: unknown }).stripeCode === 'string'
+          ? (error as { stripeCode: string }).stripeCode
+          : '';
+        if (hint || stripeCode) {
+          Alert.alert('Detalle Stripe Connect', [stripeCode, hint].filter(Boolean).join('\n'));
+        }
+      }
     } finally {
       if (isCurrent()) {
         stripeConnectBusyRef.current = null;

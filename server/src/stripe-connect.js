@@ -516,11 +516,19 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
     } else {
       if (!/^[a-f0-9]{48}$/.test(pending.token || '') || !Number.isFinite(pending.started) ||
         typeof pending.email !== 'string' || typeof pending.name !== 'string') throw fail(409, 'connect_creation_invalid');
-      const matches = [];
-      for await (const account of stripe().v2.core.accounts.list({ limit: 100 })) {
-        if (account.metadata?.supabase_owner_id === owner.id && account.metadata?.connect_test_creation_token === pending.token) {
-          matches.push(account.id);
+      let matches = [];
+      try {
+        for await (const account of stripe().v2.core.accounts.list({ limit: 100 })) {
+          if (account.metadata?.supabase_owner_id === owner.id && account.metadata?.connect_test_creation_token === pending.token) {
+            matches.push(account.id);
+          }
         }
+      } catch (listError) {
+        // List en live a veces falla; no bloquear el alta: reiniciar pending y crear de nuevo.
+        console.error('Stripe Connect accounts.list failed; resetting pending:', listError?.code || listError?.message || listError);
+        pending = { token: crypto.randomBytes(24).toString('hex'), started: now(), email: pending.email, name: pending.name, country };
+        await save(owner.id, { stripe_connect_test_creation: pending });
+        matches = [];
       }
       if (matches.length > 1) throw fail(409, 'connect_creation_ambiguous');
       if (matches.length === 1) {
@@ -532,13 +540,36 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
     }
     const keyPrefix = expectLivemode() ? 'connect-live-v1' : 'connect-test-v1';
     const idempotencyKey = `${keyPrefix}-${crypto.createHash('sha256').update(owner.id).digest('hex')}-${pending.token}`;
-    const account = checkAccount(await stripe().v2.core.accounts.create({ contact_email: pending.email, display_name: pending.name,
-      identity: { country }, dashboard: 'full', defaults: { responsibilities: { fees_collector: 'stripe', losses_collector: 'stripe' } },
+    const account = checkAccount(await stripe().v2.core.accounts.create({
+      contact_email: pending.email,
+      display_name: pending.name,
+      identity: {
+        country,
+        entity_type: 'individual',
+        business_details: { registered_name: pending.name },
+      },
+      dashboard: 'full',
+      defaults: {
+        currency: 'eur',
+        responsibilities: { fees_collector: 'stripe', losses_collector: 'stripe' },
+      },
       configuration: MERCHANT_RECIPIENT_CONFIG,
-      metadata: { supabase_owner_id: owner.id, connect_test_creation_token: pending.token }, include: INCLUDE,
+      metadata: { supabase_owner_id: owner.id, connect_test_creation_token: pending.token },
+      include: INCLUDE,
     }, { idempotencyKey }), owner, undefined, country);
     await save(owner.id, { stripe_connect_test_account_id: account.id, stripe_connect_test_country: country, stripe_connect_test_creation: null });
     return account;
+  };
+  const sanitizeUpstreamHint = (error) => {
+    const raw = [error?.type, error?.code, error?.message].filter(Boolean).join(' | ');
+    if (!raw) return '';
+    return String(raw)
+      .replace(/sk_(live|test)_[A-Za-z0-9]+/g, 'sk_***')
+      .replace(/rk_(live|test)_[A-Za-z0-9]+/g, 'rk_***')
+      .replace(/whsec_[A-Za-z0-9]+/g, 'whsec_***')
+      .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, 'Bearer ***')
+      .replace(/credentials/gi, '***')
+      .slice(0, 240);
   };
   const handle = (task) => async (req, res) => {
     res.set?.('Cache-Control', 'no-store');
@@ -552,9 +583,12 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
       const body = { ok: false,
         code: trusted ? error.code : 'connect_upstream_unavailable',
         error: 'Stripe Connect no disponible para esta solicitud.' };
-      // Código Stripe seguro (sin secretos) para diagnosticar en la app / logs.
-      if (!trusted && typeof error?.code === 'string' && /^[a-z0-9_]+$/i.test(error.code) && error.code.length < 80) {
-        body.stripeCode = error.code;
+      if (!trusted) {
+        const hint = sanitizeUpstreamHint(error);
+        if (hint) body.hint = hint;
+        if (typeof error?.code === 'string' && /^[a-z0-9_]+$/i.test(error.code) && error.code.length < 80) {
+          body.stripeCode = error.code;
+        }
       }
       return res.status(trusted ? error.status : 502).json(body);
     }
