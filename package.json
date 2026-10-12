@@ -55,8 +55,8 @@
     "ios": "expo run:ios",
     "web": "expo start --web",
     "lint": "expo lint",
-    "update:preview": "eas update --channel preview --message",
-    "update:production": "eas update --channel production --message"
+    "update:preview": "eas update --channel preview --platform android --message",
+    "update:production": "eas update --channel production --platform android --message"
   },
   "private": true
 }
