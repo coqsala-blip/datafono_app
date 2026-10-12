@@ -109,15 +109,20 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
     if (!EU_COUNTRIES.has(country) || account.identity?.country !== country) throw fail(409, 'connect_country_mismatch');
     return account;
   };
-  const isMissingStripeAccount = (error) => {
+  const isInaccessibleStripeAccount = (error) => {
     if (!error || error.status) return false;
     const code = String(error.code || '');
+    const type = String(error.type || '');
     const message = String(error.message || '');
-    return code === 'resource_missing' || code === 'account_invalid'
-      || /no such account/i.test(message);
+    // Cuenta de otra plataforma / clave sin permiso / cuenta borrada → recrear alta.
+    return code === 'resource_missing' || code === 'account_invalid' || code === 'forbidden'
+      || type === 'StripePermissionError'
+      || /no such account/i.test(message)
+      || /permission denied/i.test(message)
+      || /does not have permission to access account/i.test(message);
   };
   const isStaleConnectBinding = (error) =>
-    error?.code === 'connect_account_mode_mismatch' || isMissingStripeAccount(error);
+    error?.code === 'connect_account_mode_mismatch' || isInaccessibleStripeAccount(error);
   const clearStaleConnectBinding = async (ownerId) => save(ownerId, {
     stripe_connect_test_account_id: null,
     stripe_connect_test_creation: null,
@@ -132,7 +137,7 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
     try {
       account = await stripe().v2.core.accounts.retrieve(accountId, { include: INCLUDE });
     } catch (error) {
-      if (isMissingStripeAccount(error)) throw fail(409, 'connect_account_mode_mismatch');
+      if (isInaccessibleStripeAccount(error)) throw fail(409, 'connect_account_mode_mismatch');
       throw error;
     }
     return checkAccount(account, owner, accountId, country);

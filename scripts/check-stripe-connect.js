@@ -38,6 +38,7 @@ const fixture = (patch = {}) => {
     },
     async retrieve(id, params) {
       state.retrieves.push({ id, params });
+      if (state.retrieveError) throw state.retrieveError;
       if (state.failRetrieve) {
         throw Object.assign(new Error(`No such account: '${id}'`), { code: 'resource_missing', type: 'StripeInvalidRequestError' });
       }
@@ -624,6 +625,22 @@ const main = async () => {
   equal(recovered.statusCode, 200);
   equal(recovered.body.livemode, true);
   equal(staleToLive.state.creates.length, 1);
+  // Clave live sin permiso sobre acct_ de otra plataforma → limpia y recrea.
+  const forbiddenStale = fixture({
+    STRIPE_CONNECT_TEST_ENABLED: 'false',
+    STRIPE_CONNECT_LIVE_ENABLED: 'true',
+    STRIPE_CONNECT_LIVE_SECRET_KEY: 'sk_live_fixture',
+  });
+  forbiddenStale.state.users.get('owner').app_metadata.stripe_connect_test_account_id = 'acct_otherPlatform';
+  forbiddenStale.state.retrieveError = Object.assign(
+    new Error('Permission denied. API Key does not have permission to access account acct_otherPlatform.'),
+    { type: 'StripePermissionError', code: 'forbidden' },
+  );
+  equal((await forbiddenStale.call('status')).body.connected, false);
+  equal(forbiddenStale.state.users.get('owner').app_metadata.stripe_connect_test_account_id, null);
+  forbiddenStale.state.retrieveError = null;
+  equal((await forbiddenStale.call('onboarding')).statusCode, 200);
+  equal(forbiddenStale.state.creates.length, 1);
   const bothModes = fixture({
     STRIPE_CONNECT_TEST_ENABLED: 'true',
     STRIPE_CONNECT_LIVE_ENABLED: 'true',
