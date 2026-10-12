@@ -53,6 +53,7 @@ const contextFor = (overrides = {}) => {
     isLoaded: true, storageScope: 'owner:owner', storageScopeRef: { current: 'owner:owner' },
     loadedScopeRef: { current: 'owner:owner' }, cacheGenerationRef: { current: 1 },
     stripeConnectBusyRef: { current: null }, stripeAccountLoading: false, stripeMethodsInfo: '', stripeMethodsError: '',
+    stripeMethodsErrorDetail: '',
     issuer: { country: 'ES' }, stripeCountryConfirmed: 'ES', stripeCountryModalVisible: false,
     stripeCountryScopeRef: { current: null },
     ensureFreshAccessToken: async () => `fresh-token-${++context.tokenCalls}`,
@@ -66,7 +67,7 @@ const contextFor = (overrides = {}) => {
     },
     ...overrides,
   });
-  for (const name of ['stripeAccountLoading', 'stripeMethodsInfo', 'stripeMethodsError', 'stripeCountryConfirmed', 'stripeCountryModalVisible']) {
+  for (const name of ['stripeAccountLoading', 'stripeMethodsInfo', 'stripeMethodsError', 'stripeMethodsErrorDetail', 'stripeCountryConfirmed', 'stripeCountryModalVisible']) {
     context[`set${name[0].toUpperCase()}${name.slice(1)}`] = value => {
       context[name] = value; context.mutations.push([name, value]);
     };

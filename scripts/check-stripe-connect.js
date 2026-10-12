@@ -326,9 +326,8 @@ const main = async () => {
   equal(payload.configuration, {
     customer: {},
     merchant: { capabilities: { card_payments: { requested: true } } },
-    recipient: { capabilities: { stripe_balance: { stripe_transfers: { requested: true } } } },
   });
-  equal(payload.include.includes('configuration.recipient'), true);
+  equal(payload.include.includes('configuration.merchant'), true);
   equal(payload.identity, {
     country: 'ES',
     entity_type: 'individual',

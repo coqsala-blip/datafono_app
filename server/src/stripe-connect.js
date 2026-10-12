@@ -11,6 +11,12 @@ const MERCHANT_RECIPIENT_CONFIG = {
   // Necesario para Checkout/Terminal destination (transfer_data / on_behalf_of).
   recipient: { capabilities: { stripe_balance: { stripe_transfers: { requested: true } } } },
 };
+// Alta inicial sin recipient: en live Stripe a veces rechaza merchant+recipient juntos
+// si la plataforma Connect aún no tiene recipient habilitado. El recipient se añade después.
+const MERCHANT_CREATE_CONFIG = {
+  customer: {},
+  merchant: { capabilities: { card_payments: { requested: true } } },
+};
 const EU_COUNTRIES = new Set('AT BE BG HR CY CZ DK EE FI FR DE GR HU IE IT LV LT LU MT NL PL PT RO SK SI ES SE'.split(' '));
 const STATE_TTL = 30 * 60 * 1000;
 const RETRY_WINDOW = 23 * 60 * 60 * 1000;
@@ -553,7 +559,7 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
         currency: 'eur',
         responsibilities: { fees_collector: 'stripe', losses_collector: 'stripe' },
       },
-      configuration: MERCHANT_RECIPIENT_CONFIG,
+      configuration: MERCHANT_CREATE_CONFIG,
       metadata: { supabase_owner_id: owner.id, connect_test_creation_token: pending.token },
       include: INCLUDE,
     }, { idempotencyKey }), owner, undefined, country);
@@ -561,15 +567,18 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
     return account;
   };
   const sanitizeUpstreamHint = (error) => {
-    const raw = [error?.type, error?.code, error?.message].filter(Boolean).join(' | ');
-    if (!raw) return '';
+    let raw = [error?.type, error?.code, error?.message].filter(Boolean).join(' | ');
+    if (!raw) {
+      try { raw = typeof error === 'string' ? error : JSON.stringify(error); } catch { raw = String(error); }
+    }
+    if (!raw || raw === '{}' || raw === 'undefined') raw = 'error_sin_detalle';
     return String(raw)
       .replace(/sk_(live|test)_[A-Za-z0-9]+/g, 'sk_***')
       .replace(/rk_(live|test)_[A-Za-z0-9]+/g, 'rk_***')
       .replace(/whsec_[A-Za-z0-9]+/g, 'whsec_***')
       .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, 'Bearer ***')
       .replace(/credentials/gi, '***')
-      .slice(0, 240);
+      .slice(0, 280);
   };
   const handle = (task) => async (req, res) => {
     res.set?.('Cache-Control', 'no-store');

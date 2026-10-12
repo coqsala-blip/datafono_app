@@ -578,6 +578,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   const stripeConnectBusyRef = useRef<number | null>(null);
   const [stripeMethodsInfo, setStripeMethodsInfo] = useState('');
   const [stripeMethodsError, setStripeMethodsError] = useState('');
+  const [stripeMethodsErrorDetail, setStripeMethodsErrorDetail] = useState('');
   const [stripeCountryModalVisible, setStripeCountryModalVisible] = useState(false);
   const [stripeCountryConfirmed, setStripeCountryConfirmed] = useState<ConnectCountry | null>(null);
   const stripeCountryScopeRef = useRef<{ scope: string; generation: number } | null>(null);
@@ -762,6 +763,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     setTerminalMessage('tpv.ready');
     setStripeMethodsInfo('');
     setStripeMethodsError('');
+    setStripeMethodsErrorDetail('');
     setStripeAccountLoading(false);
     setStripeCountryModalVisible(false);
     setStripeCountryConfirmed(null);
@@ -2995,6 +2997,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       stripeConnectBusyRef.current === generation;
     setStripeAccountLoading(true);
     setStripeMethodsError('');
+    setStripeMethodsErrorDetail('');
     setStripeMethodsInfo('');
 
     const request = async (onboarding = false): Promise<unknown> => {
@@ -3006,13 +3009,24 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         headers: { Authorization: `Bearer ${token}`, ...(onboarding ? { 'Content-Type': 'application/json' } : {}) },
         ...(onboarding ? { body: JSON.stringify({ country }) } : {}),
       }, 30000);
-      const result: unknown = await response.json();
+      let result: unknown = null;
+      try {
+        result = await response.json();
+      } catch {
+        throw Object.assign(new Error('connect.upstream'), {
+          hint: `HTTP ${response.status} sin JSON`,
+          stripeCode: '',
+        });
+      }
       if (!isCurrent()) return null;
       if (!response.ok) {
         const key = connectErrorKey(result);
         const record = result && typeof result === 'object' ? result as Record<string, unknown> : {};
-        const hint = typeof record.hint === 'string' ? record.hint : '';
+        const hint = typeof record.hint === 'string' ? record.hint
+          : typeof record.error === 'string' ? record.error
+          : typeof record.code === 'string' ? record.code : `HTTP ${response.status}`;
         const stripeCode = typeof record.stripeCode === 'string' ? record.stripeCode : '';
+        console.warn('Connect API error', response.status, record);
         throw Object.assign(new Error(key), { hint, stripeCode });
       }
       return result;
@@ -3063,9 +3077,9 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
           && typeof (error as { stripeCode?: unknown }).stripeCode === 'string'
           ? (error as { stripeCode: string }).stripeCode
           : '';
-        if (hint || stripeCode) {
-          Alert.alert('Detalle Stripe Connect', [stripeCode, hint].filter(Boolean).join('\n'));
-        }
+        const detail = [stripeCode, hint].filter(Boolean).join(' — ');
+        setStripeMethodsErrorDetail(detail || (error instanceof Error ? error.message : 'error desconocido'));
+        if (detail) Alert.alert('Detalle Stripe Connect', detail);
       }
     } finally {
       if (isCurrent()) {
@@ -5039,6 +5053,11 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
               ) : null}
               {stripeMethodsError ? (
                 <Text style={{ color: '#b91c1c', fontSize: 12, marginTop: 10 }}>{tr(stripeMethodsError)}</Text>
+              ) : null}
+              {stripeMethodsErrorDetail ? (
+                <Text style={{ color: '#7f1d1d', fontSize: 11, marginTop: 6, lineHeight: 16 }} selectable>
+                  {stripeMethodsErrorDetail}
+                </Text>
               ) : null}
             </View>
               <View style={styles.card}>
