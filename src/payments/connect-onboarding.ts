@@ -32,6 +32,13 @@ export const connectErrorKey = (value: unknown): string => {
     case 'connect_link_invalid': return 'connect.linkInvalid';
     case 'connect_session_unbound': return 'connect.sessionRequired';
     case 'connect_upstream_unavailable': return 'connect.upstream';
+    case 'connect_owner_profile_required': return 'connect.profileRequired';
+    case 'connect_account_mode_mismatch': return 'connect.modeMismatch';
+    case 'connect_mode_ambiguous':
+    case 'connect_live_key_invalid':
+    case 'connect_test_key_invalid':
+    case 'connect_state_secret_missing':
+    case 'connect_public_origin_invalid': return 'connect.serverMisconfigured';
     default: return 'connect.failed';
   }
 };

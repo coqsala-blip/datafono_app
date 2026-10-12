@@ -3045,7 +3045,8 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       if (isCurrent()) setStripeMethodsError(error instanceof Error &&
         ['connect.countryRequiresSupport', 'connect.countryNotApproved', 'connect.countryMismatch',
           'connect.notConnected', 'connect.chargesNotEnabled', 'connect.linkInvalid', 'connect.upstream',
-          'connect.sessionRequired', 'connect.chooseCountry', 'connect.principalOnly'].includes(error.message)
+          'connect.sessionRequired', 'connect.chooseCountry', 'connect.principalOnly',
+          'connect.profileRequired', 'connect.modeMismatch', 'connect.serverMisconfigured'].includes(error.message)
         ? error.message : 'connect.failed');
     } finally {
       if (isCurrent()) {

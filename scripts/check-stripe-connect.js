@@ -36,7 +36,17 @@ const fixture = (patch = {}) => {
       if (state.lostResponse) { state.lostResponse = false; throw new Error('response lost'); }
       return clone(account);
     },
-    async retrieve(id, params) { state.retrieves.push({ id, params }); if (state.failRetrieve) throw new Error('secret'); return clone(state.accounts.get(id)); },
+    async retrieve(id, params) {
+      state.retrieves.push({ id, params });
+      if (state.failRetrieve) {
+        throw Object.assign(new Error(`No such account: '${id}'`), { code: 'resource_missing', type: 'StripeInvalidRequestError' });
+      }
+      const found = state.accounts.get(id);
+      if (!found) {
+        throw Object.assign(new Error(`No such account: '${id}'`), { code: 'resource_missing', type: 'StripeInvalidRequestError' });
+      }
+      return clone(found);
+    },
     async update(id, params) {
       state.v2AccountUpdates = state.v2AccountUpdates || [];
       state.v2AccountUpdates.push({ id, params: clone(params) });
@@ -326,7 +336,7 @@ const main = async () => {
   equal(test.state.users.get('employee').app_metadata.stripe_connect_test_account_id, undefined);
   equal((await test.call('status', { id: 'employee' })).body, (await test.call('status')).body);
   equal((await test.call('status')).body.requirementsPending, true);
-  const account = test.state.accounts.get('acct_fixture');
+  let account = test.state.accounts.get('acct_fixture');
   account.configuration.merchant.capabilities.card_payments.status = 'active';
   account.configuration.merchant.capabilities.stripe_balance.payouts.status = 'active';
   account.requirements.entries = [];
@@ -336,7 +346,18 @@ const main = async () => {
   delete account.configuration;
   equal((await test.call('status')).body.chargesEnabled, false);
   equal((await test.call('status')).body.requirementsPending, true);
-  for (const patch of [{ livemode: true }, { metadata: { supabase_owner_id: 'other' } }, { dashboard: 'express' },
+  // Cuenta test con livemode distinto al modo actual → se limpia (no 502).
+  {
+    const original = clone(account);
+    Object.assign(account, { livemode: true });
+    equal((await test.call('status')).statusCode, 200);
+    equal((await test.call('status')).body.connected, false);
+    equal(test.state.users.get('owner').app_metadata.stripe_connect_test_account_id, null);
+    Object.assign(account, original);
+    await test.call('onboarding');
+    account = test.state.accounts.get('acct_fixture');
+  }
+  for (const patch of [{ metadata: { supabase_owner_id: 'other' } }, { dashboard: 'express' },
     { defaults: null }, { defaults: { responsibilities: { fees_collector: 'application', losses_collector: 'stripe' } } }]) {
     const original = clone(account);
     Object.assign(account, patch);
@@ -579,6 +600,22 @@ const main = async () => {
   equal(liveOnboard.body.livemode, true);
   equal(liveOnboard.body.phase, 'connect_live');
   equal(liveConnect.state.creates[0].options.idempotencyKey.startsWith('connect-live-v1-'), true);
+  // Cuenta test guardada + modo live: status limpia; onboarding crea cuenta live nueva.
+  const staleToLive = fixture({
+    STRIPE_CONNECT_TEST_ENABLED: 'false',
+    STRIPE_CONNECT_LIVE_ENABLED: 'true',
+    STRIPE_CONNECT_LIVE_SECRET_KEY: 'sk_live_fixture',
+  });
+  staleToLive.state.users.get('owner').app_metadata.stripe_connect_test_account_id = 'acct_staleFromTest';
+  staleToLive.state.users.get('owner').app_metadata.stripe_connect_test_country = 'ES';
+  staleToLive.state.failRetrieve = true;
+  equal((await staleToLive.call('status')).body.connected, false);
+  equal(staleToLive.state.users.get('owner').app_metadata.stripe_connect_test_account_id, null);
+  staleToLive.state.failRetrieve = false;
+  const recovered = await staleToLive.call('onboarding');
+  equal(recovered.statusCode, 200);
+  equal(recovered.body.livemode, true);
+  equal(staleToLive.state.creates.length, 1);
   const bothModes = fixture({
     STRIPE_CONNECT_TEST_ENABLED: 'true',
     STRIPE_CONNECT_LIVE_ENABLED: 'true',

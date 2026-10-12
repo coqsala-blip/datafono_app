@@ -90,9 +90,12 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
     return pending?.country === undefined ? 'ES' : pending.country;
   };
   const checkAccount = (account, owner, expectedId, country = boundCountry(owner)) => {
-    if (!account || !ACCOUNT_ID.test(account.id) || (expectedId && account.id !== expectedId)
-      || account.livemode !== expectLivemode()
-      || account.metadata?.supabase_owner_id !== owner.id || account.dashboard !== 'full' ||
+    if (!account || !ACCOUNT_ID.test(account.id) || (expectedId && account.id !== expectedId)) {
+      throw fail(409, 'connect_account_binding_invalid');
+    }
+    // Cuenta de test con clave live (o al revés): hay que recrear, no dejar 502 genérico.
+    if (account.livemode !== expectLivemode()) throw fail(409, 'connect_account_mode_mismatch');
+    if (account.metadata?.supabase_owner_id !== owner.id || account.dashboard !== 'full' ||
       account.defaults?.responsibilities?.fees_collector !== 'stripe' ||
       account.defaults?.responsibilities?.losses_collector !== 'stripe') {
       throw fail(409, 'connect_account_binding_invalid');
@@ -100,9 +103,50 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
     if (!EU_COUNTRIES.has(country) || account.identity?.country !== country) throw fail(409, 'connect_country_mismatch');
     return account;
   };
+  const isMissingStripeAccount = (error) => {
+    if (!error || error.status) return false;
+    const code = String(error.code || '');
+    const message = String(error.message || '');
+    return code === 'resource_missing' || code === 'account_invalid'
+      || /no such account/i.test(message);
+  };
+  const isStaleConnectBinding = (error) =>
+    error?.code === 'connect_account_mode_mismatch' || isMissingStripeAccount(error);
+  const clearStaleConnectBinding = async (ownerId) => save(ownerId, {
+    stripe_connect_test_account_id: null,
+    stripe_connect_test_creation: null,
+    stripe_connect_test_country: null,
+    stripe_connect_test_terminal_location_id: null,
+    stripe_connect_test_platform_terminal_location_id: null,
+    stripe_connect_test_state_nonce: null,
+  });
   const retrieve = async (owner, accountId, country = boundCountry(owner)) => {
     if (!ACCOUNT_ID.test(accountId || '')) throw fail(409, 'connect_account_binding_invalid');
-    return checkAccount(await stripe().v2.core.accounts.retrieve(accountId, { include: INCLUDE }), owner, accountId, country);
+    let account;
+    try {
+      account = await stripe().v2.core.accounts.retrieve(accountId, { include: INCLUDE });
+    } catch (error) {
+      if (isMissingStripeAccount(error)) throw fail(409, 'connect_account_mode_mismatch');
+      throw error;
+    }
+    return checkAccount(account, owner, accountId, country);
+  };
+  /** Cuenta guardada usable, o null si había binding de otro modo (test↔live) y se limpió. */
+  const resolveStoredAccount = async (owner, country = boundCountry(owner)) => {
+    const accountId = owner.app_metadata?.stripe_connect_test_account_id;
+    if (accountId == null || accountId === '') return { owner, account: null };
+    if (!ACCOUNT_ID.test(accountId)) {
+      console.error('Stripe Connect: clearing invalid account id', String(accountId).slice(0, 24));
+      return { owner: await clearStaleConnectBinding(owner.id), account: null };
+    }
+    try {
+      return { owner, account: await retrieve(owner, accountId, country) };
+    } catch (error) {
+      if (!isStaleConnectBinding(error)) throw error;
+      console.error('Stripe Connect: clearing stale account binding', accountId, error?.code || '');
+      const cleared = await clearStaleConnectBinding(owner.id);
+      return { owner: cleared, account: null };
+    }
   };
   const summary = (isEnabled, account = null) => {
     const capabilities = account?.configuration?.merchant?.capabilities;
@@ -126,12 +170,17 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
     config();
     const actor = await freshActor(req);
     const owner = await ownerFor(actor);
-    const accountId = owner.app_metadata?.stripe_connect_test_account_id;
-    if (!ACCOUNT_ID.test(accountId || '')) throw fail(409, 'connect_not_connected');
-    const account = await retrieve(owner, accountId);
-    const status = summary(true, account);
+    const resolved = await resolveStoredAccount(owner);
+    if (!resolved.account) throw fail(409, 'connect_not_connected');
+    const status = summary(true, resolved.account);
     if (requireCharges && !status.chargesEnabled) throw fail(409, 'connect_charges_not_enabled');
-    return { accountId: account.id, stripe: stripe(), ownerId: owner.id, status, owner };
+    return {
+      accountId: resolved.account.id,
+      stripe: stripe(),
+      ownerId: resolved.owner.id,
+      status,
+      owner: resolved.owner,
+    };
   };
   // Dirección placeholder válida por país (Stripe valida CP; "00000" falla en ES).
   const terminalAddressFor = (country) => {
@@ -442,7 +491,7 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
     return { url: safeLink(link, account.id), expiresAt: link.expires_at };
   };
   const ensureAccount = async (owner, country) => {
-    const metadata = owner.app_metadata || {};
+    let metadata = owner.app_metadata || {};
     if ((metadata.stripe_connect_test_account_id || metadata.stripe_connect_test_creation) && boundCountry(owner) !== country) {
       throw fail(409, 'connect_country_mismatch');
     }
@@ -451,7 +500,12 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
     if (!approvedCountries.includes(country)) {
       throw fail(503, 'connect_country_not_approved');
     }
-    if (metadata.stripe_connect_test_account_id) return retrieve(owner, metadata.stripe_connect_test_account_id, country);
+    if (metadata.stripe_connect_test_account_id) {
+      const resolved = await resolveStoredAccount(owner, country);
+      owner = resolved.owner;
+      metadata = owner.app_metadata || {};
+      if (resolved.account) return resolved.account;
+    }
     let pending = metadata.stripe_connect_test_creation;
     if (!pending) {
       const name = owner.user_metadata?.full_name;
@@ -495,8 +549,14 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
       if (!trusted) {
         console.error('Stripe Connect upstream:', error?.type || '', error?.code || '', error?.message || error);
       }
-      return res.status(trusted ? error.status : 502).json({ ok: false,
-        code: trusted ? error.code : 'connect_upstream_unavailable', error: 'Stripe Connect test no disponible para esta solicitud.' });
+      const body = { ok: false,
+        code: trusted ? error.code : 'connect_upstream_unavailable',
+        error: 'Stripe Connect no disponible para esta solicitud.' };
+      // Código Stripe seguro (sin secretos) para diagnosticar en la app / logs.
+      if (!trusted && typeof error?.code === 'string' && /^[a-z0-9_]+$/i.test(error.code) && error.code.length < 80) {
+        body.stripeCode = error.code;
+      }
+      return res.status(trusted ? error.status : 502).json(body);
     }
   };
   return {
@@ -517,8 +577,8 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
         const currentActor = await freshActor(req);
         const currentOwner = await ownerFor(currentActor);
         if (currentOwner.id !== owner.id) throw fail(403, 'connect_company_invalid');
-        const accountId = currentOwner.app_metadata?.stripe_connect_test_account_id;
-        return res.json(summary(true, accountId ? await retrieve(currentOwner, accountId) : null));
+        const { account } = await resolveStoredAccount(currentOwner);
+        return res.json(summary(true, account));
       });
     }),
     onboarding: handle(async (req, res) => {
