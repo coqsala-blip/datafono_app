@@ -425,7 +425,6 @@ const [seatsPanelOpen, setSeatsPanelOpen] = useState(false);
     disconnectReader,
     easyConnect,
     retrievePaymentIntent,
-    collectPaymentMethod,
     processPaymentIntent,
   } = useStripeTerminal({
     onDidRequestReaderInput: (input) => {
@@ -2473,19 +2472,14 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         throw new Error(retrievedResult.error?.message || 'No se pudo preparar el cobro presencial.');
       }
 
+      // Un solo paso: el SDK pide acercar la tarjeta una vez y autoriza (sin collect + process).
       setTerminalMessage('tpv.contactlessHint');
-      const collectedResult = await collectPaymentMethod({
+      const processedResult = await processPaymentIntent({
         paymentIntent: retrievedResult.paymentIntent,
         customerCancellation: 'disableIfAvailable',
       });
-      if (collectedResult.error || !collectedResult.paymentIntent) {
-        throw new Error(collectedResult.error?.message || 'No se pudo leer la tarjeta o wallet.');
-      }
-
-      setTerminalMessage('common.checking');
-      const processedResult = await processPaymentIntent({ paymentIntent: collectedResult.paymentIntent });
       if (processedResult.error || !processedResult.paymentIntent) {
-        throw new Error(processedResult.error?.message || 'No se pudo confirmar el cobro presencial.');
+        throw new Error(processedResult.error?.message || 'No se pudo completar el cobro presencial.');
       }
       if (processedResult.paymentIntent.status !== 'succeeded') {
         throw new Error(`Stripe Terminal devolvió el estado ${processedResult.paymentIntent.status || 'desconocido'}.`);
