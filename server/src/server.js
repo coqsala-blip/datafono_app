@@ -76,24 +76,23 @@ const stripePaymentMethodTypes = stripeDynamicPaymentMethods
 const BIZUM_MIN_AMOUNT_CENTS = 50;
 const BIZUM_MAX_AMOUNT_CENTS = 500000;
 
-// QR/enlace: únicamente Bizum + equivalentes EU. Nunca card (tarjeta física/Tap to Pay van aparte).
+// QR/enlace: solo el método “app” del país del comercio (Bizum en ES, MB WAY en PT…). Nunca card.
+// No mezclar Bancontact/EPS en un comercio español: si Bizum no está activo, hay que activarlo en Stripe.
 const resolveCheckoutPaymentMethodTypes = (amountCents, country = null) => {
   const bizumOk = amountCents >= BIZUM_MIN_AMOUNT_CENTS && amountCents <= BIZUM_MAX_AMOUNT_CENTS;
   const countryLocals = (country && LOCAL_METHODS_BY_COUNTRY[country]) || [];
   if (stripeDynamicPaymentMethods) {
-    const locals = EUR_LOCAL_PAYMENT_METHODS.filter((method) => method !== 'bizum' || bizumOk);
-    const prioritized = [
-      ...countryLocals.filter((method) => locals.includes(method)),
-      ...locals.filter((method) => !countryLocals.includes(method)),
-    ];
-    return prioritized.length > 0 ? prioritized : (bizumOk ? ['bizum'] : ['mb_way', 'bancontact', 'ideal', 'eps', 'wero']);
+    if (countryLocals.length > 0) {
+      return countryLocals.filter((method) => method !== 'bizum' || bizumOk);
+    }
+    return EUR_LOCAL_PAYMENT_METHODS.filter((method) => method !== 'bizum' || bizumOk);
   }
   const eligible = stripePaymentMethodTypes.filter((method) => (
     method !== 'card'
     && EUR_LOCAL_PAYMENT_METHODS.includes(method)
     && (method !== 'bizum' || bizumOk)
   ));
-  return eligible.length > 0 ? eligible : ['bizum'];
+  return eligible.length > 0 ? eligible : (bizumOk ? ['bizum'] : ['mb_way']);
 };
 
 // Comprueba si el mensaje de error menciona a un método local europeo (por palabra completa,
@@ -1678,21 +1677,42 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
       : paymentMethodTypes;
     const methodsList = Array.isArray(sessionMethods) ? sessionMethods : [];
     const missingLocals = expectedLocalMethods.filter((method) => !methodsList.includes(method));
-    let localPaymentHint = null;
-    if (missingLocals.includes('bizum')) {
-      localPaymentHint = 'Bizum no está activo en la cuenta plataforma Stripe (Live). '
-        + 'Actívalo en Dashboard → Settings → Payment methods → Bizum → Turn on. '
-        + 'Sin eso el QR no puede ofrecer Bizum aunque el comercio esté en España.';
-    } else if (missingLocals.length > 0) {
-      localPaymentHint = `Métodos locales no activos en Stripe (${missingLocals.join(', ')}). `
-        + 'Actívalos en Dashboard → Settings → Payment methods (modo Live).';
+    // Comercio ES sin Bizum en la sesión: no servir un QR con Bancontact/MB WAY por error.
+    if (connectCountry === 'ES' && missingLocals.includes('bizum')) {
+      try {
+        if (session?.id) await connected.stripe.checkout.sessions.expire(session.id);
+      } catch {
+        // no bloquea
+      }
+      return res.status(502).json({
+        ok: false,
+        code: 'bizum_not_enabled',
+        error: 'Bizum no está activo en tu cuenta Stripe (modo Live). '
+          + 'Ábrelo aquí y pulsa Turn on: https://dashboard.stripe.com/settings/payment_methods '
+          + 'Hasta que Bizum figure como activo, el QR no puede ofrecer pago con Bizum.',
+        dashboardUrl: 'https://dashboard.stripe.com/settings/payment_methods',
+        paymentMethods: methodsList,
+      });
+    }
+    if (missingLocals.length > 0) {
+      try {
+        if (session?.id) await connected.stripe.checkout.sessions.expire(session.id);
+      } catch {
+        // no bloquea
+      }
+      return res.status(502).json({
+        ok: false,
+        code: 'local_payment_methods_unavailable',
+        error: `Falta activar ${missingLocals.join(', ')} en Stripe Live → Settings → Payment methods.`,
+        dashboardUrl: 'https://dashboard.stripe.com/settings/payment_methods',
+        paymentMethods: methodsList,
+      });
     }
     console.log('Checkout online creado:', {
       chargeMode,
       accountId: connected.accountId,
       paymentMethods: sessionMethods || 'auto',
       country: connectCountry,
-      missingLocals,
       amount,
     });
 
@@ -1706,18 +1726,29 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
       amount,
       accountId: connected?.accountId || null,
       chargeMode,
-      localPaymentHint,
       paymentIntentId: typeof session.payment_intent === 'string'
         ? session.payment_intent
         : (session.payment_intent?.id || null),
     });
   } catch (error) {
     console.error('Error creando pago Stripe:', error.message);
-    if (error?.code === 'local_payment_methods_unavailable') {
+    if (error?.code === 'local_payment_methods_unavailable' || error?.code === 'bizum_not_enabled') {
       return res.status(502).json({
         ok: false,
-        code: 'local_payment_methods_unavailable',
+        code: error.code,
         error: error.message,
+        dashboardUrl: 'https://dashboard.stripe.com/settings/payment_methods',
+      });
+    }
+    // Stripe rechaza bizum si la capacidad no está activa en la plataforma.
+    if (/bizum/i.test(String(error?.message || ''))) {
+      return res.status(502).json({
+        ok: false,
+        code: 'bizum_not_enabled',
+        error: 'Stripe no permite Bizum todavía en la cuenta plataforma (Live). '
+          + 'Actívalo en https://dashboard.stripe.com/settings/payment_methods (Bizum → Turn on). '
+          + `Detalle: ${error.message}`,
+        dashboardUrl: 'https://dashboard.stripe.com/settings/payment_methods',
       });
     }
     return res.status(502).json({ ok: false, error: `Stripe: ${error.message}` });

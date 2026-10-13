@@ -2586,6 +2586,9 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         if (result.code && ['connect_not_connected', 'connect_charges_not_enabled', 'connect_disabled', 'connect_test_disabled'].includes(result.code)) {
           throw new Error(result.error || tr(connectErrorKey(result)));
         }
+        if (result.code === 'bizum_not_enabled' || result.code === 'local_payment_methods_unavailable') {
+          throw new Error(result.error || 'Activa Bizum en Stripe Live → Settings → Payment methods.');
+        }
         throw new Error(result.error || `Stripe no devolvió un enlace de pago (HTTP ${response.status}).`);
       }
 
