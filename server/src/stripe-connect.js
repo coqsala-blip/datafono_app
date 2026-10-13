@@ -252,7 +252,17 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
     await save(owner.id, { stripe_connect_test_terminal_location_id: location.id });
     return location.id;
   };
-  // Solicita recipient/transfers (v2) + capacidades v1 (Bizum, transfers) en la cuenta conectada.
+  // Capacidades v1 locales por país (el comercio no toca el Dashboard: lo pide la app).
+  const localCapabilitiesForCountry = (country) => {
+    const caps = {};
+    if (country === 'ES') caps.bizum_payments = { requested: true };
+    if (country === 'BE') caps.bancontact_payments = { requested: true };
+    if (country === 'NL') caps.ideal_payments = { requested: true };
+    if (country === 'AT') caps.eps_payments = { requested: true };
+    if (country === 'PL') caps.blik_payments = { requested: true };
+    return caps;
+  };
+  // Solicita recipient/transfers (v2) + capacidades v1 (Bizum/locales, transfers) en la cuenta conectada.
   const ensureConnectedCapabilities = async (accountId, country) => {
     try {
       await stripe().v2.core.accounts.update(accountId, {
@@ -268,20 +278,18 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
     const capabilities = {
       card_payments: { requested: true },
       transfers: { requested: true },
+      ...localCapabilitiesForCountry(country),
     };
-    if (country === 'ES') capabilities.bizum_payments = { requested: true };
     try {
       await stripe().accounts.update(accountId, { capabilities });
     } catch (error) {
       console.warn('No se pudieron solicitar capacidades Connect v1:', error?.code || '', error?.message || error);
     }
   };
-  // Activa Bizum (y locales EU habituales) en la PMC por defecto de la cuenta Connect.
-  // Con cobros directos Stripe usa la PMC del comercio, no la de la plataforma.
+  // Activa Bizum / MB WAY / Bancontact… en la PMC de la cuenta conectada (QR con on_behalf_of).
   const ensureConnectedLocalPaymentMethods = async (accountId, country) => {
-    if (country !== 'ES' && country !== 'PT' && country !== 'BE' && country !== 'NL' && country !== 'AT' && country !== 'DE') {
-      return;
-    }
+    const supported = new Set(['ES', 'PT', 'BE', 'NL', 'AT', 'DE', 'FR', 'IT', 'PL']);
+    if (!supported.has(country)) return;
     await ensureConnectedCapabilities(accountId, country);
     try {
       const listed = await stripe().paymentMethodConfigurations.list({ limit: 10 }, { stripeAccount: accountId });
@@ -290,33 +298,24 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
         || items.find((item) => item?.active !== false)
         || items[0];
       if (!configuration?.id) return;
-      // Activar preferencias sin sustituir la lista dinámica de Checkout (Klarna, Revolut, etc.).
       const patch = {
         card: { display_preference: { preference: 'on' } },
-        klarna: { display_preference: { preference: 'on' } },
-        revolut_pay: { display_preference: { preference: 'on' } },
-        amazon_pay: { display_preference: { preference: 'on' } },
-        link: { display_preference: { preference: 'on' } },
       };
       if (country === 'ES') patch.bizum = { display_preference: { preference: 'on' } };
       if (country === 'PT') patch.mb_way = { display_preference: { preference: 'on' } };
       if (country === 'BE') patch.bancontact = { display_preference: { preference: 'on' } };
       if (country === 'NL') patch.ideal = { display_preference: { preference: 'on' } };
       if (country === 'AT') patch.eps = { display_preference: { preference: 'on' } };
-      if (['ES', 'PT', 'BE', 'NL', 'AT', 'DE'].includes(country)) {
+      if (country === 'PL') patch.blik = { display_preference: { preference: 'on' } };
+      if (['DE', 'FR', 'IT', 'ES', 'PT', 'BE', 'NL', 'AT'].includes(country)) {
         patch.wero = { display_preference: { preference: 'on' } };
-        patch.bancontact = patch.bancontact || { display_preference: { preference: 'on' } };
-        patch.ideal = patch.ideal || { display_preference: { preference: 'on' } };
-        patch.eps = patch.eps || { display_preference: { preference: 'on' } };
-        patch.pay_by_bank = { display_preference: { preference: 'on' } };
       }
       await stripe().paymentMethodConfigurations.update(configuration.id, patch, { stripeAccount: accountId });
     } catch (error) {
-      // No bloquea el cobro: Checkout puede seguir con tarjeta y otros métodos ya activos.
       console.warn('No se pudo activar métodos locales en la cuenta Connect:', error?.code || '', error?.message || error);
     }
   };
-  // Misma activación en la PMC de la plataforma Connect (Checkout destination / sin Stripe-Account).
+  // PMC de la plataforma (respaldo; el QR usa on_behalf_of → PMC del comercio).
   const ensurePlatformLocalPaymentMethods = async (country) => {
     try {
       try {
@@ -325,7 +324,7 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
           await stripe().accounts.update(platform.id, {
             capabilities: {
               card_payments: { requested: true },
-              ...(country === 'ES' ? { bizum_payments: { requested: true } } : {}),
+              ...localCapabilitiesForCountry(country),
             },
           });
         }
@@ -340,18 +339,14 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
       if (!configuration?.id) return;
       const patch = {
         card: { display_preference: { preference: 'on' } },
-        klarna: { display_preference: { preference: 'on' } },
-        revolut_pay: { display_preference: { preference: 'on' } },
-        amazon_pay: { display_preference: { preference: 'on' } },
-        link: { display_preference: { preference: 'on' } },
         wero: { display_preference: { preference: 'on' } },
         bancontact: { display_preference: { preference: 'on' } },
         ideal: { display_preference: { preference: 'on' } },
         eps: { display_preference: { preference: 'on' } },
-        pay_by_bank: { display_preference: { preference: 'on' } },
       };
       if (country === 'ES') patch.bizum = { display_preference: { preference: 'on' } };
       if (country === 'PT') patch.mb_way = { display_preference: { preference: 'on' } };
+      if (country === 'PL') patch.blik = { display_preference: { preference: 'on' } };
       const updated = await stripe().paymentMethodConfigurations.update(configuration.id, patch);
       if (country === 'ES') {
         console.log('PMC plataforma Bizum:', {
@@ -573,6 +568,12 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
       include: INCLUDE,
     }, { idempotencyKey }), owner, undefined, country);
     await save(owner.id, { stripe_connect_test_account_id: account.id, stripe_connect_test_country: country, stripe_connect_test_creation: null });
+    // Pedir Bizum/locales en cuanto existe la cuenta (sin que el comercio entre al Dashboard).
+    try {
+      await ensureConnectedLocalPaymentMethods(account.id, country);
+    } catch (localError) {
+      console.warn('Métodos locales tras crear cuenta Connect:', localError?.message || localError);
+    }
     return account;
   };
   const sanitizeUpstreamHint = (error) => {
@@ -658,7 +659,15 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
       const state = readState(req.query?.state);
       return withAccountLock(state.owner, async () => {
         const owner = await stateOwner(state);
-        await retrieve(owner, owner.app_metadata?.stripe_connect_test_account_id);
+        const accountId = owner.app_metadata?.stripe_connect_test_account_id;
+        await retrieve(owner, accountId);
+        if (typeof accountId === 'string' && ACCOUNT_ID.test(accountId)) {
+          try {
+            await ensureConnectedLocalPaymentMethods(accountId, boundCountry(owner) || state.country);
+          } catch (localError) {
+            console.warn('Métodos locales tras return Connect:', localError?.message || localError);
+          }
+        }
         await save(owner.id, { stripe_connect_test_state_nonce: null });
         return res.redirect('tpvapp://pago-completado?connect=return');
       });

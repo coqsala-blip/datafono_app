@@ -2608,22 +2608,11 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       const offeredMethods = Array.isArray(result.paymentMethods) && result.paymentMethods.length > 0
         ? result.paymentMethods.join(', ')
         : '';
-      const modeHint = result.chargeMode === 'direct'
-        ? ' Cobro directo a tu cuenta Connect.'
-        : result.chargeMode === 'destination'
-          ? ' Cobro destination (métodos de la plataforma Connect, incl. Bizum si está activo).'
-          : '';
-      const localHint = typeof result.localPaymentHint === 'string' && result.localPaymentHint.trim()
-        ? ` ${result.localPaymentHint.trim()}`
-        : '';
       setOnlinePaymentMessage(
         offeredMethods
-          ? `Muestra el QR al cliente o abre el enlace de pago. Métodos en este cobro: ${offeredMethods}.${modeHint}${localHint}`
-          : `Muestra el QR al cliente o abre el enlace de pago. Stripe mostrará los métodos activados (tarjeta, Bizum...).${modeHint}${localHint}`,
+          ? `Muestra el QR al cliente o abre el enlace. Métodos: ${offeredMethods}.`
+          : 'Muestra el QR al cliente o abre el enlace de pago (Bizum u otro método local según el país).',
       );
-      if (localHint) {
-        Alert.alert('Métodos de pago', result.localPaymentHint!.trim());
-      }
       // Persistir el cobro pendiente: al volver del navegador la app puede remontarse y
       // perder el estado en memoria; asi se reanuda la comprobacion automaticamente.
       try {

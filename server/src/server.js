@@ -53,8 +53,8 @@ const stripeCurrency = 'eur';
 const SUBSCRIPTION_LOCK_DAYS = 3;
 const SUBSCRIPTION_PAST_DUE_STATES = new Set(['past_due', 'unpaid']);
 
-// Solo métodos “app” tipo Bizum (sin tarjeta ni Klarna): el QR/enlace es para pagar con el banco/app.
-const EUR_LOCAL_PAYMENT_METHODS = ['bizum', 'mb_way', 'bancontact', 'eps', 'ideal', 'wero'];
+// Solo métodos “app” tipo Bizum (sin tarjeta): el QR/enlace es para pagar con el banco/app.
+const EUR_LOCAL_PAYMENT_METHODS = ['bizum', 'mb_way', 'bancontact', 'eps', 'ideal', 'wero', 'blik'];
 // País del comercio → método local prioritario (equivalente a Bizum en otros países EUR).
 const LOCAL_METHODS_BY_COUNTRY = {
   ES: ['bizum'],
@@ -65,6 +65,7 @@ const LOCAL_METHODS_BY_COUNTRY = {
   DE: ['wero'],
   FR: ['wero'],
   IT: ['wero'],
+  PL: ['blik'],
 };
 const stripePaymentMethodTypesSetting = String(process.env.STRIPE_PAYMENT_METHOD_TYPES || 'auto').trim().toLowerCase();
 const stripeDynamicPaymentMethods = stripePaymentMethodTypesSetting === '' || stripePaymentMethodTypesSetting === 'auto';
@@ -120,9 +121,10 @@ const PAYMENT_METHOD_CONFIGURATION_TTL_MS = 10 * 60 * 1000;
 // OJO: en la API de Stripe el campo se llama 'is_default' (no 'default'): al buscarlo mal se
 // cogia la primera configuracion de la lista, que puede NO ser la que aplica el Checkout; en ese
 // caso activar un metodo (Bizum) no surtia ningun efecto en el cobro.
-const readDefaultPaymentMethodConfiguration = async (stripeClient = null) => {
+const readDefaultPaymentMethodConfiguration = async (stripeClient = null, stripeAccount = null) => {
   const client = stripeClient || requireStripe();
-  const configurations = await client.paymentMethodConfigurations.list({ limit: 10 });
+  const requestOptions = stripeAccount ? { stripeAccount } : {};
+  const configurations = await client.paymentMethodConfigurations.list({ limit: 10 }, requestOptions);
   const items = Array.isArray(configurations?.data) ? configurations.data : [];
   return items.find((item) => item?.is_default === true)
     || items.find((item) => item?.active !== false)
@@ -130,53 +132,53 @@ const readDefaultPaymentMethodConfiguration = async (stripeClient = null) => {
     || null;
 };
 
-const getPaymentMethodConfiguration = async (stripeClient = null) => {
-  // Con cliente Connect no reutilizar caché de billing: pueden ser cuentas distintas.
-  if (!stripeClient) {
+const getPaymentMethodConfiguration = async (stripeClient = null, stripeAccount = null) => {
+  // PMC de cuenta conectada o cliente Connect: no reutilizar caché de billing.
+  if (!stripeClient && !stripeAccount) {
     const now = Date.now();
     if (cachedPaymentMethodConfiguration && now - cachedPaymentMethodConfigurationAt < PAYMENT_METHOD_CONFIGURATION_TTL_MS) {
       return cachedPaymentMethodConfiguration;
     }
   }
   try {
-    const configuration = await readDefaultPaymentMethodConfiguration(stripeClient);
-    if (!stripeClient) {
+    const configuration = await readDefaultPaymentMethodConfiguration(stripeClient, stripeAccount);
+    if (!stripeClient && !stripeAccount) {
       cachedPaymentMethodConfiguration = configuration;
       cachedPaymentMethodConfigurationAt = Date.now();
     }
     return configuration;
   } catch (error) {
-    // Sin configuración no se prefiltra: la lista pedida pasa tal cual y filtran los reintentos.
     console.warn('No se pudo leer la configuración de métodos de pago de Stripe:', error.message);
   }
-  return stripeClient ? null : cachedPaymentMethodConfiguration;
+  return (stripeClient || stripeAccount) ? null : cachedPaymentMethodConfiguration;
 };
 
 // Deja métodos que Stripe no marca como no disponibles. Sin inyectar card: el QR es solo apps locales.
-const filterAvailablePaymentMethods = async (paymentMethodTypes, stripeClient = null) => {
+const filterAvailablePaymentMethods = async (paymentMethodTypes, stripeClient = null, stripeAccount = null) => {
   if (!Array.isArray(paymentMethodTypes)) return paymentMethodTypes;
-  const configuration = await getPaymentMethodConfiguration(stripeClient);
+  const configuration = await getPaymentMethodConfiguration(stripeClient, stripeAccount);
   if (!configuration) return paymentMethodTypes;
   return paymentMethodTypes.filter((method) => configuration[method]?.available !== false);
 };
 
-// Crea la sesión de Checkout solo con métodos locales (Bizum, MB WAY…). Si Stripe rechaza uno,
-// se retira y se reintenta. Nunca se añade card como comodín.
-// options.stripeAccount: cobro directo en cuenta Connect (Stripe-Account).
+const LOCAL_METHODS_MERCHANT_HINT = 'El pago con app bancaria (Bizum u otro según tu país) aún se está activando en tu cuenta. '
+  + 'Completa el alta de cobros en la app y vuelve a intentarlo en unos minutos.';
+
+// Crea Checkout solo con métodos locales. options.stripeAccount = cobro directo.
+// options.filterStripeAccount = PMC de la cuenta conectada (destination + on_behalf_of).
 const createCheckoutSessionWithLocalMethodsFallback = async (params, requestedPaymentMethodTypes, options = {}) => {
   const stripeClient = options.stripeClient || requireStripe();
   const requestOptions = options.stripeAccount ? { stripeAccount: options.stripeAccount } : {};
-  let currentTypes = options.stripeAccount
+  const filterAccount = options.filterStripeAccount || options.stripeAccount || null;
+  let currentTypes = options.stripeAccount && !options.filterStripeAccount
     ? (Array.isArray(requestedPaymentMethodTypes) ? [...requestedPaymentMethodTypes] : requestedPaymentMethodTypes)
     : await filterAvailablePaymentMethods(
       Array.isArray(requestedPaymentMethodTypes) ? [...requestedPaymentMethodTypes] : requestedPaymentMethodTypes,
       stripeClient,
+      filterAccount,
     );
   if (Array.isArray(currentTypes) && currentTypes.length === 0) {
-    const err = new Error(
-      'Ningún método local (Bizum, MB WAY, Bancontact, iDEAL, EPS, Wero) está activo en Stripe Live. '
-      + 'Activa al menos Bizum en Dashboard → Settings → Payment methods.',
-    );
+    const err = new Error(LOCAL_METHODS_MERCHANT_HINT);
     err.code = 'local_payment_methods_unavailable';
     throw err;
   }
@@ -206,10 +208,7 @@ const createCheckoutSessionWithLocalMethodsFallback = async (params, requestedPa
       const toRemove = mentioned || [...currentTypes].reverse().find((method) => EUR_LOCAL_PAYMENT_METHODS.includes(method));
       currentTypes = currentTypes.filter((method) => method !== toRemove);
       if (currentTypes.length === 0) {
-        const err = new Error(
-          'Stripe rechazó todos los métodos locales. Activa Bizum (ES) u otros (MB WAY, Bancontact, iDEAL, EPS, Wero) '
-          + 'en Dashboard Live → Settings → Payment methods.',
-        );
+        const err = new Error(LOCAL_METHODS_MERCHANT_HINT);
         err.code = 'local_payment_methods_unavailable';
         throw err;
       }
@@ -1580,16 +1579,14 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
   }
 
   try {
-    // Connect online: destination SIN on_behalf_of → la PMC es la de la plataforma (Bizum).
-    // Con on_behalf_of Stripe usaría la PMC de la cuenta conectada, donde Bizum suele no estar.
-    // Si Stripe rechaza destination (falta transfers), fallback a cobro directo.
+    // QR locales: destination + on_behalf_of → PMC del comercio (Bizum pedido por API al alta).
+    // Si falta transfers, fallback a cobro directo en la cuenta conectada.
     const ownerId = connected.ownerId || req.user.app_metadata?.company_owner_id || req.user.id;
     const connectCountry = typeof stripeConnect.boundCountry === 'function'
       ? stripeConnect.boundCountry(connected.owner)
       : (connected.owner?.app_metadata?.stripe_connect_test_country || 'ES');
     await stripeConnect.ensureConnectedLocalPaymentMethods(connected.accountId, connectCountry);
     await stripeConnect.ensurePlatformLocalPaymentMethods(connectCountry);
-    // Tras activar Bizum en la PMC de plataforma, invalidar caché del filtro de métodos.
     cachedPaymentMethodConfiguration = null;
     cachedPaymentMethodConfigurationAt = 0;
     const requestedPaymentMethodTypes = resolveCheckoutPaymentMethodTypes(amount, connectCountry);
@@ -1607,15 +1604,15 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
     const buildCheckoutParams = (chargeMode) => ({
       mode: 'payment',
       ...(requestedPaymentMethodTypes ? { payment_method_types: requestedPaymentMethodTypes } : {}),
-      // Locale del país del comercio: ayuda a que Checkout priorice métodos locales (Bizum en ES…).
       ...(connectCountry === 'ES' ? { locale: 'es' }
         : connectCountry === 'PT' ? { locale: 'pt' }
           : connectCountry === 'FR' ? { locale: 'fr' }
             : connectCountry === 'DE' ? { locale: 'de' }
               : connectCountry === 'IT' ? { locale: 'it' }
                 : connectCountry === 'NL' ? { locale: 'nl' }
-                  : connectCountry === 'BE' ? { locale: 'fr' }
-                    : {}),
+                  : connectCountry === 'PL' ? { locale: 'pl' }
+                    : connectCountry === 'BE' ? { locale: 'fr' }
+                      : {}),
       line_items: baseLineItems,
       metadata: {
         supabase_user_id: ownerId,
@@ -1625,10 +1622,10 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
         charge_mode: chargeMode,
       },
       payment_intent_data: {
-        // Solo transfer_data: el cobro vive en la plataforma Connect (su PMC, con Bizum).
-        // No usar on_behalf_of aquí: cambiaría la PMC a la cuenta conectada.
         ...(chargeMode === 'destination' ? {
           transfer_data: { destination: connected.accountId },
+          // PMC del comercio: Bizum/MB WAY se activan por API sin Dashboard del cliente.
+          on_behalf_of: connected.accountId,
         } : {}),
         metadata: {
           supabase_user_id: ownerId,
@@ -1655,7 +1652,7 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
       ({ session, paymentMethodTypes } = await createCheckoutSessionWithLocalMethodsFallback(
         buildCheckoutParams(chargeMode),
         requestedPaymentMethodTypes,
-        { stripeClient: connected.stripe },
+        { stripeClient: connected.stripe, filterStripeAccount: connected.accountId },
       ));
     } catch (destinationError) {
       if (!isDestinationCapabilityError(destinationError)) throw destinationError;
@@ -1677,23 +1674,6 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
       : paymentMethodTypes;
     const methodsList = Array.isArray(sessionMethods) ? sessionMethods : [];
     const missingLocals = expectedLocalMethods.filter((method) => !methodsList.includes(method));
-    // Comercio ES sin Bizum en la sesión: no servir un QR con Bancontact/MB WAY por error.
-    if (connectCountry === 'ES' && missingLocals.includes('bizum')) {
-      try {
-        if (session?.id) await connected.stripe.checkout.sessions.expire(session.id);
-      } catch {
-        // no bloquea
-      }
-      return res.status(502).json({
-        ok: false,
-        code: 'bizum_not_enabled',
-        error: 'Bizum no está activo en tu cuenta Stripe (modo Live). '
-          + 'Ábrelo aquí y pulsa Turn on: https://dashboard.stripe.com/settings/payment_methods '
-          + 'Hasta que Bizum figure como activo, el QR no puede ofrecer pago con Bizum.',
-        dashboardUrl: 'https://dashboard.stripe.com/settings/payment_methods',
-        paymentMethods: methodsList,
-      });
-    }
     if (missingLocals.length > 0) {
       try {
         if (session?.id) await connected.stripe.checkout.sessions.expire(session.id);
@@ -1702,9 +1682,8 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
       }
       return res.status(502).json({
         ok: false,
-        code: 'local_payment_methods_unavailable',
-        error: `Falta activar ${missingLocals.join(', ')} en Stripe Live → Settings → Payment methods.`,
-        dashboardUrl: 'https://dashboard.stripe.com/settings/payment_methods',
+        code: connectCountry === 'ES' ? 'bizum_not_enabled' : 'local_payment_methods_unavailable',
+        error: LOCAL_METHODS_MERCHANT_HINT,
         paymentMethods: methodsList,
       });
     }
@@ -1713,6 +1692,7 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
       accountId: connected.accountId,
       paymentMethods: sessionMethods || 'auto',
       country: connectCountry,
+      onBehalfOf: chargeMode === 'destination',
       amount,
     });
 
@@ -1736,19 +1716,14 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
       return res.status(502).json({
         ok: false,
         code: error.code,
-        error: error.message,
-        dashboardUrl: 'https://dashboard.stripe.com/settings/payment_methods',
+        error: LOCAL_METHODS_MERCHANT_HINT,
       });
     }
-    // Stripe rechaza bizum si la capacidad no está activa en la plataforma.
-    if (/bizum/i.test(String(error?.message || ''))) {
+    if (/bizum|mb_way|bancontact|ideal|eps|wero|blik/i.test(String(error?.message || ''))) {
       return res.status(502).json({
         ok: false,
-        code: 'bizum_not_enabled',
-        error: 'Stripe no permite Bizum todavía en la cuenta plataforma (Live). '
-          + 'Actívalo en https://dashboard.stripe.com/settings/payment_methods (Bizum → Turn on). '
-          + `Detalle: ${error.message}`,
-        dashboardUrl: 'https://dashboard.stripe.com/settings/payment_methods',
+        code: 'local_payment_methods_unavailable',
+        error: LOCAL_METHODS_MERCHANT_HINT,
       });
     }
     return res.status(502).json({ ok: false, error: `Stripe: ${error.message}` });

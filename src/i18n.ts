@@ -101,7 +101,7 @@ const es: Dict = {
   'pay.notConfirmed': 'No se pudo comprobar el pago.',
   'pay.newLink': 'Generar enlace y QR de pago',
   'pay.waitTitle': 'Esperando el pago del cliente...',
-  'pay.waitBody': 'El cliente escanea el QR y elige su método (tarjeta, Bizum, MB WAY, Bancontact, iDEAL, EPS o Wero, según su país). El ticket con su QR aparece solo al confirmarse.',
+  'pay.waitBody': 'El cliente escanea el QR y paga con Bizum (o MB WAY, Bancontact, iDEAL, EPS, Wero o BLIK según el país). Sin formulario de tarjeta. El ticket aparece al confirmarse.',
   'pay.noQr': 'Todavía no hay QR. Pulsa "Generar enlace y QR de pago".',
   'pay.checkError': 'El servidor no devolvió un enlace de pago.',
   'pay.maxAmount': 'El importe supera el máximo permitido para el cobro online.',
