@@ -2587,7 +2587,10 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
           throw new Error(result.error || tr(connectErrorKey(result)));
         }
         if (result.code === 'bizum_not_enabled' || result.code === 'local_payment_methods_unavailable') {
-          throw new Error(result.error || 'Activa Bizum en Stripe Live → Settings → Payment methods.');
+          const detail = typeof (result as { detail?: string }).detail === 'string'
+            ? ` ${(result as { detail?: string }).detail}`
+            : '';
+          throw new Error((result.error || 'No se pudo preparar el pago con Bizum.') + detail);
         }
         throw new Error(result.error || `Stripe no devolvió un enlace de pago (HTTP ${response.status}).`);
       }
@@ -3743,14 +3746,40 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       const response = await fetchWithTimeout(`${configuredDocumentApiUrl}/api/documents/refund`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
-        body: JSON.stringify({ documentId: original.id, amount: refundVal, ...(userRole === 'empleado' ? { pin: pin?.trim() } : {}) }),
-      }, 15000);
-      const result = await response.json() as { ok?: boolean; document?: Transaction; error?: string };
+        body: JSON.stringify({
+          documentId: original.id,
+          amount: refundVal,
+          ...(userRole === 'empleado' ? { pin: pin?.trim() } : {}),
+          // Si la nube publicó el ticket sin PI, el móvil aún puede tenerlo tras el cobro Terminal.
+          ...(typeof original.stripePaymentIntentId === 'string' ? { stripePaymentIntentId: original.stripePaymentIntentId } : {}),
+          ...(typeof original.stripeAccountId === 'string' ? { stripeAccountId: original.stripeAccountId } : {}),
+          ...(original.chargeMode === 'direct' || original.chargeMode === 'destination' || original.chargeMode === 'platform'
+            ? { chargeMode: original.chargeMode } : {}),
+        }),
+      }, 20000);
+      const result = await response.json() as {
+        ok?: boolean;
+        document?: Transaction;
+        error?: string;
+        code?: string;
+        detail?: string;
+      };
       if (cacheGenerationRef.current !== generation) return false;
       if (!response.ok || !result.ok || !result.document || result.document.id !== targetTicket.id || !result.document.publicUrl || !Number.isFinite(result.document.amount)) {
-        throw new Error(result.error || 'El servidor no confirmó la devolución.');
+        const detail = typeof result.detail === 'string' && result.detail.trim() ? ` ${result.detail.trim()}` : '';
+        throw new Error((result.error || 'El servidor no confirmó la devolución.') + detail);
       }
       const updatedTicket = result.document;
+      const method = String(original.method || updatedTicket.method || '').toLowerCase();
+      const isStripeSale = Boolean(original.stripePaymentIntentId)
+        || method.includes('stripe')
+        || method.includes('terminal')
+        || method.includes('contactless')
+        || method.includes('bizum');
+      const lastRefund = updatedTicket.refundHistory?.[updatedTicket.refundHistory.length - 1];
+      if (isStripeSale && !lastRefund?.stripeRefundId) {
+        throw new Error('La devolución no se registró en Stripe. No se ha confirmado el reembolso del dinero.');
+      }
       setTransactions((current) => current.map((transaction) => transaction.id === targetTicket.id ? updatedTicket : transaction));
       setSelectedTicket(updatedTicket);
       return true;

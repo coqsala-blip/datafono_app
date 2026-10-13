@@ -161,28 +161,27 @@ const filterAvailablePaymentMethods = async (paymentMethodTypes, stripeClient = 
   return paymentMethodTypes.filter((method) => configuration[method]?.available !== false);
 };
 
-const LOCAL_METHODS_MERCHANT_HINT = 'El pago con app bancaria (Bizum u otro según tu país) aún se está activando en tu cuenta. '
-  + 'Completa el alta de cobros en la app y vuelve a intentarlo en unos minutos.';
+// Mensaje al comercio: no le pide entrar al Dashboard (Bizum lo gestiona la plataforma / la app).
+const LOCAL_METHODS_MERCHANT_HINT = 'No se pudo preparar el pago con Bizum (u otro método local). '
+  + 'Vuelve a intentarlo. Si el cobro con tarjeta presencial funciona y esto sigue fallando, contacta con soporte.';
 
-// Crea Checkout solo con métodos locales. options.stripeAccount = cobro directo.
-// options.filterStripeAccount = PMC de la cuenta conectada (destination + on_behalf_of).
+// Crea Checkout solo con métodos locales. Sin prefiltrar PMC: se intenta crear y Stripe decide.
+// options.stripeAccount = cobro directo en cuenta Connect.
 const createCheckoutSessionWithLocalMethodsFallback = async (params, requestedPaymentMethodTypes, options = {}) => {
   const stripeClient = options.stripeClient || requireStripe();
   const requestOptions = options.stripeAccount ? { stripeAccount: options.stripeAccount } : {};
-  const filterAccount = options.filterStripeAccount || options.stripeAccount || null;
-  let currentTypes = options.stripeAccount && !options.filterStripeAccount
-    ? (Array.isArray(requestedPaymentMethodTypes) ? [...requestedPaymentMethodTypes] : requestedPaymentMethodTypes)
-    : await filterAvailablePaymentMethods(
-      Array.isArray(requestedPaymentMethodTypes) ? [...requestedPaymentMethodTypes] : requestedPaymentMethodTypes,
-      stripeClient,
-      filterAccount,
-    );
+  // No filtrar antes: el prefiltro marcaba Bizum como no disponible en cuentas Connect v2
+  // aunque la plataforma sí pueda ofrecer Bizum en destination.
+  let currentTypes = Array.isArray(requestedPaymentMethodTypes)
+    ? [...requestedPaymentMethodTypes]
+    : requestedPaymentMethodTypes;
   if (Array.isArray(currentTypes) && currentTypes.length === 0) {
     const err = new Error(LOCAL_METHODS_MERCHANT_HINT);
     err.code = 'local_payment_methods_unavailable';
     throw err;
   }
   let removalsLeft = EUR_LOCAL_PAYMENT_METHODS.length;
+  let lastError = null;
 
   for (;;) {
     try {
@@ -197,6 +196,7 @@ const createCheckoutSessionWithLocalMethodsFallback = async (params, requestedPa
           : null);
       return { session, paymentMethodTypes: resolvedTypes };
     } catch (error) {
+      lastError = error;
       const requestedLocal = Array.isArray(currentTypes) && currentTypes.some((method) => EUR_LOCAL_PAYMENT_METHODS.includes(method));
       if (!requestedLocal || removalsLeft <= 0 || !isLocalPaymentMethodUnavailableError(error)) {
         throw error;
@@ -208,8 +208,10 @@ const createCheckoutSessionWithLocalMethodsFallback = async (params, requestedPa
       const toRemove = mentioned || [...currentTypes].reverse().find((method) => EUR_LOCAL_PAYMENT_METHODS.includes(method));
       currentTypes = currentTypes.filter((method) => method !== toRemove);
       if (currentTypes.length === 0) {
-        const err = new Error(LOCAL_METHODS_MERCHANT_HINT);
+        const detail = typeof lastError?.message === 'string' ? lastError.message.slice(0, 180) : '';
+        const err = new Error(detail ? `${LOCAL_METHODS_MERCHANT_HINT} (${detail})` : LOCAL_METHODS_MERCHANT_HINT);
         err.code = 'local_payment_methods_unavailable';
+        err.detail = detail;
         throw err;
       }
       console.warn(`Método ${toRemove} no disponible en Stripe. Se reintenta con:`, currentTypes.join(', '));
@@ -1579,8 +1581,10 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
   }
 
   try {
-    // QR locales: destination + on_behalf_of → PMC del comercio (Bizum pedido por API al alta).
-    // Si falta transfers, fallback a cobro directo en la cuenta conectada.
+    // QR locales: destination SIN on_behalf_of → PMC de la plataforma.
+    // Bizum en Connect suele exigir cuentas v1; las cuentas de la app son v2, así que
+    // on_behalf_of (PMC del comercio) no sirve para Bizum. El dinero sigue yendo al comercio
+    // con transfer_data.destination.
     const ownerId = connected.ownerId || req.user.app_metadata?.company_owner_id || req.user.id;
     const connectCountry = typeof stripeConnect.boundCountry === 'function'
       ? stripeConnect.boundCountry(connected.owner)
@@ -1624,8 +1628,6 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
       payment_intent_data: {
         ...(chargeMode === 'destination' ? {
           transfer_data: { destination: connected.accountId },
-          // PMC del comercio: Bizum/MB WAY se activan por API sin Dashboard del cliente.
-          on_behalf_of: connected.accountId,
         } : {}),
         metadata: {
           supabase_user_id: ownerId,
@@ -1652,7 +1654,7 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
       ({ session, paymentMethodTypes } = await createCheckoutSessionWithLocalMethodsFallback(
         buildCheckoutParams(chargeMode),
         requestedPaymentMethodTypes,
-        { stripeClient: connected.stripe, filterStripeAccount: connected.accountId },
+        { stripeClient: connected.stripe },
       ));
     } catch (destinationError) {
       if (!isDestinationCapabilityError(destinationError)) throw destinationError;
@@ -1692,7 +1694,6 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
       accountId: connected.accountId,
       paymentMethods: sessionMethods || 'auto',
       country: connectCountry,
-      onBehalfOf: chargeMode === 'destination',
       amount,
     });
 
@@ -1716,14 +1717,16 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
       return res.status(502).json({
         ok: false,
         code: error.code,
-        error: LOCAL_METHODS_MERCHANT_HINT,
+        error: error.message || LOCAL_METHODS_MERCHANT_HINT,
+        ...(error.detail ? { detail: error.detail } : {}),
       });
     }
     if (/bizum|mb_way|bancontact|ideal|eps|wero|blik/i.test(String(error?.message || ''))) {
       return res.status(502).json({
         ok: false,
         code: 'local_payment_methods_unavailable',
-        error: LOCAL_METHODS_MERCHANT_HINT,
+        error: `${LOCAL_METHODS_MERCHANT_HINT} (${String(error.message).slice(0, 160)})`,
+        detail: String(error.message).slice(0, 220),
       });
     }
     return res.status(502).json({ ok: false, error: `Stripe: ${error.message}` });
@@ -2540,23 +2543,43 @@ const refundMoneyCents = (amount) => {
 const validStripePaymentIntentId = (value) => typeof value === 'string' && /^pi_[A-Za-z0-9]+$/.test(value);
 const validStripeAccountId = (value) => typeof value === 'string' && /^acct_[A-Za-z0-9]+$/.test(value);
 
-// Reembolso de dinero en Stripe cuando el ticket guarda un PaymentIntent. Sin PI: solo documental.
+// Cobros Stripe (Terminal / enlace / QR): deben reembolsarse en Stripe, no solo en el ticket.
+const isStripeMoneyDocument = (document) => {
+  if (validStripePaymentIntentId(document?.stripePaymentIntentId)) return true;
+  const method = String(document?.method || '').toLowerCase();
+  return method.includes('stripe')
+    || method.includes('terminal')
+    || method.includes('contactless')
+    || method.includes('bizum')
+    || method.includes('tap to pay');
+};
+
+// Reembolso de dinero en Stripe. Sin PI en un cobro Stripe → error (nunca silencioso).
+// Efectivo / sin Stripe → solo documental.
 const createStripeMoneyRefund = async (document, requestedCents, historyLength) => {
   if (!validStripePaymentIntentId(document.stripePaymentIntentId)) {
+    if (isStripeMoneyDocument(document)) {
+      throw Object.assign(new Error('missing_payment_intent'), {
+        status: 409,
+        code: 'missing_payment_intent',
+      });
+    }
     return { stripeRefundId: null, stripeRefundStatus: null };
   }
   const connectClient = createConnectStripeClient(process.env);
   const direct = document.chargeMode === 'direct' && validStripeAccountId(document.stripeAccountId);
-  const destination = document.chargeMode === 'destination' && validStripeAccountId(document.stripeAccountId);
+  // Terminal/Checkout Connect: destination (con o sin on_behalf_of) vive en la clave Connect.
+  const useConnect = direct
+    || document.chargeMode === 'destination'
+    || document.chargeMode === 'platform'
+    || !document.chargeMode;
   let stripeClient;
   let requestOptions = {};
   if (direct) {
     if (!connectClient) throw Object.assign(new Error('connect_refund_client_unavailable'), { status: 503, code: 'connect_refund_client_unavailable' });
     stripeClient = connectClient;
     requestOptions = { stripeAccount: document.stripeAccountId };
-  } else if (destination) {
-    // Cobro destination: PI en la plataforma Connect (misma clave que creó el Checkout).
-    if (!connectClient) throw Object.assign(new Error('connect_refund_client_unavailable'), { status: 503, code: 'connect_refund_client_unavailable' });
+  } else if (useConnect && connectClient) {
     stripeClient = connectClient;
   } else {
     stripeClient = requireStripe();
@@ -2574,15 +2597,18 @@ const createStripeMoneyRefund = async (document, requestedCents, historyLength) 
     ...requestOptions,
     idempotencyKey: `doc-refund-${document.id}-${historyLength}-${requestedCents}`,
   });
+  if (!refund?.id) {
+    throw Object.assign(new Error('stripe_refund_missing_id'), { status: 502, code: 'stripe_refund_failed' });
+  }
   return {
-    stripeRefundId: typeof refund?.id === 'string' ? refund.id : null,
+    stripeRefundId: String(refund.id),
     stripeRefundStatus: typeof refund?.status === 'string' ? refund.status : null,
   };
 };
 
 app.post('/api/documents/refund', requireAuth, async (req, res) => {
   try {
-    const { documentId, amount, pin } = req.body || {};
+    const { documentId, amount, pin, stripePaymentIntentId, stripeAccountId, chargeMode } = req.body || {};
     const requestedCents = refundMoneyCents(amount);
     if (typeof documentId !== 'string' || !documentId.trim() || requestedCents === null || requestedCents <= 0) {
       return res.status(400).json({ ok: false, error: 'Se requiere documentId e importe positivo con hasta dos decimales.' });
@@ -2606,9 +2632,19 @@ app.post('/api/documents/refund', requireAuth, async (req, res) => {
         .order('created_at', { ascending: false })
         .limit(1);
       if (error) return res.status(500).json({ ok: false, error: 'No se pudo leer el documento.' });
-      const document = data?.[0]?.document_data;
-      if (!document) return res.status(404).json({ ok: false, error: 'Documento no encontrado.' });
-      if (document.type !== 'COBRO') return res.status(409).json({ ok: false, error: 'Solo se pueden devolver cobros originales.' });
+      const stored = data?.[0]?.document_data;
+      if (!stored) return res.status(404).json({ ok: false, error: 'Documento no encontrado.' });
+      if (stored.type !== 'COBRO') return res.status(409).json({ ok: false, error: 'Solo se pueden devolver cobros originales.' });
+      // Recuperar PI/cuenta desde el móvil si el documento en nube se publicó sin ellos.
+      const document = {
+        ...stored,
+        ...(validStripePaymentIntentId(stripePaymentIntentId) && !validStripePaymentIntentId(stored.stripePaymentIntentId)
+          ? { stripePaymentIntentId } : {}),
+        ...(validStripeAccountId(stripeAccountId) && !validStripeAccountId(stored.stripeAccountId)
+          ? { stripeAccountId } : {}),
+        ...((chargeMode === 'direct' || chargeMode === 'destination' || chargeMode === 'platform')
+          && !stored.chargeMode ? { chargeMode } : {}),
+      };
       const history = document.refundHistory ?? [];
       const balanceCents = refundMoneyCents(document.amount);
       if (!Array.isArray(history) || history.some((entry) => refundMoneyCents(entry?.amount) === null || entry.amount <= 0)) {
@@ -2634,11 +2670,27 @@ app.post('/api/documents/refund', requireAuth, async (req, res) => {
         if (stripeError?.code === 'connect_refund_client_unavailable') {
           return res.status(503).json({ ok: false, code: stripeError.code, error: 'No se pudo conectar con Stripe Connect para reembolsar.' });
         }
+        if (stripeError?.code === 'missing_payment_intent') {
+          return res.status(409).json({
+            ok: false,
+            code: 'missing_payment_intent',
+            error: 'Este cobro con tarjeta no tiene el identificador de Stripe. No se puede devolver el dinero automáticamente. Contacta soporte con el código del ticket.',
+          });
+        }
         console.error('Error reembolsando en Stripe:', stripeError.message);
         return res.status(502).json({
           ok: false,
           code: 'stripe_refund_failed',
           error: 'Stripe no pudo reembolsar el cobro. No se ha modificado el ticket.',
+          detail: typeof stripeError?.message === 'string' ? stripeError.message.slice(0, 220) : undefined,
+        });
+      }
+
+      if (isStripeMoneyDocument(document) && !moneyRefund.stripeRefundId) {
+        return res.status(502).json({
+          ok: false,
+          code: 'stripe_refund_failed',
+          error: 'Stripe no confirmó el reembolso. No se ha modificado el ticket.',
         });
       }
 
