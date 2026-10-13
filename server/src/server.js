@@ -2554,39 +2554,65 @@ const isStripeMoneyDocument = (document) => {
     || method.includes('tap to pay');
 };
 
-// Reembolso de dinero en Stripe. Sin PI en un cobro Stripe → error (nunca silencioso).
-// Efectivo / sin Stripe → solo documental.
-const createStripeMoneyRefund = async (document, requestedCents, historyLength) => {
-  if (!validStripePaymentIntentId(document.stripePaymentIntentId)) {
-    if (isStripeMoneyDocument(document)) {
-      throw Object.assign(new Error('missing_payment_intent'), {
-        status: 409,
-        code: 'missing_payment_intent',
-      });
-    }
-    return { stripeRefundId: null, stripeRefundStatus: null };
-  }
+const stripeClientForDocument = (document) => {
   const connectClient = createConnectStripeClient(process.env);
   const direct = document.chargeMode === 'direct' && validStripeAccountId(document.stripeAccountId);
-  // Terminal/Checkout Connect: destination (con o sin on_behalf_of) vive en la clave Connect.
   const useConnect = direct
     || document.chargeMode === 'destination'
     || document.chargeMode === 'platform'
     || !document.chargeMode;
-  let stripeClient;
-  let requestOptions = {};
   if (direct) {
-    if (!connectClient) throw Object.assign(new Error('connect_refund_client_unavailable'), { status: 503, code: 'connect_refund_client_unavailable' });
-    stripeClient = connectClient;
-    requestOptions = { stripeAccount: document.stripeAccountId };
-  } else if (useConnect && connectClient) {
-    stripeClient = connectClient;
-  } else {
-    stripeClient = requireStripe();
+    if (!connectClient) {
+      throw Object.assign(new Error('connect_refund_client_unavailable'), {
+        status: 503,
+        code: 'connect_refund_client_unavailable',
+      });
+    }
+    return { stripeClient: connectClient, requestOptions: { stripeAccount: document.stripeAccountId }, direct: true };
   }
+  if (useConnect && connectClient) {
+    return { stripeClient: connectClient, requestOptions: {}, direct: false };
+  }
+  return { stripeClient: requireStripe(), requestOptions: {}, direct: false };
+};
+
+// Si el ticket perdió el PI (sync antiguo), recupéralo por document_id / ticket / importe+dueño.
+const resolvePaymentIntentId = async (document, stripeClient, ownerId, originalCents) => {
+  if (validStripePaymentIntentId(document.stripePaymentIntentId)) {
+    return document.stripePaymentIntentId;
+  }
+  try {
+    const listed = await stripeClient.paymentIntents.list({ limit: 40 });
+    const owner = String(ownerId || '');
+    const docId = String(document.id || '');
+    const ticket = String(document.ticketCode || '');
+    const matches = (listed.data || []).filter((pi) => {
+      if (!pi || pi.status !== 'succeeded') return false;
+      const meta = pi.metadata || {};
+      if (docId && String(meta.document_id || '') === docId) return true;
+      if (ticket && String(meta.ticket_code || '') === ticket) return true;
+      if (owner && String(meta.supabase_user_id || '') === owner
+        && Number.isFinite(originalCents) && Number(pi.amount) === originalCents) {
+        return true;
+      }
+      return false;
+    });
+    if (matches.length === 1) return matches[0].id;
+    if (matches.length > 1) {
+      const byDoc = matches.find((pi) => String(pi.metadata?.document_id || '') === docId);
+      if (byDoc) return byDoc.id;
+      return matches.sort((a, b) => (b.created || 0) - (a.created || 0))[0].id;
+    }
+  } catch (error) {
+    console.warn('No se pudo recuperar PaymentIntent para devolución:', error.message);
+  }
+  return null;
+};
+
+const createStripeRefundParams = (document, paymentIntentId, requestedCents) => {
   const chargeMode = String(document.chargeMode || '');
   const refundParams = {
-    payment_intent: document.stripePaymentIntentId,
+    payment_intent: paymentIntentId,
     amount: requestedCents,
     reason: 'requested_by_customer',
     metadata: {
@@ -2599,10 +2625,71 @@ const createStripeMoneyRefund = async (document, requestedCents, historyLength) 
   if (chargeMode === 'destination' || chargeMode === 'platform' || !chargeMode) {
     refundParams.reverse_transfer = true;
   }
+  return refundParams;
+};
+
+// Reembolso de dinero en Stripe. Sin PI en un cobro Stripe → error (nunca silencioso).
+// Efectivo / sin Stripe → solo documental.
+const createStripeMoneyRefund = async (document, requestedCents, historyLength, ownerId, originalCents) => {
+  const { stripeClient, requestOptions, direct } = stripeClientForDocument(document);
+  let paymentIntentId = document.stripePaymentIntentId;
+  if (!validStripePaymentIntentId(paymentIntentId)) {
+    paymentIntentId = await resolvePaymentIntentId(document, stripeClient, ownerId, originalCents);
+    if (validStripePaymentIntentId(paymentIntentId)) {
+      document.stripePaymentIntentId = paymentIntentId;
+    }
+  }
+  if (!validStripePaymentIntentId(paymentIntentId)) {
+    if (isStripeMoneyDocument(document)) {
+      throw Object.assign(new Error('missing_payment_intent'), {
+        status: 409,
+        code: 'missing_payment_intent',
+      });
+    }
+    return { stripeRefundId: null, stripeRefundStatus: null, settledHistory: null };
+  }
+
+  // Devoluciones antiguas solo en ticket (sin re_): empujarlas a Stripe antes de la nueva.
+  const history = Array.isArray(document.refundHistory) ? document.refundHistory : [];
+  const settledHistory = [...history];
+  for (let index = 0; index < settledHistory.length; index += 1) {
+    const entry = settledHistory[index];
+    if (entry?.stripeRefundId || !entry) continue;
+    const orphanCents = refundMoneyCents(entry.amount);
+    if (!orphanCents || orphanCents <= 0) continue;
+    console.log('Stripe refund backfill orphan:', { paymentIntentId, amount: orphanCents, index });
+    const orphanRefund = await stripeClient.refunds.create(
+      createStripeRefundParams(document, paymentIntentId, orphanCents),
+      {
+        ...requestOptions,
+        idempotencyKey: `doc-refund-orphan-${document.id}-${index}-${orphanCents}`,
+      },
+    );
+    if (!orphanRefund?.id) {
+      throw Object.assign(new Error('stripe_refund_missing_id'), { status: 502, code: 'stripe_refund_failed' });
+    }
+    settledHistory[index] = {
+      ...entry,
+      stripeRefundId: String(orphanRefund.id),
+      stripeRefundStatus: typeof orphanRefund.status === 'string' ? orphanRefund.status : null,
+    };
+  }
+
+  // requestedCents === 0: solo sincronizar huérfanos (ticket ya sin saldo en app).
+  if (!requestedCents || requestedCents <= 0) {
+    const lastOrphan = [...settledHistory].reverse().find((entry) => entry?.stripeRefundId);
+    return {
+      stripeRefundId: lastOrphan?.stripeRefundId || null,
+      stripeRefundStatus: lastOrphan?.stripeRefundStatus || null,
+      settledHistory,
+    };
+  }
+
+  const refundParams = createStripeRefundParams(document, paymentIntentId, requestedCents);
   console.log('Stripe refund create:', {
-    paymentIntentId: document.stripePaymentIntentId,
+    paymentIntentId,
     amount: requestedCents,
-    chargeMode: chargeMode || null,
+    chargeMode: String(document.chargeMode || '') || null,
     direct: Boolean(direct),
     reverse_transfer: Boolean(refundParams.reverse_transfer),
   });
@@ -2617,6 +2704,7 @@ const createStripeMoneyRefund = async (document, requestedCents, historyLength) 
   return {
     stripeRefundId: String(refund.id),
     stripeRefundStatus: typeof refund?.status === 'string' ? refund.status : null,
+    settledHistory,
   };
 };
 
@@ -2673,13 +2761,23 @@ app.post('/api/documents/refund', requireAuth, async (req, res) => {
         || typeof rate !== 'number' || !Number.isFinite(rate) || rate < 0) {
         return res.status(409).json({ ok: false, error: 'Saldo del documento inconsistente.' });
       }
-      if (document.isRefunded || balanceCents <= 0 || requestedCents > balanceCents) {
+      const hasOrphanStripeRefunds = isStripeMoneyDocument(document)
+        && history.some((entry) => entry && !entry.stripeRefundId && refundMoneyCents(entry.amount) > 0);
+      if ((document.isRefunded || balanceCents <= 0 || requestedCents > balanceCents) && !hasOrphanStripeRefunds) {
         return res.status(409).json({ ok: false, error: 'El importe supera el saldo disponible.' });
       }
+      // Ticket ya sin saldo pero con devoluciones solo documentales: empujar huérfanos a Stripe.
+      const settleOnly = (document.isRefunded || balanceCents <= 0 || requestedCents > balanceCents) && hasOrphanStripeRefunds;
 
-      let moneyRefund = { stripeRefundId: null, stripeRefundStatus: null };
+      let moneyRefund = { stripeRefundId: null, stripeRefundStatus: null, settledHistory: null };
       try {
-        moneyRefund = await createStripeMoneyRefund(document, requestedCents, history.length);
+        moneyRefund = await createStripeMoneyRefund(
+          document,
+          settleOnly ? 0 : requestedCents,
+          history.length,
+          freshOwner.id,
+          originalCents,
+        );
       } catch (stripeError) {
         if (stripeError?.code === 'connect_refund_client_unavailable') {
           return res.status(503).json({ ok: false, code: stripeError.code, error: 'No se pudo conectar con Stripe Connect para reembolsar.' });
@@ -2700,11 +2798,39 @@ app.post('/api/documents/refund', requireAuth, async (req, res) => {
         });
       }
 
-      if (isStripeMoneyDocument(document) && !moneyRefund.stripeRefundId) {
+      if (!settleOnly && isStripeMoneyDocument(document) && !moneyRefund.stripeRefundId) {
         return res.status(502).json({
           ok: false,
           code: 'stripe_refund_failed',
           error: 'Stripe no confirmó el reembolso. No se ha modificado el ticket.',
+        });
+      }
+
+      const baseHistory = Array.isArray(moneyRefund.settledHistory) ? moneyRefund.settledHistory : history;
+      if (settleOnly) {
+        const settled = {
+          ...document,
+          refundHistory: baseHistory,
+          ...(validStripePaymentIntentId(document.stripePaymentIntentId)
+            ? { stripePaymentIntentId: document.stripePaymentIntentId } : {}),
+        };
+        delete settled.publicUrl;
+        const token = crypto.randomBytes(24).toString('hex');
+        const { error: insertError } = await supabase.from('documents').insert({
+          user_id: freshOwner.id,
+          ticket_code: settled.ticketCode,
+          document_type: settled.documentType,
+          amount: settled.amount,
+          original_amount: settled.originalAmount,
+          document_data: settled,
+          public_token: token,
+        });
+        if (insertError) {
+          return res.status(500).json({ ok: false, error: 'Se reembolsó en Stripe pero no se pudo guardar el ticket.' });
+        }
+        return res.json({
+          ok: true,
+          document: { ...settled, publicUrl: `${PUBLIC_API_URL}/documents/${token}` },
         });
       }
 
@@ -2722,7 +2848,9 @@ app.post('/api/documents/refund', requireAuth, async (req, res) => {
         ...document, documentType: 'COMPRA/DEVOLUCIONES', amount: remaining,
         originalAmount: originalCents / 100, subtotal, iva: remaining - subtotal,
         isRefunded: remaining === 0,
-        refundHistory: [...history, historyEntry],
+        refundHistory: [...baseHistory, historyEntry],
+        ...(validStripePaymentIntentId(document.stripePaymentIntentId)
+          ? { stripePaymentIntentId: document.stripePaymentIntentId } : {}),
       };
       delete updated.publicUrl;
       const token = crypto.randomBytes(24).toString('hex');
@@ -2795,6 +2923,21 @@ app.post('/api/documents', requireAuth, async (req, res) => {
   };
 
   const ownerId = req.user.app_metadata?.company_owner_id || req.user.id;
+  // Enlaza el PI al ticket para poder recuperar devoluciones si el móvil pierde el id.
+  if (validStripePaymentIntentId(document.stripePaymentIntentId)) {
+    try {
+      const { stripeClient, requestOptions } = stripeClientForDocument(document);
+      await stripeClient.paymentIntents.update(document.stripePaymentIntentId, {
+        metadata: {
+          document_id: String(id),
+          ticket_code: String(ticketCode),
+          supabase_user_id: String(ownerId),
+        },
+      }, requestOptions);
+    } catch (error) {
+      console.warn('No se pudo etiquetar PaymentIntent con document_id:', error.message);
+    }
+  }
   return withAccountLock(ownerId, async () => {
     if (req.user.app_metadata?.role === 'empleado') {
       const userIds = await companyHistoryUserIds(req, res);
