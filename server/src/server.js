@@ -838,10 +838,14 @@ const connectChargeError = (error) => {
     connect_company_invalid: 'No se pudo resolver la empresa de la cuenta Connect.',
     connect_account_binding_invalid: 'La cuenta Connect vinculada no es válida.',
     connect_country_mismatch: 'El país de la cuenta Connect no coincide.',
-    connect_terminal_location_invalid:
-      'No se pudo crear la ubicación de Stripe Terminal en la cuenta plataforma (test). '
-      + 'En el Dashboard de la plataforma (Test): Terminal → Locations, o activa Stripe Terminal. '
-      + 'Esto no es el alta Connect del comercio: Config puede decir “lista para cobros” y aun así fallar Terminal.',
+    connect_terminal_location_invalid: (() => {
+      const connect = resolveConnectMode(process.env);
+      const mode = connect.enabled ? (connect.livemode ? 'live' : 'test') : 'test';
+      const dash = mode === 'live' ? 'Dashboard de la plataforma (Live)' : 'Dashboard de la plataforma (Test)';
+      return `No se pudo crear la ubicación de Stripe Terminal en la cuenta plataforma (${mode}). `
+        + `En el ${dash}: Terminal → Locations, o activa Stripe Terminal. `
+        + 'Esto no es el alta Connect del comercio: Config puede decir “lista para cobros” y aun así fallar Terminal.';
+    })(),
   };
   const base = messages[error.code] || 'Stripe Connect no disponible para esta solicitud.';
   const detail = typeof error.detail === 'string' && error.detail.trim() ? ` Detalle Stripe: ${error.detail.trim()}` : '';

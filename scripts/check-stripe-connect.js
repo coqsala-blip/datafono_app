@@ -567,7 +567,7 @@ const main = async () => {
   equal(terminal.state.locationCreates.length, 1);
   equal(terminal.state.locationCreates[0].options, undefined);
   equal(terminal.state.locationCreates[0].params.address, {
-    line1: 'Calle Provisional 1', city: 'Madrid', postal_code: '28001', country: 'ES',
+    line1: 'Calle Provisional 1', city: 'Madrid', state: 'Madrid', postal_code: '28001', country: 'ES',
   });
   equal(terminal.state.users.get('owner').app_metadata.stripe_connect_test_platform_terminal_location_id, 'tml_platform');
   const terminalReuse = await terminal.resolveTerminalContext();

@@ -193,13 +193,17 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
       owner: resolved.owner,
     };
   };
-  // Dirección placeholder válida por país (Stripe valida CP; "00000" falla en ES).
+  // Dirección placeholder válida por país (Stripe valida CP; ES/IT/US exigen state/provincia).
   const terminalAddressFor = (country) => {
     if (country === 'ES') {
-      return { line1: 'Calle Provisional 1', city: 'Madrid', postal_code: '28001', country: 'ES' };
+      // Stripe Terminal ES: line1, city, state, postal_code, country (state = provincia).
+      return { line1: 'Calle Provisional 1', city: 'Madrid', state: 'Madrid', postal_code: '28001', country: 'ES' };
     }
     if (country === 'PT') {
       return { line1: 'Rua Provisoria 1', city: 'Lisboa', postal_code: '1000-001', country: 'PT' };
+    }
+    if (country === 'IT') {
+      return { line1: 'Via Provvisoria 1', city: 'Roma', state: 'RM', postal_code: '00118', country: 'IT' };
     }
     return { line1: 'Provisional street 1', city: 'City', postal_code: '10115', country };
   };
