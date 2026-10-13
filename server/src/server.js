@@ -2584,22 +2584,36 @@ const createStripeMoneyRefund = async (document, requestedCents, historyLength) 
   } else {
     stripeClient = requireStripe();
   }
-  const refund = await stripeClient.refunds.create({
+  const chargeMode = String(document.chargeMode || '');
+  const refundParams = {
     payment_intent: document.stripePaymentIntentId,
     amount: requestedCents,
     reason: 'requested_by_customer',
     metadata: {
       document_id: String(document.id || ''),
       ticket_code: String(document.ticketCode || ''),
-      charge_mode: String(document.chargeMode || 'platform'),
+      charge_mode: chargeMode || 'platform',
     },
-  }, {
+  };
+  // Destination / Terminal Connect: revertir la transferencia al comercio conectado.
+  if (chargeMode === 'destination' || chargeMode === 'platform' || !chargeMode) {
+    refundParams.reverse_transfer = true;
+  }
+  console.log('Stripe refund create:', {
+    paymentIntentId: document.stripePaymentIntentId,
+    amount: requestedCents,
+    chargeMode: chargeMode || null,
+    direct: Boolean(direct),
+    reverse_transfer: Boolean(refundParams.reverse_transfer),
+  });
+  const refund = await stripeClient.refunds.create(refundParams, {
     ...requestOptions,
     idempotencyKey: `doc-refund-${document.id}-${historyLength}-${requestedCents}`,
   });
   if (!refund?.id) {
     throw Object.assign(new Error('stripe_refund_missing_id'), { status: 502, code: 'stripe_refund_failed' });
   }
+  console.log('Stripe refund OK:', { id: refund.id, status: refund.status, amount: refund.amount });
   return {
     stripeRefundId: String(refund.id),
     stripeRefundStatus: typeof refund?.status === 'string' ? refund.status : null,

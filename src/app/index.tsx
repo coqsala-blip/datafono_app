@@ -2492,10 +2492,11 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       }
 
       setTerminalMessage('pay.confirmedTicket');
+      const confirmedPi = processedResult.paymentIntent.id || intent.paymentIntentId;
       createTransactionFromConfirmedPayment('Stripe Terminal - Contactless', paymentAmount, {
-        stripePaymentIntentId: intent.paymentIntentId,
+        stripePaymentIntentId: confirmedPi,
         stripeAccountId: intent.accountId,
-        chargeMode: intent.chargeMode,
+        chargeMode: intent.chargeMode || 'destination',
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'No se pudo completar el cobro presencial.';
@@ -3209,7 +3210,14 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     const merged = current.map((document) => {
       const revision = latest.get(document.id);
       if (!document.publicUrl || !revision || (document.refundHistory?.length ?? 0) > (revision.refundHistory?.length ?? 0)) return document;
-      return revision;
+      // No perder PI/cuenta Stripe al sincronizar: sin ellos la devolución no reembolsa dinero.
+      return {
+        ...revision,
+        stripePaymentIntentId: revision.stripePaymentIntentId || document.stripePaymentIntentId,
+        stripeAccountId: revision.stripeAccountId || document.stripeAccountId,
+        chargeMode: revision.chargeMode || document.chargeMode,
+        method: revision.method || document.method,
+      };
     });
     const additions = [...latest.values()].filter((document) => {
       if (keys.has(document.id) || keys.has(document.ticketCode)) return false;
@@ -3782,6 +3790,14 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       }
       setTransactions((current) => current.map((transaction) => transaction.id === targetTicket.id ? updatedTicket : transaction));
       setSelectedTicket(updatedTicket);
+      if (lastRefund?.stripeRefundId) {
+        Alert.alert(
+          'Devolución en Stripe',
+          `Reembolso creado: ${lastRefund.stripeRefundId}`
+            + (lastRefund.stripeRefundStatus ? ` (${lastRefund.stripeRefundStatus})` : '')
+            + '. Debe aparecer en el pago en el Dashboard de Stripe (cuenta plataforma Live).',
+        );
+      }
       return true;
     } catch (error) {
       if (cacheGenerationRef.current === generation) Alert.alert('Devolución no realizada', error instanceof Error ? error.message : 'No se pudo conectar con el servidor.');
