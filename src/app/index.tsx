@@ -85,6 +85,7 @@ type StripeOnlinePaymentResult = {
   accountId?: string | null;
   chargeMode?: 'direct' | 'destination' | 'platform';
   paymentIntentId?: string | null;
+  localPaymentHint?: string | null;
   code?: string;
   error?: string;
 };
@@ -880,13 +881,13 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
             }
           });
 
-          // Presupuestos y facturas pendientes no pertenecen al historial de cobros.
-          const { history, unpaidInvoices } = partitionSalesDocuments(sales);
+          // Historial sin presupuestos ni facturas pendientes. Borradores FACTURA solo desde AsyncStorage local.
+          const { history } = partitionSalesDocuments(sales);
           const localDrafts = storedCashInvoiceDrafts
             ? (JSON.parse(storedCashInvoiceDrafts) as CashInvoiceDraft[])
             : [];
           setTransactions(history);
-          setCashInvoiceDrafts(mergeCashInvoiceDrafts(localDrafts, unpaidInvoices, history));
+          setCashInvoiceDrafts(mergeCashInvoiceDrafts(localDrafts, [], history));
         } else if (storedCashInvoiceDrafts) {
           setCashInvoiceDrafts(JSON.parse(storedCashInvoiceDrafts) as CashInvoiceDraft[]);
         }
@@ -2405,9 +2406,9 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
 
     // Si el lector ya conectado apunta a otra Location (p. ej. tras Connect), reconectar.
     const readerLocationId = connectedReader?.locationId || connectedReader?.location?.id || null;
-    // En Connect test (o __DEV__) usamos lector simulado: Android con Opciones de desarrollador
-    // bloquea el Tap to Pay de producción.
-    const preferSimulated = __DEV__ || options?.livemode === false;
+    // Cobro live: siempre Tap to Pay real. Simulado solo en Connect test (o __DEV__ sin live).
+    const isLiveTerminal = options?.livemode === true;
+    const preferSimulated = !isLiveTerminal && (__DEV__ || options?.livemode === false);
     if (connectedReader && readerLocationId === resolvedLocationId && !preferSimulated) {
       return connectedReader;
     }
@@ -2432,16 +2433,17 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     const developerOptionsBlocked = /Developer Options must not be enabled/i.test(
       connectionResult.error?.message || '',
     );
-    if (connectionResult.error && !preferSimulated && developerOptionsBlocked) {
-      // APK release + Opciones de desarrollador: reintentar con lector simulado.
+    // En test, si Developer Options bloquean Tap to Pay real, se puede usar simulado.
+    // En live nunca: el usuario vería "pulsa para simular" y no un cobro real.
+    if (connectionResult.error && !preferSimulated && !isLiveTerminal && developerOptionsBlocked) {
       connectionResult = await connectTapToPay(true);
     }
     if (connectionResult.error) {
       const message = connectionResult.error.message || 'No se pudo conectar Tap to Pay.';
       if (/Developer Options must not be enabled/i.test(message)) {
         throw new Error(
-          'Tap to Pay real no funciona con «Opciones de desarrollador» activadas. '
-          + 'Desactívalas en Ajustes del móvil, o usa Connect en test (lector simulado).',
+          'Para cobrar de verdad con tarjeta o móvil, desactiva «Opciones de desarrollador» '
+          + 'en Ajustes del teléfono y vuelve a intentarlo. (USB debugging también las activa.)',
         );
       }
       throw new Error(message);
@@ -2608,11 +2610,17 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         : result.chargeMode === 'destination'
           ? ' Cobro destination (métodos de la plataforma Connect, incl. Bizum si está activo).'
           : '';
+      const localHint = typeof result.localPaymentHint === 'string' && result.localPaymentHint.trim()
+        ? ` ${result.localPaymentHint.trim()}`
+        : '';
       setOnlinePaymentMessage(
         offeredMethods
-          ? `Muestra el QR al cliente o abre el enlace de pago. Métodos en este cobro: ${offeredMethods}.${modeHint}`
-          : `Muestra el QR al cliente o abre el enlace de pago. Stripe mostrará los métodos activados (tarjeta, Bizum...).${modeHint}`,
+          ? `Muestra el QR al cliente o abre el enlace de pago. Métodos en este cobro: ${offeredMethods}.${modeHint}${localHint}`
+          : `Muestra el QR al cliente o abre el enlace de pago. Stripe mostrará los métodos activados (tarjeta, Bizum...).${modeHint}${localHint}`,
       );
+      if (localHint) {
+        Alert.alert('Métodos de pago', result.localPaymentHint!.trim());
+      }
       // Persistir el cobro pendiente: al volver del navegador la app puede remontarse y
       // perder el estado en memoria; asi se reanuda la comprobacion automaticamente.
       try {
@@ -3264,8 +3272,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         throw new Error(result.error || 'HTTP ' + response.status);
       }
 
-      // 3) Restaurar tickets/facturas sin duplicar (se comparan por id y codigo de ticket).
-      // Presupuestos se ignoran en historial; facturas method "Factura" vuelven a pendientes de cobro.
+      // 3) Restaurar cobros sin duplicar. Facturas pendientes son solo locales: la nube no las reinyecta.
       const restoredDocs = (Array.isArray(result.documents) ? result.documents : [])
         .filter((doc) => doc && doc.id && doc.ticketCode)
         .map((doc) => ({
@@ -3275,7 +3282,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
           publicUrl: doc.publicUrl,
           createdAt: doc.createdAt,
         }) as unknown as Transaction);
-      const { history: cloudHistory, unpaidInvoices: cloudUnpaidInvoices } = partitionSalesDocuments(restoredDocs);
+      const { history: cloudHistory } = partitionSalesDocuments(restoredDocs);
       const localHistory = partitionSalesDocuments(transactions).history;
       // El recuento se calcula fuera del setState: si se calcula dentro, el aviso podría decir
       // "todavía no hay historial" aunque los tickets sí se hayan recuperado.
@@ -3291,8 +3298,9 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       });
       setCashInvoiceDrafts((current) => {
         if (cacheGenerationRef.current !== generation) return current;
+        // Conservar borradores locales; quitar los que ya estén cobrados en el historial.
         const nextHistory = mergeCloudTransactions(localHistory, cloudHistory);
-        return mergeCashInvoiceDrafts(current, cloudUnpaidInvoices, nextHistory);
+        return mergeCashInvoiceDrafts(current, [], nextHistory);
       });
       setSelectedTicket((current) => {
         if (!current || cacheGenerationRef.current !== generation) return current;
@@ -3505,28 +3513,30 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         refundHistory: [],
       };
 
-      // Publicar para QR/enlace del PDF; si falla, la factura pendiente igual se queda en esta pestaña.
-      let publishedDocument = tempPresupuestoTransaction;
-      try {
-        publishedDocument = await registerTransactionDocument(tempPresupuestoTransaction);
-      } catch (publishError) {
-        console.warn('No se pudo publicar presupuesto/factura; se continúa con PDF local.', publishError);
+      // FACTURA pendiente: solo local hasta "Marcar cobrada". PRESUPUESTO: publicar PDF es opcional.
+      let documentForPdf = tempPresupuestoTransaction;
+      if (presupuestoDocumentType !== 'FACTURA') {
+        try {
+          documentForPdf = await registerTransactionDocument(tempPresupuestoTransaction);
+        } catch (publishError) {
+          console.warn('No se pudo publicar presupuesto; se continúa con PDF local.', publishError);
+        }
       }
 
       if (presupuestoDocumentType === 'FACTURA') {
-        // Solo lista pendiente aquí (Marcar cobrada / Eliminar). No entra en Gastos/Facturas.
+        // Lista pendiente local (Marcar cobrada / Eliminar). No nube ni Gastos/Facturas.
         setCashInvoiceDrafts((current) => {
-          const next = publishedDocument as CashInvoiceDraft;
+          const next = tempPresupuestoTransaction as CashInvoiceDraft;
           const withoutDup = current.filter((item) => item.id !== next.id && item.ticketCode !== next.ticketCode);
           return [next, ...withoutDup];
         });
       }
 
-      const pdfUri = await generatePdfFileUri(publishedDocument);
+      const pdfUri = await generatePdfFileUri(documentForPdf);
 
       const result = await MailComposer.composeAsync({
         recipients: [presupuestoClientEmail.trim()],
-        subject: `${presupuestoDocumentType === 'FACTURA' ? 'Factura' : 'Presupuesto'} de Servicios - Ref: ${publishedDocument.ticketCode} (${issuer.name})`,
+        subject: `${presupuestoDocumentType === 'FACTURA' ? 'Factura' : 'Presupuesto'} de Servicios - Ref: ${documentForPdf.ticketCode} (${issuer.name})`,
         body: `Estimado/a ${validClient.name},\n\nAdjunto le hacemos llegar la ${presupuestoDocumentType === 'FACTURA' ? 'factura' : 'presupuesto'} solicitada con importe total de ${formatCurrency(totalWithIva)}.\n\nAtentamente,\n${issuer.name}`,
         attachments: [pdfUri],
       });
