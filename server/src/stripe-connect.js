@@ -312,7 +312,20 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
       console.warn('No se pudo activar métodos locales en la cuenta Connect:', error?.code || '', error?.message || error);
     }
   };
-  // PMC de la plataforma: activar todos los métodos app EUR (Bizum + equivalentes).
+  const EUR_LOCAL_PMC_NAME = 'TPV QR locales EUR';
+  const eurLocalPmcPatch = () => ({
+    // Sin tarjeta: el QR es solo apps locales (Bizum, MB WAY, Bancontact…).
+    card: { display_preference: { preference: 'off' } },
+    bizum: { display_preference: { preference: 'on' } },
+    mb_way: { display_preference: { preference: 'on' } },
+    bancontact: { display_preference: { preference: 'on' } },
+    ideal: { display_preference: { preference: 'on' } },
+    eps: { display_preference: { preference: 'on' } },
+    wero: { display_preference: { preference: 'on' } },
+    blik: { display_preference: { preference: 'on' } },
+  });
+
+  // PMC dedicada al QR TPV (card off + todos los locales EUR on). Devuelve id + disponibilidad.
   const ensurePlatformLocalPaymentMethods = async (country) => {
     try {
       try {
@@ -328,38 +341,42 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
       } catch (capError) {
         console.warn('Capacidades plataforma Connect:', capError?.code || '', capError?.message || capError);
       }
-      const listed = await stripe().paymentMethodConfigurations.list({ limit: 10 });
+      const listed = await stripe().paymentMethodConfigurations.list({ limit: 20 });
       const items = Array.isArray(listed?.data) ? listed.data : [];
-      const configuration = items.find((item) => item?.is_default === true)
-        || items.find((item) => item?.active !== false)
-        || items[0];
-      if (!configuration?.id) return;
-      const patch = {
-        card: { display_preference: { preference: 'on' } },
-        bizum: { display_preference: { preference: 'on' } },
-        mb_way: { display_preference: { preference: 'on' } },
-        bancontact: { display_preference: { preference: 'on' } },
-        ideal: { display_preference: { preference: 'on' } },
-        eps: { display_preference: { preference: 'on' } },
-        wero: { display_preference: { preference: 'on' } },
-        blik: { display_preference: { preference: 'on' } },
-      };
-      const updated = await stripe().paymentMethodConfigurations.update(configuration.id, patch);
-      console.log('PMC plataforma locales EUR:', {
-        id: configuration.id,
-        bizum: {
-          available: updated?.bizum?.available ?? null,
-          preference: updated?.bizum?.display_preference?.value ?? null,
-        },
+      let configuration = items.find((item) => String(item?.name || '') === EUR_LOCAL_PMC_NAME)
+        || items.find((item) => String(item?.name || '').toLowerCase().includes('tpv qr'));
+      if (!configuration?.id) {
+        try {
+          configuration = await stripe().paymentMethodConfigurations.create({
+            name: EUR_LOCAL_PMC_NAME,
+            ...eurLocalPmcPatch(),
+          });
+        } catch (createError) {
+          console.warn('No se pudo crear PMC TPV QR; se usa la default:', createError.message);
+          configuration = items.find((item) => item?.is_default === true)
+            || items.find((item) => item?.active !== false)
+            || items[0];
+        }
+      }
+      if (!configuration?.id) return null;
+      const updated = await stripe().paymentMethodConfigurations.update(
+        configuration.id,
+        eurLocalPmcPatch(),
+      );
+      const availability = {
+        bizum: updated?.bizum?.available ?? null,
         mb_way: updated?.mb_way?.available ?? null,
         bancontact: updated?.bancontact?.available ?? null,
         ideal: updated?.ideal?.available ?? null,
         eps: updated?.eps?.available ?? null,
         wero: updated?.wero?.available ?? null,
         blik: updated?.blik?.available ?? null,
-      });
+      };
+      console.log('PMC TPV QR locales EUR:', { id: configuration.id, ...availability });
+      return { id: configuration.id, availability };
     } catch (error) {
       console.warn('No se pudo activar métodos locales en la plataforma Connect:', error?.code || '', error?.message || error);
+      return null;
     }
   };
   // Ubicación Terminal en la plataforma Connect (sin Stripe-Account). Sirve para destination/on_behalf_of.

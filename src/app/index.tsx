@@ -86,6 +86,7 @@ type StripeOnlinePaymentResult = {
   qrDataUrl?: string | null;
   paymentMethods?: string[] | 'auto';
   preferredMissing?: string[];
+  methodAvailability?: Record<string, boolean | null> | null;
   accountId?: string | null;
   chargeMode?: 'direct' | 'destination' | 'platform';
   paymentIntentId?: string | null;
@@ -2621,13 +2622,20 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       const offeredMethods = Array.isArray(result.paymentMethods) && result.paymentMethods.length > 0
         ? result.paymentMethods.join(', ')
         : '';
-      const missingBizum = Array.isArray(result.preferredMissing) && result.preferredMissing.includes('bizum');
+      const availability = result.methodAvailability && typeof result.methodAvailability === 'object'
+        ? result.methodAvailability
+        : null;
+      const pendingMethods = availability
+        ? Object.entries(availability)
+          .filter(([, available]) => available === false)
+          .map(([method]) => method)
+        : (Array.isArray(result.preferredMissing) ? result.preferredMissing : []);
       setOnlinePaymentMessage(
         offeredMethods
           ? (
-            `Muestra el QR al cliente o abre el enlace. Métodos: ${offeredMethods}.`
-            + (missingBizum
-              ? ' Bizum aún no está habilitado en Live; el cliente puede pagar con los otros métodos de la zona euro.'
+            `Muestra el QR al cliente o abre el enlace. Métodos activos: ${offeredMethods}.`
+            + (pendingMethods.length > 0
+              ? ` Aún no disponibles en Stripe Live: ${pendingMethods.join(', ')}.`
               : '')
           )
           : 'Muestra el QR al cliente o abre el enlace de pago (métodos locales de la zona euro).',

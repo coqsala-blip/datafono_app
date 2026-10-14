@@ -1588,11 +1588,16 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
       ? stripeConnect.boundCountry(connected.owner)
       : (connected.owner?.app_metadata?.stripe_connect_test_country || 'ES');
     await stripeConnect.ensureConnectedLocalPaymentMethods(connected.accountId, connectCountry);
-    // Activa todos los locales EUR en la PMC de la plataforma (no solo el del país).
-    await stripeConnect.ensurePlatformLocalPaymentMethods(connectCountry);
+    // PMC dedicada al QR (sin tarjeta) + todos los locales EUR que Stripe permita activar.
+    const platformPmc = await stripeConnect.ensurePlatformLocalPaymentMethods(connectCountry);
     cachedPaymentMethodConfiguration = null;
     cachedPaymentMethodConfigurationAt = 0;
     const requestedPaymentMethodTypes = resolveCheckoutPaymentMethodTypes(amount, connectCountry);
+    // Solo métodos que la PMC no marca como unavailable (Bizum pendiente → false → se omite).
+    const pmcAvailable = requestedPaymentMethodTypes.filter((method) => {
+      const flag = platformPmc?.availability?.[method];
+      return flag !== false;
+    });
     const preferredLocalMethods = LOCAL_METHODS_BY_COUNTRY[connectCountry] || [];
     const baseLineItems = [
       {
@@ -1604,30 +1609,29 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
         },
       },
     ];
-    const buildCheckoutParams = (chargeMode) => ({
-      mode: 'payment',
-      ...(requestedPaymentMethodTypes ? { payment_method_types: requestedPaymentMethodTypes } : {}),
-      ...(connectCountry === 'ES' ? { locale: 'es' }
-        : connectCountry === 'PT' ? { locale: 'pt' }
-          : connectCountry === 'FR' ? { locale: 'fr' }
-            : connectCountry === 'DE' ? { locale: 'de' }
-              : connectCountry === 'IT' ? { locale: 'it' }
-                : connectCountry === 'NL' ? { locale: 'nl' }
-                  : connectCountry === 'PL' ? { locale: 'pl' }
-                    : connectCountry === 'BE' ? { locale: 'fr' }
-                      : {}),
-      line_items: baseLineItems,
-      metadata: {
-        supabase_user_id: ownerId,
-        operator_user_id: req.user.id,
-        order_id: orderId,
-        stripe_connect_account_id: connected.accountId,
-        charge_mode: chargeMode,
-      },
-      payment_intent_data: {
-        ...(chargeMode === 'destination' ? {
-          transfer_data: { destination: connected.accountId },
-        } : {}),
+    const localeForCheckout = connectCountry === 'ES' ? 'es'
+      : connectCountry === 'PT' ? 'pt'
+        : connectCountry === 'FR' ? 'fr'
+          : connectCountry === 'DE' ? 'de'
+            : connectCountry === 'IT' ? 'it'
+              : connectCountry === 'NL' ? 'nl'
+                : connectCountry === 'PL' ? 'pl'
+                  : connectCountry === 'BE' ? 'fr'
+                    : undefined;
+    const buildCheckoutParams = (chargeMode, mode = 'types') => {
+      const methodParams = mode === 'pmc' && platformPmc?.id
+        ? {
+          payment_method_configuration: platformPmc.id,
+          excluded_payment_method_types: ['card'],
+        }
+        : mode === 'allowed'
+          ? { allowed_payment_method_types: pmcAvailable.length > 0 ? pmcAvailable : requestedPaymentMethodTypes }
+          : { payment_method_types: pmcAvailable.length > 0 ? pmcAvailable : requestedPaymentMethodTypes };
+      return {
+        mode: 'payment',
+        ...methodParams,
+        ...(localeForCheckout ? { locale: localeForCheckout } : {}),
+        line_items: baseLineItems,
         metadata: {
           supabase_user_id: ownerId,
           operator_user_id: req.user.id,
@@ -1635,10 +1639,22 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
           stripe_connect_account_id: connected.accountId,
           charge_mode: chargeMode,
         },
-      },
-      success_url: `${PUBLIC_API_URL}/stripe/complete?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${PUBLIC_API_URL}/stripe/cancel?orderId=${encodeURIComponent(orderId)}`,
-    });
+        payment_intent_data: {
+          ...(chargeMode === 'destination' ? {
+            transfer_data: { destination: connected.accountId },
+          } : {}),
+          metadata: {
+            supabase_user_id: ownerId,
+            operator_user_id: req.user.id,
+            order_id: orderId,
+            stripe_connect_account_id: connected.accountId,
+            charge_mode: chargeMode,
+          },
+        },
+        success_url: `${PUBLIC_API_URL}/stripe/complete?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${PUBLIC_API_URL}/stripe/cancel?orderId=${encodeURIComponent(orderId)}`,
+      };
+    };
     const isDestinationCapabilityError = (error) => {
       const message = String(error?.message || '').toLowerCase();
       return message.includes('destination account needs')
@@ -1646,24 +1662,61 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
         || (message.includes('transfers') && message.includes('capabilities'));
     };
 
+    const createOnlineCheckout = async (chargeMode, stripeAccount = null) => {
+      const stripeClient = connected.stripe;
+      const requestOptions = stripeAccount ? { stripeAccount } : {};
+      // 1) PMC dedicada (sin card) — Stripe elige todos los locales habilitados.
+      if (platformPmc?.id && !stripeAccount) {
+        try {
+          const session = await stripeClient.checkout.sessions.create(
+            buildCheckoutParams(chargeMode, 'pmc'),
+            requestOptions,
+          );
+          return {
+            session,
+            paymentMethodTypes: Array.isArray(session?.payment_method_types)
+              ? session.payment_method_types
+              : null,
+          };
+        } catch (pmcError) {
+          console.warn('Checkout con PMC TPV QR falló, se prueba allowed/types:', pmcError.message);
+        }
+      }
+      // 2) allowed_payment_method_types (API nueva: filtra sin fallar).
+      try {
+        const session = await stripeClient.checkout.sessions.create(
+          buildCheckoutParams(chargeMode, 'allowed'),
+          requestOptions,
+        );
+        return {
+          session,
+          paymentMethodTypes: Array.isArray(session?.payment_method_types)
+            ? session.payment_method_types
+            : (pmcAvailable.length > 0 ? pmcAvailable : requestedPaymentMethodTypes),
+        };
+      } catch (allowedError) {
+        if (!/allowed_payment_method_types|unknown parameter/i.test(String(allowedError?.message || ''))) {
+          console.warn('Checkout allowed_payment_method_types no usable:', allowedError.message);
+        }
+      }
+      // 3) Lista explícita con reintentos (quita métodos que Stripe rechace).
+      return createCheckoutSessionWithLocalMethodsFallback(
+        buildCheckoutParams(chargeMode, 'types'),
+        pmcAvailable.length > 0 ? pmcAvailable : requestedPaymentMethodTypes,
+        { stripeClient, stripeAccount },
+      );
+    };
+
     let chargeMode = 'destination';
     let session;
     let paymentMethodTypes;
     try {
-      ({ session, paymentMethodTypes } = await createCheckoutSessionWithLocalMethodsFallback(
-        buildCheckoutParams(chargeMode),
-        requestedPaymentMethodTypes,
-        { stripeClient: connected.stripe },
-      ));
+      ({ session, paymentMethodTypes } = await createOnlineCheckout(chargeMode));
     } catch (destinationError) {
       if (!isDestinationCapabilityError(destinationError)) throw destinationError;
       console.warn('Checkout destination no disponible, fallback a directo:', destinationError.message);
       chargeMode = 'direct';
-      ({ session, paymentMethodTypes } = await createCheckoutSessionWithLocalMethodsFallback(
-        buildCheckoutParams(chargeMode),
-        requestedPaymentMethodTypes,
-        { stripeClient: connected.stripe, stripeAccount: connected.accountId },
-      ));
+      ({ session, paymentMethodTypes } = await createOnlineCheckout(chargeMode, connected.accountId));
     }
 
     const redirectUrl = session.url;
@@ -1711,6 +1764,7 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
       qrDataUrl,
       paymentMethods: methodsList,
       preferredMissing: missingPreferred,
+      methodAvailability: platformPmc?.availability || null,
       amount,
       accountId: connected?.accountId || null,
       chargeMode,
