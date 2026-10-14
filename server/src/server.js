@@ -54,7 +54,7 @@ const SUBSCRIPTION_LOCK_DAYS = 3;
 const SUBSCRIPTION_PAST_DUE_STATES = new Set(['past_due', 'unpaid']);
 
 // Solo métodos “app” tipo Bizum (sin tarjeta): el QR/enlace es para pagar con el banco/app.
-const EUR_LOCAL_PAYMENT_METHODS = ['bizum', 'mb_way', 'bancontact', 'eps', 'ideal', 'wero', 'blik'];
+const EUR_LOCAL_PAYMENT_METHODS = ['bizum', 'mb_way', 'bancontact', 'eps', 'ideal', 'wero', 'blik', 'klarna'];
 // País del comercio → método local prioritario (equivalente a Bizum en otros países EUR).
 const LOCAL_METHODS_BY_COUNTRY = {
   ES: ['bizum'],
@@ -1782,7 +1782,7 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
         ...(error.detail ? { detail: error.detail } : {}),
       });
     }
-    if (/bizum|mb_way|bancontact|ideal|eps|wero|blik/i.test(String(error?.message || ''))) {
+    if (/bizum|mb_way|bancontact|ideal|eps|wero|blik|klarna/i.test(String(error?.message || ''))) {
       return res.status(502).json({
         ok: false,
         code: 'local_payment_methods_unavailable',
@@ -2612,6 +2612,7 @@ const isStripeMoneyDocument = (document) => {
     || method.includes('terminal')
     || method.includes('contactless')
     || method.includes('bizum')
+    || method.includes('klarna')
     || method.includes('tap to pay');
 };
 

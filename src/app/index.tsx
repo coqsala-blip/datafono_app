@@ -2700,10 +2700,19 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     return result;
   };
 
-  const methodLabelFor = (method: string | null | undefined): 'bizum' | 'card' | null => {
+  const methodLabelFor = (method: string | null | undefined): 'bizum' | 'klarna' | 'card' | 'local' | null => {
     if (method === 'bizum') return 'bizum';
+    if (method === 'klarna') return 'klarna';
     if (method === 'card') return 'card';
+    if (method && ['mb_way', 'bancontact', 'eps', 'ideal', 'wero', 'blik'].includes(method)) return 'local';
     return null;
+  };
+  const stripeMethodTicketLabel = (used: ReturnType<typeof methodLabelFor>) => {
+    if (used === 'bizum') return 'Stripe - Bizum (enlace o QR)';
+    if (used === 'klarna') return 'Stripe - Klarna (enlace o QR)';
+    if (used === 'card') return 'Stripe - Tarjeta online';
+    if (used === 'local') return 'Stripe - Método local (enlace o QR)';
+    return 'Stripe - Enlace o QR';
   };
 
   // Comprueba el pago sin tocar los mensajes de la interfaz (para la espera automatica).
@@ -2725,7 +2734,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       setOnlinePaymentMessage('Pago confirmado. Generando el ticket con su QR...');
       const currentOnline = onlinePaymentRef.current;
       createTransactionFromConfirmedPayment(
-        usedMethod === 'bizum' ? 'Stripe - Bizum (enlace o QR)' : usedMethod === 'card' ? 'Stripe - Tarjeta online' : 'Stripe - Enlace o QR (tarjeta o Bizum)',
+        stripeMethodTicketLabel(usedMethod),
         paymentAmount,
         {
           stripePaymentIntentId: payment?.paymentIntentId || currentOnline?.paymentIntentId || undefined,
@@ -2915,7 +2924,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
               onlinePaymentConfirmedRef.current = true;
               setOnlinePaymentMessage('Pago confirmado. Generando el ticket con su QR...');
               createOnlinePaymentRef.current(
-                resumeUsedMethod === 'bizum' ? 'Stripe - Bizum (enlace o QR)' : resumeUsedMethod === 'card' ? 'Stripe - Tarjeta online' : 'Stripe - Enlace o QR (tarjeta o Bizum)',
+                stripeMethodTicketLabel(resumeUsedMethod),
                 amountToConfirm,
                 {
                   stripePaymentIntentId: payment?.paymentIntentId || pending.paymentIntentId || undefined,
@@ -3806,7 +3815,11 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         || method.includes('stripe')
         || method.includes('terminal')
         || method.includes('contactless')
-        || method.includes('bizum');
+        || method.includes('bizum')
+        || method.includes('klarna')
+        || method.includes('mb way')
+        || method.includes('bancontact')
+        || method.includes('ideal');
       const lastRefund = updatedTicket.refundHistory?.[updatedTicket.refundHistory.length - 1];
       if (isStripeSale && !lastRefund?.stripeRefundId) {
         throw new Error('La devolución no se registró en Stripe. No se ha confirmado el reembolso del dinero.');

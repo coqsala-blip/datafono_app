@@ -306,6 +306,7 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
         eps: { display_preference: { preference: 'on' } },
         wero: { display_preference: { preference: 'on' } },
         blik: { display_preference: { preference: 'on' } },
+        klarna: { display_preference: { preference: 'on' } },
       };
       await stripe().paymentMethodConfigurations.update(configuration.id, patch, { stripeAccount: accountId });
     } catch (error) {
@@ -314,7 +315,7 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
   };
   const EUR_LOCAL_PMC_NAME = 'TPV QR locales EUR';
   const eurLocalPmcPatch = () => ({
-    // Sin tarjeta: el QR es solo apps locales (Bizum, MB WAY, Bancontact…).
+    // Sin tarjeta: el QR es solo apps locales (Bizum, MB WAY, Bancontact, Klarna…).
     card: { display_preference: { preference: 'off' } },
     bizum: { display_preference: { preference: 'on' } },
     mb_way: { display_preference: { preference: 'on' } },
@@ -323,6 +324,7 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
     eps: { display_preference: { preference: 'on' } },
     wero: { display_preference: { preference: 'on' } },
     blik: { display_preference: { preference: 'on' } },
+    klarna: { display_preference: { preference: 'on' } },
   });
 
   // PMC dedicada al QR TPV (card off + todos los locales EUR on). Devuelve id + disponibilidad.
@@ -371,6 +373,7 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
         eps: updated?.eps?.available ?? null,
         wero: updated?.wero?.available ?? null,
         blik: updated?.blik?.available ?? null,
+        klarna: updated?.klarna?.available ?? null,
       };
       console.log('PMC TPV QR locales EUR:', { id: configuration.id, ...availability });
       return { id: configuration.id, availability };
