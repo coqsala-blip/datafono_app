@@ -29,12 +29,12 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { buildAuthRequestBody, classifySessionCheck, getOrCreateDeviceId, validateAuthForm, type AuthForm } from '../auth/auth-session';
 import { LogoSettings } from '../components/logo-settings';
+import { VatRateField } from '../components/vat-rate-field';
 import { normalizeLogoSettings, renderIssuerBlock, type LogoOffset, type LogoPosition, type LogoSize } from '../documents/logo-layout';
 import { buildPdfFilename, buildReportPdfFilename, copyPdfForExport } from '../documents/pdf-export';
 import { APP_LOCALES, APP_LOCALE_STORAGE_KEY, detectDeviceLocale, formatCurrencyForLocale, isAppLocale, t as translateKey, type AppLocale } from '../i18n';
 import { CONNECT_EU_COUNTRIES, connectCountryLabel, connectErrorKey, connectStatusKey, normalizeConnectCountry, parseConnectOnboardingUrl, parseConnectStatus, type ConnectCountry } from '../payments/connect-onboarding';
 import { buildEmailedReport } from '../reports/emailed-report';
-import { vatRateInWords } from '../utils/number-words';
 
 type DocumentType = 'TICKET DE VENTA' | 'FACTURA SIMPLIFICADA' | 'FACTURA COMPLETA' | 'TICKET DE DEVOLUCIÓN' | 'COMPRA/DEVOLUCIONES' | 'PRESUPUESTO' | 'FACTURA';
 type TransactionType = 'COBRO' | 'DEVOLUCIÓN';
@@ -497,13 +497,6 @@ const [seatsPanelOpen, setSeatsPanelOpen] = useState(false);
   const trRef = useRef(tr);
   trRef.current = tr;
   const formatUiCurrency = (value: number) => formatCurrencyForLocale(appLocale, value);
-  // Presupuesto/factura: "Veintiuno · IVA / tax" junto al % configurable.
-  const formatVatCaption = (raw: string) => {
-    const words = vatRateInWords(appLocale, raw);
-    if (!words) return tr('config.vatTaxLabel');
-    const titled = words.charAt(0).toUpperCase() + words.slice(1);
-    return `${titled} · ${tr('config.vatTaxLabel')}`;
-  };
   const formatUiDate = (isoDate: string) => new Intl.DateTimeFormat(appLocale, {
     dateStyle: 'short', timeStyle: 'short', hourCycle: 'h23',
   }).format(new Date(isoDate));
@@ -4911,22 +4904,16 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                 <Text style={styles.secondaryButtonText}>+ {tr('quote.add')}</Text>
               </Pressable>
 
-              <View style={{ marginTop: 10 }}>
-                <TextInput
-                  style={styles.input}
-                  placeholder={tr('quote.vatInput')}
-                  ref={(input) => { quoteInputRefs.current.iva = input; }}
-                  onFocus={() => revealQuoteInput('iva')}
-                  onBlur={() => blurQuoteInput('iva')}
-                  placeholderTextColor="#94a3b8"
-                  keyboardType="numeric"
-                  value={presupuestoIvaInput}
-                  onChangeText={setPresupuestoIvaInput}
-                />
-                <Text style={{ color: '#0f172a', marginTop: 8, fontSize: 15, fontWeight: '700' }}>
-                  {formatVatCaption(presupuestoIvaInput)}
-                </Text>
-              </View>
+              <VatRateField
+                style={{ marginTop: 10 }}
+                value={presupuestoIvaInput}
+                onChangeText={setPresupuestoIvaInput}
+                label={tr('config.vatTaxLabel')}
+                placeholder="21"
+                inputRef={(input) => { quoteInputRefs.current.iva = input; }}
+                onFocus={() => revealQuoteInput('iva')}
+                onBlur={() => blurQuoteInput('iva')}
+              />
 
               <Pressable style={styles.primaryButton} onPress={sendPresupuestoByEmail}>
                 <Text style={styles.primaryButtonText}>{tr('quote.send').replace('{document}', documentTypeLabel(presupuestoDocumentType))}</Text>
@@ -5215,19 +5202,13 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
               )}
               <LogoSettings issuer={issuer} locale={appLocale} onChange={settings => setIssuer(current => ({ ...current, ...settings }))} />
 
-              <View style={{ marginTop: 15, flexDirection: 'row', alignItems: 'center' }}>
-                <TextInput
-                  style={[styles.input, { flex: 1, marginTop: 0 }]}
-                  placeholder={tr('config.defaultVat')}
-                  placeholderTextColor="#94a3b8"
-                  keyboardType="numeric"
-                  value={ivaPercentage}
-                  onChangeText={setIvaPercentage}
-                />
-                <Text style={{ color: '#0f172a', marginLeft: 12, fontSize: 16, fontWeight: '700' }}>
-                  {tr('config.vatTaxLabel')}
-                </Text>
-              </View>
+              <VatRateField
+                style={{ marginTop: 15 }}
+                value={ivaPercentage}
+                onChangeText={setIvaPercentage}
+                label={tr('config.vatTaxLabel')}
+                placeholder="21"
+              />
             </View>
           </ScrollView>
         )}
@@ -5440,19 +5421,13 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                 <Text style={styles.secondaryButtonText}>+ {tr('quote.add')}</Text>
               </Pressable>
 
-              <View style={{ marginTop: 10 }}>
-                <TextInput
-                  style={styles.input}
-                  placeholder={tr('quote.vatInput')}
-                  placeholderTextColor="#94a3b8"
-                  keyboardType="numeric"
-                  value={invoiceIvaInput}
-                  onChangeText={setInvoiceIvaInput}
-                />
-                <Text style={{ color: '#0f172a', marginTop: 8, fontSize: 15, fontWeight: '700' }}>
-                  {formatVatCaption(invoiceIvaInput)}
-                </Text>
-              </View>
+              <VatRateField
+                style={{ marginTop: 10 }}
+                value={invoiceIvaInput}
+                onChangeText={setInvoiceIvaInput}
+                label={tr('config.vatTaxLabel')}
+                placeholder="21"
+              />
 
               <Pressable style={styles.primaryButton} onPress={submitClientModal}>
                 <Text style={styles.primaryButtonText}>{tr('invoice.continue')}</Text>
