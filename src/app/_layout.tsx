@@ -1,8 +1,6 @@
 import { StripeTerminalProvider } from '@stripe/stripe-terminal-react-native';
 import { Stack } from 'expo-router';
 import * as SecureStore from 'expo-secure-store';
-import * as Updates from 'expo-updates';
-import { useEffect } from 'react';
 
 const AUTH_TOKEN_KEY = 'tpv_access_token';
 const configuredDocumentApiUrl = process.env.EXPO_PUBLIC_DOCUMENT_API_URL?.replace(/\/$/, '');
@@ -30,22 +28,6 @@ const fetchStripeTerminalToken = async () => {
 };
 
 export default function RootLayout() {
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      if (__DEV__ || !Updates.isEnabled) return;
-      try {
-        const result = await Updates.checkForUpdateAsync();
-        if (cancelled || !result.isAvailable) return;
-        await Updates.fetchUpdateAsync();
-        if (!cancelled) await Updates.reloadAsync();
-      } catch (error) {
-        console.warn('No se pudo aplicar actualización OTA:', error);
-      }
-    })();
-    return () => { cancelled = true; };
-  }, []);
-
   return (
     <StripeTerminalProvider tokenProvider={fetchStripeTerminalToken} logLevel="verbose">
       <Stack screenOptions={{ headerShown: false }}>

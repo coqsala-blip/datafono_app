@@ -148,6 +148,8 @@ const es: Dict = {
   'sync.empty': 'Todavía no hay historial guardado en la nube. Los cobros se guardan solos al emitirlos con la sesión iniciada.',
   'sync.login': 'Inicia sesión con tu cuenta para poder sincronizar el historial.',
   'sync.error': 'No se pudo sincronizar el historial.',
+  'ota.banner': 'Hay una actualización · Toca para instalar',
+  'ota.installing': 'Instalando actualización...',
 };
 
 const en: Dict = {
@@ -223,6 +225,8 @@ const en: Dict = {
   'sync.empty': 'No history stored in the cloud yet. Sales are saved automatically when issued while signed in.',
   'sync.login': 'Sign in to your account to sync your history.',
   'sync.error': 'Could not sync the history.',
+  'ota.banner': 'Update available · Tap to install',
+  'ota.installing': 'Installing update...',
 };
 
 const fr: Dict = {

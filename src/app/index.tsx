@@ -20,6 +20,7 @@ import {
   Modal,
   Platform,
   Pressable,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
@@ -35,6 +36,7 @@ import { buildPdfFilename, buildReportPdfFilename, copyPdfForExport } from '../d
 import { APP_LOCALES, APP_LOCALE_STORAGE_KEY, detectDeviceLocale, formatCurrencyForLocale, isAppLocale, t as translateKey, type AppLocale } from '../i18n';
 import { CONNECT_EU_COUNTRIES, connectCountryLabel, connectErrorKey, connectStatusKey, normalizeConnectCountry, parseConnectOnboardingUrl, parseConnectStatus, type ConnectCountry } from '../payments/connect-onboarding';
 import { buildEmailedReport } from '../reports/emailed-report';
+import { useAppOta } from '../updates/use-app-ota';
 
 type DocumentType = 'TICKET DE VENTA' | 'FACTURA SIMPLIFICADA' | 'FACTURA COMPLETA' | 'TICKET DE DEVOLUCIÓN' | 'COMPRA/DEVOLUCIONES' | 'PRESUPUESTO' | 'FACTURA';
 type TransactionType = 'COBRO' | 'DEVOLUCIÓN';
@@ -472,6 +474,17 @@ const [seatsPanelOpen, setSeatsPanelOpen] = useState(false);
   // Modales
   const [scannerModalVisible, setScannerModalVisible] = useState(false);
   const [nfcModalVisible, setNfcModalVisible] = useState(false);
+  const { updateReady, checking: otaChecking, checkForOta, applyUpdate } = useAppOta({
+    busy: isProcessing || nfcModalVisible,
+  });
+  const otaRefreshControl = useMemo(() => (
+    <RefreshControl
+      refreshing={otaChecking}
+      onRefresh={() => { void checkForOta(); }}
+      colors={['#b91c1c']}
+      tintColor="#b91c1c"
+    />
+  ), [otaChecking, checkForOta]);
   const [clientModalVisible, setClientModalVisible] = useState(false);
 
   // Cobro online con enlace/QR (tarjeta y Bizum) sobre Stripe Checkout
@@ -4660,6 +4673,25 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         </View>
       </View>
 
+      {updateReady ? (
+        <Pressable
+          onPress={() => { void applyUpdate(); }}
+          style={{
+            backgroundColor: '#fee2e2',
+            borderBottomWidth: 1,
+            borderBottomColor: '#b91c1c',
+            paddingVertical: 8,
+            paddingHorizontal: 12,
+          }}
+          accessibilityRole="button"
+          accessibilityLabel={tr('ota.banner')}
+        >
+          <Text style={{ color: '#b91c1c', fontSize: 12, fontWeight: '700', textAlign: 'center' }}>
+            {otaChecking ? tr('ota.installing') : tr('ota.banner')}
+          </Text>
+        </Pressable>
+      ) : null}
+
       {/* AVISO DE IMPAGO (encima de las pestañas) */}
       {renderPastDueBanner()}
 
@@ -4699,7 +4731,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       <View style={styles.content}>
         {/* PESTAÑA: GASTOS Y FACTURACIÓN */}
         {activeTab === 'gastos_facturacion' && (
-          <ScrollView contentContainerStyle={styles.scrollContent}>
+          <ScrollView contentContainerStyle={styles.scrollContent} refreshControl={otaRefreshControl}>
             <View style={styles.card}>
               <Text style={styles.cardTitle}>📥 {tr('expense.new')}</Text>
               <TextInput
@@ -4786,38 +4818,44 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
 
         {/* PESTAÑA: TPV CAJA */}
         {activeTab === 'tpv' && (
-          <View style={styles.tpvContainer}>
-            <View style={styles.displayContainer}>
-              <Text style={styles.displayLabel}>{tr('tpv.amount')}</Text>
-              <Text style={styles.displayText}>{formatUiCurrency(amount)}</Text>
-            </View>
+          <ScrollView
+            contentContainerStyle={{ flexGrow: 1 }}
+            keyboardShouldPersistTaps="handled"
+            refreshControl={otaRefreshControl}
+          >
+            <View style={styles.tpvContainer}>
+              <View style={styles.displayContainer}>
+                <Text style={styles.displayLabel}>{tr('tpv.amount')}</Text>
+                <Text style={styles.displayText}>{formatUiCurrency(amount)}</Text>
+              </View>
 
-            <View style={styles.keypad}>
-              {['1', '2', '3', '4', '5', '6', '7', '8', '9', 'C', '0', '⌫'].map((key) => (
-                <Pressable key={key} style={styles.keyButton} onPress={() => handleKey(key)}>
-                  <Text style={styles.keyText}>{key}</Text>
+              <View style={styles.keypad}>
+                {['1', '2', '3', '4', '5', '6', '7', '8', '9', 'C', '0', '⌫'].map((key) => (
+                  <Pressable key={key} style={styles.keyButton} onPress={() => handleKey(key)}>
+                    <Text style={styles.keyText}>{key}</Text>
+                  </Pressable>
+                ))}
+              </View>
+
+              <View style={styles.actionButtonsContainer}>
+                <Pressable style={styles.actionBtnTicket} onPress={() => startPayment('TICKET DE VENTA')}>
+                  <Text style={styles.actionBtnText}>{documentTypeLabel('TICKET DE VENTA')}</Text>
                 </Pressable>
-              ))}
-            </View>
+                <Pressable style={styles.actionBtnFactura} onPress={() => startPayment('FACTURA SIMPLIFICADA')}>
+                  <Text style={styles.actionBtnText}>{documentTypeLabel('FACTURA SIMPLIFICADA')}</Text>
+                </Pressable>
+                <Pressable style={styles.actionBtnFacturaCompleta} onPress={() => startPayment('FACTURA COMPLETA')}>
+                  <Text style={styles.actionBtnText}>{documentTypeLabel('FACTURA COMPLETA')}</Text>
+                </Pressable>
+              </View>
 
-            <View style={styles.actionButtonsContainer}>
-              <Pressable style={styles.actionBtnTicket} onPress={() => startPayment('TICKET DE VENTA')}>
-                <Text style={styles.actionBtnText}>{documentTypeLabel('TICKET DE VENTA')}</Text>
-              </Pressable>
-              <Pressable style={styles.actionBtnFactura} onPress={() => startPayment('FACTURA SIMPLIFICADA')}>
-                <Text style={styles.actionBtnText}>{documentTypeLabel('FACTURA SIMPLIFICADA')}</Text>
-              </Pressable>
-              <Pressable style={styles.actionBtnFacturaCompleta} onPress={() => startPayment('FACTURA COMPLETA')}>
-                <Text style={styles.actionBtnText}>{documentTypeLabel('FACTURA COMPLETA')}</Text>
-              </Pressable>
+              <View style={styles.scanBarRow}>
+                <Pressable style={styles.scanBarcodeBtn} onPress={() => setScannerModalVisible(true)}>
+                  <Text style={styles.scanBarcodeText}>📷 {tr('scanner.open')}</Text>
+                </Pressable>
+              </View>
             </View>
-
-            <View style={styles.scanBarRow}>
-              <Pressable style={styles.scanBarcodeBtn} onPress={() => setScannerModalVisible(true)}>
-                <Text style={styles.scanBarcodeText}>📷 {tr('scanner.open')}</Text>
-              </Pressable>
-            </View>
-          </View>
+          </ScrollView>
         )}
 
         {/* PESTAÑA: PRESUPUESTO */}
@@ -4832,6 +4870,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
             onScrollBeginDrag={() => { quoteFocusGenerationRef.current += 1; }}
             scrollEventThrottle={16}
             keyboardShouldPersistTaps="handled"
+            refreshControl={otaRefreshControl}
             automaticallyAdjustKeyboardInsets={false}
           >
             <View style={styles.card}>
@@ -4951,7 +4990,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
 
         {/* PESTAÑA: INFORMES Y ESTADÍSTICAS */}
         {activeTab === 'stats' && (
-          <ScrollView contentContainerStyle={styles.scrollContent}>
+          <ScrollView contentContainerStyle={styles.scrollContent} refreshControl={otaRefreshControl}>
             <View style={styles.card}>
               <Text style={styles.cardTitle}>📊 {tr('reports.summary')}</Text>
               <View style={styles.statRow}>
@@ -5042,7 +5081,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
 
         {/* PESTAÑA: CONFIGURACIÓN */}
         {activeTab === 'config' && (
-          <ScrollView contentContainerStyle={styles.scrollContent}>
+          <ScrollView contentContainerStyle={styles.scrollContent} refreshControl={otaRefreshControl}>
             <View style={styles.card}>
               <Text style={styles.cardTitle}>📦 {tr('config.plan')}</Text>
               <View style={styles.statRow}>
