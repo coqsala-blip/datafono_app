@@ -85,6 +85,7 @@ type StripeOnlinePaymentResult = {
   redirectUrl?: string;
   qrDataUrl?: string | null;
   paymentMethods?: string[] | 'auto';
+  preferredMissing?: string[];
   accountId?: string | null;
   chargeMode?: 'direct' | 'destination' | 'platform';
   paymentIntentId?: string | null;
@@ -2620,10 +2621,16 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       const offeredMethods = Array.isArray(result.paymentMethods) && result.paymentMethods.length > 0
         ? result.paymentMethods.join(', ')
         : '';
+      const missingBizum = Array.isArray(result.preferredMissing) && result.preferredMissing.includes('bizum');
       setOnlinePaymentMessage(
         offeredMethods
-          ? `Muestra el QR al cliente o abre el enlace. Métodos: ${offeredMethods}.`
-          : 'Muestra el QR al cliente o abre el enlace de pago (Bizum u otro método local según el país).',
+          ? (
+            `Muestra el QR al cliente o abre el enlace. Métodos: ${offeredMethods}.`
+            + (missingBizum
+              ? ' Bizum aún no está habilitado en Live; el cliente puede pagar con los otros métodos de la zona euro.'
+              : '')
+          )
+          : 'Muestra el QR al cliente o abre el enlace de pago (métodos locales de la zona euro).',
       );
       // Persistir el cobro pendiente: al volver del navegador la app puede remontarse y
       // perder el estado en memoria; asi se reanuda la comprobacion automaticamente.

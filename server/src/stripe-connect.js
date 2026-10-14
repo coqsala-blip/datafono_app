@@ -252,16 +252,14 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
     await save(owner.id, { stripe_connect_test_terminal_location_id: location.id });
     return location.id;
   };
-  // Capacidades v1 locales por país (el comercio no toca el Dashboard: lo pide la app).
-  const localCapabilitiesForCountry = (country) => {
-    const caps = {};
-    if (country === 'ES') caps.bizum_payments = { requested: true };
-    if (country === 'BE') caps.bancontact_payments = { requested: true };
-    if (country === 'NL') caps.ideal_payments = { requested: true };
-    if (country === 'AT') caps.eps_payments = { requested: true };
-    if (country === 'PL') caps.blik_payments = { requested: true };
-    return caps;
-  };
+  // Capacidades v1 locales EUR (plataforma/comercio). Pedir todas; Stripe ignora las no aplicables.
+  const localCapabilitiesForCountry = (_country) => ({
+    bizum_payments: { requested: true },
+    bancontact_payments: { requested: true },
+    ideal_payments: { requested: true },
+    eps_payments: { requested: true },
+    blik_payments: { requested: true },
+  });
   // Solicita recipient/transfers (v2) + capacidades v1 (Bizum/locales, transfers) en la cuenta conectada.
   const ensureConnectedCapabilities = async (accountId, country) => {
     try {
@@ -298,24 +296,23 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
         || items.find((item) => item?.active !== false)
         || items[0];
       if (!configuration?.id) return;
+      // Todos los locales EUR en la cuenta conectada (Checkout destination usa PMC plataforma).
       const patch = {
         card: { display_preference: { preference: 'on' } },
+        bizum: { display_preference: { preference: 'on' } },
+        mb_way: { display_preference: { preference: 'on' } },
+        bancontact: { display_preference: { preference: 'on' } },
+        ideal: { display_preference: { preference: 'on' } },
+        eps: { display_preference: { preference: 'on' } },
+        wero: { display_preference: { preference: 'on' } },
+        blik: { display_preference: { preference: 'on' } },
       };
-      if (country === 'ES') patch.bizum = { display_preference: { preference: 'on' } };
-      if (country === 'PT') patch.mb_way = { display_preference: { preference: 'on' } };
-      if (country === 'BE') patch.bancontact = { display_preference: { preference: 'on' } };
-      if (country === 'NL') patch.ideal = { display_preference: { preference: 'on' } };
-      if (country === 'AT') patch.eps = { display_preference: { preference: 'on' } };
-      if (country === 'PL') patch.blik = { display_preference: { preference: 'on' } };
-      if (['DE', 'FR', 'IT', 'ES', 'PT', 'BE', 'NL', 'AT'].includes(country)) {
-        patch.wero = { display_preference: { preference: 'on' } };
-      }
       await stripe().paymentMethodConfigurations.update(configuration.id, patch, { stripeAccount: accountId });
     } catch (error) {
       console.warn('No se pudo activar métodos locales en la cuenta Connect:', error?.code || '', error?.message || error);
     }
   };
-  // PMC de la plataforma (respaldo; el QR usa on_behalf_of → PMC del comercio).
+  // PMC de la plataforma: activar todos los métodos app EUR (Bizum + equivalentes).
   const ensurePlatformLocalPaymentMethods = async (country) => {
     try {
       try {
@@ -339,22 +336,28 @@ module.exports = function createStripeConnect({ env, fetchAuthoritativeUser, upd
       if (!configuration?.id) return;
       const patch = {
         card: { display_preference: { preference: 'on' } },
-        wero: { display_preference: { preference: 'on' } },
+        bizum: { display_preference: { preference: 'on' } },
+        mb_way: { display_preference: { preference: 'on' } },
         bancontact: { display_preference: { preference: 'on' } },
         ideal: { display_preference: { preference: 'on' } },
         eps: { display_preference: { preference: 'on' } },
+        wero: { display_preference: { preference: 'on' } },
+        blik: { display_preference: { preference: 'on' } },
       };
-      if (country === 'ES') patch.bizum = { display_preference: { preference: 'on' } };
-      if (country === 'PT') patch.mb_way = { display_preference: { preference: 'on' } };
-      if (country === 'PL') patch.blik = { display_preference: { preference: 'on' } };
       const updated = await stripe().paymentMethodConfigurations.update(configuration.id, patch);
-      if (country === 'ES') {
-        console.log('PMC plataforma Bizum:', {
-          id: configuration.id,
+      console.log('PMC plataforma locales EUR:', {
+        id: configuration.id,
+        bizum: {
           available: updated?.bizum?.available ?? null,
           preference: updated?.bizum?.display_preference?.value ?? null,
-        });
-      }
+        },
+        mb_way: updated?.mb_way?.available ?? null,
+        bancontact: updated?.bancontact?.available ?? null,
+        ideal: updated?.ideal?.available ?? null,
+        eps: updated?.eps?.available ?? null,
+        wero: updated?.wero?.available ?? null,
+        blik: updated?.blik?.available ?? null,
+      });
     } catch (error) {
       console.warn('No se pudo activar métodos locales en la plataforma Connect:', error?.code || '', error?.message || error);
     }

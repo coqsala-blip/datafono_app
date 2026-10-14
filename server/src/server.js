@@ -77,23 +77,21 @@ const stripePaymentMethodTypes = stripeDynamicPaymentMethods
 const BIZUM_MIN_AMOUNT_CENTS = 50;
 const BIZUM_MAX_AMOUNT_CENTS = 500000;
 
-// QR/enlace: solo el método “app” del país del comercio (Bizum en ES, MB WAY en PT…). Nunca card.
-// No mezclar Bancontact/EPS en un comercio español: si Bizum no está activo, hay que activarlo en Stripe.
+// QR/enlace: todos los métodos “app” de la zona euro (Bizum, MB WAY, Bancontact, iDEAL…).
+// El del país del comercio va primero; nunca card. Si Bizum live está pendiente, el resto sigue.
 const resolveCheckoutPaymentMethodTypes = (amountCents, country = null) => {
   const bizumOk = amountCents >= BIZUM_MIN_AMOUNT_CENTS && amountCents <= BIZUM_MAX_AMOUNT_CENTS;
-  const countryLocals = (country && LOCAL_METHODS_BY_COUNTRY[country]) || [];
-  if (stripeDynamicPaymentMethods) {
-    if (countryLocals.length > 0) {
-      return countryLocals.filter((method) => method !== 'bizum' || bizumOk);
-    }
-    return EUR_LOCAL_PAYMENT_METHODS.filter((method) => method !== 'bizum' || bizumOk);
-  }
-  const eligible = stripePaymentMethodTypes.filter((method) => (
-    method !== 'card'
-    && EUR_LOCAL_PAYMENT_METHODS.includes(method)
-    && (method !== 'bizum' || bizumOk)
-  ));
-  return eligible.length > 0 ? eligible : (bizumOk ? ['bizum'] : ['mb_way']);
+  const preferred = (country && LOCAL_METHODS_BY_COUNTRY[country]) || [];
+  const pool = stripeDynamicPaymentMethods
+    ? [...EUR_LOCAL_PAYMENT_METHODS]
+    : stripePaymentMethodTypes.filter((method) => method !== 'card' && EUR_LOCAL_PAYMENT_METHODS.includes(method));
+  const base = pool.length > 0 ? pool : [...EUR_LOCAL_PAYMENT_METHODS];
+  const filtered = base.filter((method) => method !== 'bizum' || bizumOk);
+  const ordered = [
+    ...preferred.filter((method) => filtered.includes(method)),
+    ...filtered.filter((method) => !preferred.includes(method)),
+  ];
+  return ordered.length > 0 ? ordered : (bizumOk ? ['bizum'] : ['mb_way', 'bancontact', 'ideal']);
 };
 
 // Comprueba si el mensaje de error menciona a un método local europeo (por palabra completa,
@@ -1590,11 +1588,12 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
       ? stripeConnect.boundCountry(connected.owner)
       : (connected.owner?.app_metadata?.stripe_connect_test_country || 'ES');
     await stripeConnect.ensureConnectedLocalPaymentMethods(connected.accountId, connectCountry);
+    // Activa todos los locales EUR en la PMC de la plataforma (no solo el del país).
     await stripeConnect.ensurePlatformLocalPaymentMethods(connectCountry);
     cachedPaymentMethodConfiguration = null;
     cachedPaymentMethodConfigurationAt = 0;
     const requestedPaymentMethodTypes = resolveCheckoutPaymentMethodTypes(amount, connectCountry);
-    const expectedLocalMethods = LOCAL_METHODS_BY_COUNTRY[connectCountry] || [];
+    const preferredLocalMethods = LOCAL_METHODS_BY_COUNTRY[connectCountry] || [];
     const baseLineItems = [
       {
         quantity: 1,
@@ -1674,9 +1673,8 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
     const sessionMethods = Array.isArray(session?.payment_method_types) && session.payment_method_types.length > 0
       ? session.payment_method_types
       : paymentMethodTypes;
-    const methodsList = Array.isArray(sessionMethods) ? sessionMethods : [];
-    const missingLocals = expectedLocalMethods.filter((method) => !methodsList.includes(method));
-    if (missingLocals.length > 0) {
+    const methodsList = Array.isArray(sessionMethods) ? sessionMethods.filter((m) => m !== 'card') : [];
+    if (methodsList.length === 0) {
       try {
         if (session?.id) await connected.stripe.checkout.sessions.expire(session.id);
       } catch {
@@ -1684,15 +1682,23 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
       }
       return res.status(502).json({
         ok: false,
-        code: connectCountry === 'ES' ? 'bizum_not_enabled' : 'local_payment_methods_unavailable',
+        code: 'local_payment_methods_unavailable',
         error: LOCAL_METHODS_MERCHANT_HINT,
-        paymentMethods: methodsList,
+        paymentMethods: [],
+      });
+    }
+    const missingPreferred = preferredLocalMethods.filter((method) => !methodsList.includes(method));
+    if (missingPreferred.length > 0) {
+      console.warn('Checkout sin método preferido del país (se ofrece el resto de locales EUR):', {
+        country: connectCountry,
+        missing: missingPreferred,
+        offered: methodsList,
       });
     }
     console.log('Checkout online creado:', {
       chargeMode,
       accountId: connected.accountId,
-      paymentMethods: sessionMethods || 'auto',
+      paymentMethods: methodsList,
       country: connectCountry,
       amount,
     });
@@ -1703,7 +1709,8 @@ app.post('/api/stripe/payment', requireAuth, async (req, res) => {
       redirectUrl,
       checkoutUrl: redirectUrl,
       qrDataUrl,
-      paymentMethods: sessionMethods || 'auto',
+      paymentMethods: methodsList,
+      preferredMissing: missingPreferred,
       amount,
       accountId: connected?.accountId || null,
       chargeMode,
