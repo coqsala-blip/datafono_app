@@ -30,6 +30,12 @@ npx eas build --platform android --profile production --non-interactive
 
 **Nota:** el `versionCode` lo incrementa EAS (`appVersionSource: remote` + `autoIncrement`). No hace falta fijarlo en `app.json`.
 
+### Último AAB generado (versionCode 3)
+
+- Página EAS: https://expo.dev/accounts/hichfla/projects/tpv-app/builds/e5fd220c-bde9-48da-8f1a-3a4b1e6e0e05  
+- Descarga `.aab`: https://expo.dev/artifacts/eas/zsAVMbyB3pMCPQuUDt-qsBlc_cipy6YCV2XnMmHPZWc.aab  
+- Siguiente paso: subir este AAB a **Prueba interna** en Play Console.
+
 ---
 
 ## 2. Prueba interna (track Internal testing)
