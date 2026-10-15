@@ -46,15 +46,20 @@
       "expo-localization"
     ],
     "android": {
+      "package": "com.hichfla.tpvapp",
       "permissions": [
         "android.permission.CAMERA",
         "android.permission.RECORD_AUDIO",
         "android.permission.NFC",
+        "android.permission.ACCESS_COARSE_LOCATION",
         "android.permission.ACCESS_FINE_LOCATION",
         "android.permission.BLUETOOTH_SCAN",
         "android.permission.BLUETOOTH_CONNECT"
       ],
-      "package": "com.hichfla.tpvapp"
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0B6BCB"
+      }
     },
     "extra": {
       "eas": {

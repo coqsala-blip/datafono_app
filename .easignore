@@ -1,0 +1,18 @@
+# Reduce EAS upload size (local APKs/demos were ~1+ GB) and avoid stale native trees.
+*.apk
+*.aab
+TPV-Gestion-*.apk
+build-apk.log
+.git/
+.expo/
+.vscode/
+*.log
+coverage/
+dist/
+web-build/
+# EAS regenerates android/ via prebuild; local android/ is for USB APKs only.
+android/
+ios/
+docs/
+assets/icon-backup.png
+assets/expo.icon/

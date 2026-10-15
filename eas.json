@@ -28,7 +28,7 @@
       "autoIncrement": true,
       "channel": "production",
       "android": {
-        "buildType": "apk"
+        "buildType": "app-bundle"
       },
       "env": {
         "EXPO_PUBLIC_DOCUMENT_API_URL": "https://tpv-gestor-backend.onrender.com",
