@@ -31,6 +31,12 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { buildAuthRequestBody, classifySessionCheck, getOrCreateDeviceId, validateAuthForm, type AuthForm } from '../auth/auth-session';
 import { LogoSettings } from '../components/logo-settings';
 import { VatRateField } from '../components/vat-rate-field';
+import {
+  allocateNextInvoiceNumber,
+  displayFiscalDocumentType,
+  resolveStoredDocumentType,
+  type InvoiceSequenceByYear,
+} from '../documents/invoice-number';
 import { normalizeLogoSettings, renderIssuerBlock, type LogoOffset, type LogoPosition, type LogoSize } from '../documents/logo-layout';
 import { buildPdfFilename, buildReportPdfFilename, copyPdfForExport } from '../documents/pdf-export';
 import { APP_LOCALES, APP_LOCALE_STORAGE_KEY, detectDeviceLocale, formatCurrencyForLocale, isAppLocale, t as translateKey, type AppLocale } from '../i18n';
@@ -282,6 +288,7 @@ const STORAGE_KEY_ISSUER = '@tpv_issuer_v1';
 const STORAGE_KEY_OWNER_PIN = '@tpv_owner_pin_v1';
 const STORAGE_KEY_OWNER_RECOVERY_EMAIL = '@tpv_owner_recovery_email_v1';
 const STORAGE_KEY_OWNER_RECOVERY_PHONE = '@tpv_owner_recovery_phone_v1';
+const STORAGE_KEY_INVOICE_SEQ = '@tpv_invoice_seq_v1';
 // Cobro online pendiente: permite confirmar el ticket aunque la app se recargue al volver de Stripe.
 const STORAGE_KEY_PENDING_ONLINE_PAYMENT = '@tpv_pending_online_payment_v1';
 const AUTH_TOKEN_KEY = 'tpv_access_token';
@@ -517,7 +524,7 @@ const [seatsPanelOpen, setSeatsPanelOpen] = useState(false);
   }).format(new Date(isoDate));
   const documentTypeLabel = (type: DocumentType) => {
     const keys: Record<DocumentType, string> = {
-      'TICKET DE VENTA': 'document.sale',
+      'TICKET DE VENTA': 'document.simplified',
       'FACTURA SIMPLIFICADA': 'document.simplified',
       'FACTURA COMPLETA': 'document.complete',
       'TICKET DE DEVOLUCIÓN': 'document.refund',
@@ -577,6 +584,9 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   const syncHistoryFromCloudRef = useRef<(options?: { silent?: boolean }) => Promise<void>>(() => Promise.resolve());
   const transactionsRef = useRef<Transaction[]>([]);
   transactionsRef.current = transactions;
+  const cashInvoiceDraftsRef = useRef<CashInvoiceDraft[]>([]);
+  cashInvoiceDraftsRef.current = cashInvoiceDrafts;
+  const invoiceSeqRef = useRef<InvoiceSequenceByYear>({});
   registerTransactionDocumentRef.current = registerTransactionDocument;
 
   const onlinePaymentRef = useRef<{
@@ -725,6 +735,8 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     setIsLoaded(false);
     autoSyncDoneRef.current = false;
     transactionsRef.current = [];
+    cashInvoiceDraftsRef.current = [];
+    invoiceSeqRef.current = {};
     onlinePaymentRef.current = null;
     onlinePaymentConfirmedRef.current = false;
     setTransactions([]);
@@ -848,6 +860,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
           storedOwnerPin,
           storedRecoveryEmail,
           storedRecoveryPhone,
+          storedInvoiceSeq,
         ] = await AsyncStorage.multiGet([
           STORAGE_KEY_TRANSACTIONS,
           STORAGE_KEY_CASH_INVOICE_DRAFTS,
@@ -855,6 +868,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
           STORAGE_KEY_OWNER_PIN,
           STORAGE_KEY_OWNER_RECOVERY_EMAIL,
           STORAGE_KEY_OWNER_RECOVERY_PHONE,
+          STORAGE_KEY_INVOICE_SEQ,
         ].map((key) => accountStorageKey(key, storageScope))).then((entries) => entries.map(([, value]) => value)).catch((error) => {
           if (isCurrent()) issuerLoadedScopeRef.current = null;
           throw error;
@@ -910,6 +924,14 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         if (storedOwnerPin) setOwnerPin(storedOwnerPin);
         if (storedRecoveryEmail) setOwnerRecoveryEmail(storedRecoveryEmail);
         if (storedRecoveryPhone) setOwnerRecoveryPhone(storedRecoveryPhone);
+        if (storedInvoiceSeq) {
+          try {
+            const parsedSeq = JSON.parse(storedInvoiceSeq) as InvoiceSequenceByYear;
+            if (parsedSeq && typeof parsedSeq === 'object') invoiceSeqRef.current = parsedSeq;
+          } catch {
+            invoiceSeqRef.current = {};
+          }
+        }
       } catch (error) {
         console.error('Error al cargar datos guardados:', error);
       } finally {
@@ -2236,17 +2258,33 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     const createdAt = new Date().toISOString();
     const randomSuffix = Math.random().toString(36).slice(2, 6).toUpperCase();
     const id = `${Date.now()}-${randomSuffix}`;
-    const prefix = documentType === 'TICKET DE VENTA' ? 'TK' : documentType === 'TICKET DE DEVOLUCIÓN' ? 'DEV' : 'FAC';
+    const resolvedDocumentType = resolveStoredDocumentType(documentType) as DocumentType;
     const activeIva = customIvaRate !== undefined ? customIvaRate : Number(ivaPercentage);
     const taxMultiplier = 1 + (activeIva / 100);
     const subtotal = finalAmount / taxMultiplier;
-    
-    const ticketCode = `${prefix}-${Date.now().toString().slice(-6)}-${randomSuffix}`;
+    const year = new Date(createdAt).getFullYear();
+    const existingCodes = [
+      ...transactionsRef.current.map((item) => item.ticketCode),
+      ...cashInvoiceDraftsRef.current.map((item) => item.ticketCode),
+    ];
+    const allocated = allocateNextInvoiceNumber({
+      year,
+      existingCodes,
+      lastIssuedByYear: invoiceSeqRef.current,
+    });
+    invoiceSeqRef.current = allocated.lastIssuedByYear;
+    if (storageScope) {
+      AsyncStorage.setItem(
+        accountStorageKey(STORAGE_KEY_INVOICE_SEQ, storageScope),
+        JSON.stringify(invoiceSeqRef.current),
+      ).catch((error) => console.error('Error al guardar serie de facturas:', error));
+    }
+    const ticketCode = allocated.ticketCode;
     const transaction: Transaction = {
       id,
       ticketCode,
       type,
-      documentType,
+      documentType: resolvedDocumentType,
       amount: finalAmount,
       originalAmount: finalAmount,
       subtotal,
@@ -3528,8 +3566,26 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         return;
       }
 
-      const ticketCode = `${presupuestoDocumentType === 'FACTURA' ? 'FAC' : 'PRES'}-${Date.now().toString().slice(-6)}`;
       const createdAt = new Date().toISOString();
+      let ticketCode = `PRES-${Date.now().toString().slice(-6)}`;
+      if (presupuestoDocumentType === 'FACTURA') {
+        const allocated = allocateNextInvoiceNumber({
+          year: new Date(createdAt).getFullYear(),
+          existingCodes: [
+            ...transactionsRef.current.map((item) => item.ticketCode),
+            ...cashInvoiceDraftsRef.current.map((item) => item.ticketCode),
+          ],
+          lastIssuedByYear: invoiceSeqRef.current,
+        });
+        invoiceSeqRef.current = allocated.lastIssuedByYear;
+        ticketCode = allocated.ticketCode;
+        if (storageScope) {
+          AsyncStorage.setItem(
+            accountStorageKey(STORAGE_KEY_INVOICE_SEQ, storageScope),
+            JSON.stringify(invoiceSeqRef.current),
+          ).catch((error) => console.error('Error al guardar serie de facturas:', error));
+        }
+      }
       const tempPresupuestoTransaction: Transaction = {
         id: `pres-${Date.now()}`,
         ticketCode,
@@ -3571,7 +3627,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
 
       const result = await MailComposer.composeAsync({
         recipients: [presupuestoClientEmail.trim()],
-        subject: `${presupuestoDocumentType === 'FACTURA' ? 'Factura' : 'Presupuesto'} de Servicios - Ref: ${documentForPdf.ticketCode} (${issuer.name})`,
+        subject: `${presupuestoDocumentType === 'FACTURA' ? 'Factura' : 'Presupuesto'} de Servicios - ${presupuestoDocumentType === 'FACTURA' ? 'Factura N' : 'Ref'} ${documentForPdf.ticketCode} (${issuer.name})`,
         body: `Estimado/a ${validClient.name},\n\nAdjunto le hacemos llegar la ${presupuestoDocumentType === 'FACTURA' ? 'factura' : 'presupuesto'} solicitada con importe total de ${formatCurrency(totalWithIva)}.\n\nAtentamente,\n${issuer.name}`,
         attachments: [pdfUri],
       });
@@ -4148,8 +4204,8 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
           <div class="container">
             ${documentLogo.topHtml}
             <div class="divider"></div>
-            <div class="center bold" style="font-size: ${isA4 ? '14px' : '11px'}; margin-bottom: 6px;">${transaction.documentType}</div>
-            <div class="subtitle">Ref: <b>${transaction.ticketCode}</b></div>
+            <div class="center bold" style="font-size: ${isA4 ? '14px' : '11px'}; margin-bottom: 6px;">${fiscalTitle}</div>
+            <div class="subtitle">${transaction.documentType === 'PRESUPUESTO' ? 'Ref' : 'Factura N'} <b>${transaction.ticketCode}</b></div>
             <div class="subtitle">Fecha: ${formatDate(transaction.createdAt)}</div>
             ${transaction.relatedTicketCode ? `<div class="subtitle">Ticket original: <b>${transaction.relatedTicketCode}</b></div>` : ''}
             ${refundSummaryHtml}

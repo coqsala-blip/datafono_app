@@ -3,7 +3,7 @@ import type { AppLocale } from '../i18n';
 const rows: Record<string, readonly [string, string, string, string, string, string, string, string]> = {
   'registration.additionalUser': ['Soy usuario adicional', 'I am an additional user', 'Je suis un utilisateur supplémentaire', 'Ich bin ein zusätzlicher Benutzer', 'Sono un utente aggiuntivo', 'Sou um utilizador adicional', 'Ik ben een extra gebruiker', 'Jestem dodatkowym użytkownikiem'],
   'registration.additionalCode': ['Código de usuario adicional', 'Additional user code', 'Code utilisateur supplémentaire', 'Code für zusätzlichen Benutzer', 'Codice utente aggiuntivo', 'Código de utilizador adicional', 'Code voor extra gebruiker', 'Kod dodatkowego użytkownika'],
-  'document.sale': ['Ticket de venta', 'Sales receipt', 'Ticket de vente', 'Verkaufsbeleg', 'Scontrino di vendita', 'Talão de venda', 'Verkoopbon', 'Paragon sprzedaży'],
+  'document.sale': ['Factura simplificada', 'Simplified invoice', 'Facture simplifiée', 'Vereinfachte Rechnung', 'Fattura semplificata', 'Fatura simplificada', 'Vereenvoudigde factuur', 'Faktura uproszczona'],
   'document.simplified': ['Factura simplificada', 'Simplified invoice', 'Facture simplifiée', 'Vereinfachte Rechnung', 'Fattura semplificata', 'Fatura simplificada', 'Vereenvoudigde factuur', 'Faktura uproszczona'],
   'document.complete': ['Factura completa', 'Full invoice', 'Facture complète', 'Vollständige Rechnung', 'Fattura completa', 'Fatura completa', 'Volledige factuur', 'Pełna faktura'],
   'document.refund': ['Ticket de devolución', 'Refund receipt', 'Ticket de remboursement', 'Erstattungsbeleg', 'Ricevuta di rimborso', 'Talão de devolução', 'Retourbon', 'Paragon zwrotu'],
@@ -12,7 +12,8 @@ const rows: Record<string, readonly [string, string, string, string, string, str
   'document.invoice': ['Factura', 'Invoice', 'Facture', 'Rechnung', 'Fattura', 'Fatura', 'Factuur', 'Faktura'],
   'workflow.generalClient': ['Cliente General', 'General customer', 'Client générique', 'Allgemeiner Kunde', 'Cliente generico', 'Cliente geral', 'Algemene klant', 'Klient ogólny'],
   'workflow.client': ['Cliente', 'Customer', 'Client', 'Kunde', 'Cliente', 'Cliente', 'Klant', 'Klient'],
-  'workflow.reference': ['Referencia', 'Reference', 'Référence', 'Referenz', 'Riferimento', 'Referência', 'Referentie', 'Numer referencyjny'],
+  'workflow.reference': ['Factura N', 'Invoice No.', 'Facture N', 'Rechnung Nr.', 'Fattura N', 'Fatura N', 'Factuur nr.', 'Faktura nr'],
+  'workflow.ref': ['Ref', 'Ref', 'Réf.', 'Ref.', 'Rif.', 'Ref', 'Ref', 'Ref'],
   'workflow.date': ['Fecha', 'Date', 'Date', 'Datum', 'Data', 'Data', 'Datum', 'Data'],
   'workflow.type': ['Tipo', 'Type', 'Type', 'Typ', 'Tipo', 'Tipo', 'Type', 'Typ'],
   'workflow.provider': ['Proveedor', 'Supplier', 'Fournisseur', 'Lieferant', 'Fornitore', 'Fornecedor', 'Leverancier', 'Dostawca'],

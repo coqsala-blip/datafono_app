@@ -5,6 +5,7 @@ import { Image, PixelRatio, Platform, Pressable, ScrollView, StyleSheet, Text, V
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { captureRef, releaseCapture } from 'react-native-view-shot';
 import { buildImageFilename, copyImageForExport, getImageCaptureSize } from '../documents/image-export';
+import { displayFiscalDocumentType } from '../documents/invoice-number';
 import { getLogoLayout, type LogoSettings } from '../documents/logo-layout';
 import { formatCurrencyForLocale, t, type AppLocale } from '../i18n';
 
@@ -164,7 +165,7 @@ export function DocumentImageShare({ document, locale, qrUri, onClose }: Props) 
           <Text style={styles.text}>{tr('workflow.taxId')}: {document.issuer.nif}</Text>
           <Text style={styles.text}>{document.issuer.address}</Text>
           <Text style={styles.title}>{title}</Text>
-          {line(tr('workflow.reference'), document.ticketCode)}
+          {line(document.documentType === 'PRESUPUESTO' ? tr('workflow.ref') : tr('workflow.reference'), document.ticketCode)}
           {line(tr('workflow.date'), date(document.createdAt))}
           {document.client && <View style={styles.section}>
             <Text style={styles.bold}>{tr('workflow.client')}</Text>
@@ -198,7 +199,7 @@ export function DocumentImageShare({ document, locale, qrUri, onClose }: Props) 
           {document.publicUrl && qrUri && <View style={styles.qr}>
             <Text style={styles.bold}>{tr('ticket.qr')}</Text>
             {renderImage('qr', qrUri, 140, 140)}
-            <Text style={styles.text}>{tr('ticket.code')}: {document.ticketCode}</Text>
+            <Text style={[styles.text, styles.bold]}>{document.ticketCode}</Text>
           </View>}
           {logo.placement === 'bottom' && logoView}
         </View>
