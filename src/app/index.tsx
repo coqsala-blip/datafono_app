@@ -4109,6 +4109,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   };
 
   const generatePdfFileUri = async (transaction: Transaction): Promise<string> => {
+    const fiscalTitle = displayFiscalDocumentType(transaction.documentType);
     const filename = buildPdfFilename([documentTypeLabel(transaction.documentType), transaction.ticketCode]);
     const qrApiUrl = getTransactionQrUrl(transaction, 140);
     const isA4 = transaction.documentType === 'FACTURA COMPLETA' ||
