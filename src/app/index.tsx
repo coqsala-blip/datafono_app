@@ -40,13 +40,22 @@ import {
 import { normalizeLogoSettings, renderIssuerBlock, type LogoOffset, type LogoPosition, type LogoSize } from '../documents/logo-layout';
 import { buildPdfFilename, buildReportPdfFilename, copyPdfForExport } from '../documents/pdf-export';
 import { APP_LOCALES, APP_LOCALE_STORAGE_KEY, detectDeviceLocale, formatCurrencyForLocale, isAppLocale, t as translateKey, type AppLocale } from '../i18n';
+import {
+  addOrIncrementCartLine,
+  cartToInvoiceItems,
+  cartTotal as sumCatalogCart,
+  formatInvoiceItemLabel,
+  type CatalogCartLine,
+  type CatalogProduct,
+} from '../products/catalog';
 import { CONNECT_EU_COUNTRIES, connectCountryLabel, connectErrorKey, connectStatusKey, normalizeConnectCountry, parseConnectOnboardingUrl, parseConnectStatus, type ConnectCountry } from '../payments/connect-onboarding';
 import { buildEmailedReport } from '../reports/emailed-report';
 import { useAppOta } from '../updates/use-app-ota';
 
 type DocumentType = 'TICKET DE VENTA' | 'FACTURA SIMPLIFICADA' | 'FACTURA COMPLETA' | 'TICKET DE DEVOLUCIÓN' | 'COMPRA/DEVOLUCIONES' | 'PRESUPUESTO' | 'FACTURA';
 type TransactionType = 'COBRO' | 'DEVOLUCIÓN';
-type Tab = 'gastos_facturacion' | 'tpv' | 'presupuesto' | 'stats' | 'config';
+type Tab = 'gastos_facturacion' | 'tpv' | 'productos' | 'presupuesto' | 'stats' | 'config';
+type ProductDestination = 'tpv' | 'factura' | 'presupuesto';
 type UserRole = 'principal' | 'empleado';
 type AuthenticatedUser = { id?: string; app_metadata?: { role?: unknown; company_owner_id?: unknown } };
 
@@ -67,8 +76,9 @@ type Issuer = {
   country?: string;
   additionalUsers?: number;
 };
-type InvoiceItem = { id: string; description: string; price: string };
+type InvoiceItem = { id: string; description: string; price: string; quantity?: number };
 type PendingInvoice = { client: Client; items: InvoiceItem[]; ivaRate: number; total: number; docType: DocumentType };
+type PendingCatalogCharge = { items: InvoiceItem[]; total: number };
 type StripeTerminalPaymentIntentResult = {
   paymentIntentId?: string;
   clientSecret?: string;
@@ -289,6 +299,7 @@ const STORAGE_KEY_OWNER_PIN = '@tpv_owner_pin_v1';
 const STORAGE_KEY_OWNER_RECOVERY_EMAIL = '@tpv_owner_recovery_email_v1';
 const STORAGE_KEY_OWNER_RECOVERY_PHONE = '@tpv_owner_recovery_phone_v1';
 const STORAGE_KEY_INVOICE_SEQ = '@tpv_invoice_seq_v1';
+const STORAGE_KEY_CATALOG_PRODUCTS = '@tpv_catalog_products_v1';
 // Cobro online pendiente: permite confirmar el ticket aunque la app se recargue al volver de Stripe.
 const STORAGE_KEY_PENDING_ONLINE_PAYMENT = '@tpv_pending_online_payment_v1';
 const AUTH_TOKEN_KEY = 'tpv_access_token';
@@ -615,6 +626,16 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   const [invoiceItems, setInvoiceItems] = useState<InvoiceItem[]>([{ id: '1', description: '', price: '' }]);
   const [invoiceIvaInput, setInvoiceIvaInput] = useState('21');
   const [pendingInvoice, setPendingInvoice] = useState<PendingInvoice | null>(null);
+  const [catalogProducts, setCatalogProducts] = useState<CatalogProduct[]>([]);
+  const [catalogCart, setCatalogCart] = useState<CatalogCartLine[]>([]);
+  const [pendingCatalogCharge, setPendingCatalogCharge] = useState<PendingCatalogCharge | null>(null);
+  const [productDestination, setProductDestination] = useState<ProductDestination>('tpv');
+  const [productFormVisible, setProductFormVisible] = useState(false);
+  const [productNameInput, setProductNameInput] = useState('');
+  const [productPriceInput, setProductPriceInput] = useState('');
+  const [productPhotoUri, setProductPhotoUri] = useState<string | null>(null);
+  const [quantityProduct, setQuantityProduct] = useState<CatalogProduct | null>(null);
+  const [quantityValue, setQuantityValue] = useState(1);
 
   // Estados específicos para Presupuesto
   const [presupuestoClient, setPresupuestoClient] = useState<Client>({ name: '', nif: '', address: '' });
@@ -768,6 +789,15 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     setTicketToPartialRefund(null);
     setPartialRefundModalVisible(false);
     setPendingInvoice(null);
+    setPendingCatalogCharge(null);
+    setCatalogProducts([]);
+    setCatalogCart([]);
+    setProductDestination('tpv');
+    setProductFormVisible(false);
+    setProductNameInput('');
+    setProductPriceInput('');
+    setProductPhotoUri(null);
+    setQuantityProduct(null);
     setPendingDocumentType('TICKET DE VENTA');
     setClient({ name: '', nif: '', address: '' });
     setInvoiceItems([{ id: '1', description: '', price: '' }]);
@@ -861,6 +891,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
           storedRecoveryEmail,
           storedRecoveryPhone,
           storedInvoiceSeq,
+          storedCatalogProducts,
         ] = await AsyncStorage.multiGet([
           STORAGE_KEY_TRANSACTIONS,
           STORAGE_KEY_CASH_INVOICE_DRAFTS,
@@ -869,6 +900,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
           STORAGE_KEY_OWNER_RECOVERY_EMAIL,
           STORAGE_KEY_OWNER_RECOVERY_PHONE,
           STORAGE_KEY_INVOICE_SEQ,
+          STORAGE_KEY_CATALOG_PRODUCTS,
         ].map((key) => accountStorageKey(key, storageScope))).then((entries) => entries.map(([, value]) => value)).catch((error) => {
           if (isCurrent()) issuerLoadedScopeRef.current = null;
           throw error;
@@ -924,6 +956,14 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         if (storedOwnerPin) setOwnerPin(storedOwnerPin);
         if (storedRecoveryEmail) setOwnerRecoveryEmail(storedRecoveryEmail);
         if (storedRecoveryPhone) setOwnerRecoveryPhone(storedRecoveryPhone);
+        if (storedCatalogProducts) {
+          try {
+            const parsedProducts = JSON.parse(storedCatalogProducts) as CatalogProduct[];
+            if (Array.isArray(parsedProducts)) setCatalogProducts(parsedProducts);
+          } catch {
+            setCatalogProducts([]);
+          }
+        }
         if (storedInvoiceSeq) {
           try {
             const parsedSeq = JSON.parse(storedInvoiceSeq) as InvoiceSequenceByYear;
@@ -1743,6 +1783,13 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
 
   useEffect(() => {
     if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
+    AsyncStorage.setItem(accountStorageKey(STORAGE_KEY_CATALOG_PRODUCTS, storageScope), JSON.stringify(catalogProducts)).catch((error) =>
+      console.error('Error al guardar catálogo:', error)
+    );
+  }, [catalogProducts, isLoaded, storageScope]);
+
+  useEffect(() => {
+    if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
     AsyncStorage.setItem(accountStorageKey(STORAGE_KEY_CASH_INVOICE_DRAFTS, storageScope), JSON.stringify(cashInvoiceDrafts)).catch((error) =>
       console.error('Error al guardar facturas pendientes de cobro:', error)
     );
@@ -1813,7 +1860,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   }, [isLoaded, transactions.length, storageScope, accessToken]);
 
   useEffect(() => {
-    if (userRole === 'empleado' && activeTab !== 'tpv') setActiveTab('tpv');
+    if (userRole === 'empleado' && activeTab !== 'tpv' && activeTab !== 'productos') setActiveTab('tpv');
   }, [userRole, activeTab]);
 
   useEffect(() => {
@@ -2319,10 +2366,21 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     }, 0);
   }, [amount, ivaPercentage, issuer, isLoaded, storageScope]);
 
+  const catalogItemsAsNet = (items: InvoiceItem[], ivaRate: number): InvoiceItem[] => {
+    const divisor = 1 + (Math.max(0, ivaRate) / 100);
+    return items.map((item) => {
+      const gross = parseFloat(item.price.replace(',', '.')) || 0;
+      return { ...item, price: (gross / divisor).toFixed(2) };
+    });
+  };
+
   const startPayment = (documentType: DocumentType) => {
     if (!requireSubscription('realizar cobros')) return;
     if (documentType === 'FACTURA COMPLETA' || documentType === 'FACTURA SIMPLIFICADA') {
       setPendingDocumentType(documentType);
+      if (pendingCatalogCharge?.items.length) {
+        setInvoiceItems(catalogItemsAsNet(pendingCatalogCharge.items, Number(ivaPercentage)));
+      }
       setClientModalVisible(true);
       return;
     }
@@ -2331,6 +2389,132 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       return;
     }
     setPendingDocumentType(documentType);
+    setNfcModalVisible(true);
+  };
+
+  const openCatalogFromTpv = () => {
+    if (!requireSubscription('realizar cobros')) return;
+    setProductDestination('tpv');
+    setActiveTab('productos');
+  };
+
+  const resetProductForm = () => {
+    setProductNameInput('');
+    setProductPriceInput('');
+    setProductPhotoUri(null);
+    setProductFormVisible(false);
+  };
+
+  const pickProductImage = async (fromCamera: boolean) => {
+    try {
+      if (fromCamera) {
+        const permission = await ImagePicker.requestCameraPermissionsAsync();
+        if (!permission.granted) {
+          Alert.alert(tr('validation.error'), tr('scanner.permission'));
+          return;
+        }
+        const result = await ImagePicker.launchCameraAsync({
+          mediaTypes: ImagePicker.MediaTypeOptions.Images,
+          quality: 0.7,
+        });
+        if (!result.canceled && result.assets[0]?.uri) setProductPhotoUri(result.assets[0].uri);
+        return;
+      }
+      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!permission.granted) {
+        Alert.alert(tr('validation.error'), tr('scanner.permission'));
+        return;
+      }
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        quality: 0.7,
+      });
+      if (!result.canceled && result.assets[0]?.uri) setProductPhotoUri(result.assets[0].uri);
+    } catch {
+      Alert.alert(tr('validation.error'), tr('scanner.permission'));
+    }
+  };
+
+  const saveCatalogProduct = () => {
+    const name = productNameInput.trim();
+    const price = parseFloat(productPriceInput.replace(',', '.'));
+    if (!name) {
+      Alert.alert(tr('validation.error'), tr('products.nameRequired'));
+      return;
+    }
+    if (!Number.isFinite(price) || price <= 0) {
+      Alert.alert(tr('validation.error'), tr('products.priceRequired'));
+      return;
+    }
+    const product: CatalogProduct = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      name,
+      price: Math.round(price * 100) / 100,
+      ...(productPhotoUri ? { photoUri: productPhotoUri } : {}),
+      createdAt: new Date().toISOString(),
+    };
+    setCatalogProducts((current) => [product, ...current]);
+    resetProductForm();
+  };
+
+  const deleteCatalogProduct = (productId: string) => {
+    setCatalogProducts((current) => current.filter((product) => product.id !== productId));
+    setCatalogCart((current) => current.filter((line) => line.productId !== productId));
+  };
+
+  const confirmProductQuantity = () => {
+    if (!quantityProduct || quantityValue < 1) return;
+    setCatalogCart((current) => addOrIncrementCartLine(current, quantityProduct, quantityValue));
+    setQuantityProduct(null);
+    setQuantityValue(1);
+  };
+
+  const dispatchCatalogSelection = () => {
+    if (!requireSubscription('realizar cobros')) return;
+    if (catalogCart.length === 0) {
+      Alert.alert(tr('validation.error'), tr('products.cartEmpty'));
+      return;
+    }
+    const items = cartToInvoiceItems(catalogCart);
+    const total = sumCatalogCart(catalogCart);
+    if (productDestination === 'tpv') {
+      setDigits(String(Math.max(0, Math.round(total * 100))));
+      setPendingCatalogCharge({ items, total });
+      setActiveTab('tpv');
+      Alert.alert(tr('products.title'), tr('products.sentToTpv'));
+      return;
+    }
+    const quoteIva = parseFloat(presupuestoIvaInput.replace(',', '.')) || Number(ivaPercentage) || 21;
+    const netItems = catalogItemsAsNet(items, quoteIva);
+    if (productDestination === 'presupuesto') {
+      setPresupuestoDocumentType('PRESUPUESTO');
+      setPresupuestoItems((current) => {
+        const blankOnly = current.length === 1 && !current[0].description.trim() && !current[0].price.trim();
+        return blankOnly ? netItems : [...current.filter((item) => item.description.trim() || item.price.trim()), ...netItems];
+      });
+      setCatalogCart([]);
+      setActiveTab('presupuesto');
+      Alert.alert(tr('products.title'), tr('products.addedToQuote'));
+      return;
+    }
+    setPresupuestoDocumentType('FACTURA');
+    setPresupuestoItems((current) => {
+      const blankOnly = current.length === 1 && !current[0].description.trim() && !current[0].price.trim();
+      return blankOnly ? netItems : [...current.filter((item) => item.description.trim() || item.price.trim()), ...netItems];
+    });
+    setCatalogCart([]);
+    setActiveTab('presupuesto');
+    Alert.alert(tr('products.title'), tr('products.addedToInvoice'));
+  };
+
+  const startCatalogChargeFromTpv = () => {
+    if (!requireSubscription('realizar cobros')) return;
+    if (!pendingCatalogCharge || pendingCatalogCharge.total <= 0) {
+      Alert.alert(tr('validation.error'), tr('validation.amount'));
+      return;
+    }
+    setDigits(String(Math.max(0, Math.round(pendingCatalogCharge.total * 100))));
+    setPendingDocumentType('FACTURA SIMPLIFICADA');
     setNfcModalVisible(true);
   };
 
@@ -2372,6 +2556,8 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       total: totalWithIva, 
       docType: pendingDocumentType 
     });
+    setPendingCatalogCharge(null);
+    setCatalogCart([]);
     setNfcModalVisible(true);
   };
 
@@ -2437,6 +2623,19 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       setClient({ name: '', nif: '', address: '' });
       setInvoiceItems([{ id: '1', description: '', price: '' }]);
       setInvoiceIvaInput('21');
+    } else if (pendingCatalogCharge) {
+      createTransaction(
+        'COBRO',
+        'FACTURA SIMPLIFICADA',
+        method,
+        paymentAmount,
+        undefined,
+        pendingCatalogCharge.items,
+        Number(ivaPercentage),
+        paymentRefs,
+      );
+      setPendingCatalogCharge(null);
+      setCatalogCart([]);
     } else {
       createTransaction('COBRO', pendingDocumentType, method, paymentAmount, undefined, undefined, undefined, paymentRefs);
     }
@@ -4147,7 +4346,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         <div style="font-weight: bold; font-size: 11px; margin-bottom: 6px;">PRODUCTOS / SERVICIOS:</div>
         ${transaction.items.map(item => `
           <div style="display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 4px;">
-            <span style="flex: 2; padding-right: 10px;">- ${item.description}</span>
+            <span style="flex: 2; padding-right: 10px;">- ${formatInvoiceItemLabel(item)}</span>
             <span style="flex: 1; text-align: right; font-weight: bold;">${formatCurrency(parseFloat(item.price.replace(',', '.')) || 0)}</span>
           </div>
         `).join('')}
@@ -4795,6 +4994,9 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         <Pressable style={[styles.tabButton, activeTab === 'tpv' && styles.tabButtonActive]} onPress={() => setActiveTab('tpv')}>
           <Text style={[styles.tabText, activeTab === 'tpv' && styles.tabTextActive]}>{tr('tab.tpv')}</Text>
         </Pressable>
+        <Pressable style={[styles.tabButton, activeTab === 'productos' && styles.tabButtonActive]} onPress={() => setActiveTab('productos')}>
+          <Text style={[styles.tabText, activeTab === 'productos' && styles.tabTextActive]}>{tr('tab.products')}</Text>
+        </Pressable>
         {userRole === 'principal' && (
           <>
             <Pressable style={[styles.tabButton, activeTab === 'presupuesto' && styles.tabButtonActive]} onPress={() => setActiveTab('presupuesto')}>
@@ -4914,6 +5116,26 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                 <Text style={styles.displayText}>{formatUiCurrency(amount)}</Text>
               </View>
 
+              {pendingCatalogCharge ? (
+                <View style={styles.catalogPendingBanner}>
+                  <Text style={styles.catalogPendingTitle}>{tr('products.pendingBanner')}</Text>
+                  {pendingCatalogCharge.items.map((item) => (
+                    <Text key={item.id} style={styles.catalogPendingLine}>
+                      {formatInvoiceItemLabel(item)} — {formatUiCurrency(parseFloat(item.price.replace(',', '.')) || 0)}
+                    </Text>
+                  ))}
+                  <Pressable style={[styles.actionBtnTicket, { marginTop: 8 }]} onPress={startCatalogChargeFromTpv}>
+                    <Text style={styles.actionBtnText}>{tr('products.chargeNow')}</Text>
+                  </Pressable>
+                  <Pressable
+                    style={[styles.secondaryButton, { marginTop: 6 }]}
+                    onPress={() => { setPendingCatalogCharge(null); setDigits('0'); }}
+                  >
+                    <Text style={styles.secondaryButtonText}>{tr('products.clearPending')}</Text>
+                  </Pressable>
+                </View>
+              ) : null}
+
               <View style={styles.keypad}>
                 {['1', '2', '3', '4', '5', '6', '7', '8', '9', 'C', '0', '⌫'].map((key) => (
                   <Pressable key={key} style={styles.keyButton} onPress={() => handleKey(key)}>
@@ -4923,8 +5145,8 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
               </View>
 
               <View style={styles.actionButtonsContainer}>
-                <Pressable style={styles.actionBtnTicket} onPress={() => startPayment('TICKET DE VENTA')}>
-                  <Text style={styles.actionBtnText}>{documentTypeLabel('TICKET DE VENTA')}</Text>
+                <Pressable style={styles.actionBtnTicket} onPress={openCatalogFromTpv}>
+                  <Text style={styles.actionBtnText}>{tr('products.selectCatalog')}</Text>
                 </Pressable>
                 <Pressable style={styles.actionBtnFactura} onPress={() => startPayment('FACTURA SIMPLIFICADA')}>
                   <Text style={styles.actionBtnText}>{documentTypeLabel('FACTURA SIMPLIFICADA')}</Text>
@@ -4939,6 +5161,98 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                   <Text style={styles.scanBarcodeText}>📷 {tr('scanner.open')}</Text>
                 </Pressable>
               </View>
+            </View>
+          </ScrollView>
+        )}
+
+        {/* PESTAÑA: PRODUCTOS */}
+        {activeTab === 'productos' && (
+          <ScrollView contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled" refreshControl={otaRefreshControl}>
+            <View style={styles.card}>
+              <Text style={styles.cardTitle}>{tr('products.title')}</Text>
+              <View style={styles.productDestRow}>
+                {([
+                  ['tpv', 'products.destTpv'],
+                  ['factura', 'products.destInvoice'],
+                  ['presupuesto', 'products.destQuote'],
+                ] as const).map(([key, labelKey]) => (
+                  <Pressable
+                    key={key}
+                    style={[styles.productDestChip, productDestination === key && styles.productDestChipActive]}
+                    onPress={() => setProductDestination(key)}
+                  >
+                    <Text style={[styles.productDestChipText, productDestination === key && styles.productDestChipTextActive]}>
+                      {tr(labelKey)}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+            </View>
+
+            <View style={styles.productGrid}>
+              {catalogProducts.map((product) => (
+                <Pressable
+                  key={product.id}
+                  style={styles.productCard}
+                  onPress={() => { setQuantityProduct(product); setQuantityValue(1); }}
+                  onLongPress={() => {
+                    Alert.alert(product.name, undefined, [
+                      { text: tr('common.cancel'), style: 'cancel' },
+                      { text: tr('products.delete'), style: 'destructive', onPress: () => deleteCatalogProduct(product.id) },
+                    ]);
+                  }}
+                >
+                  {product.photoUri ? (
+                    <Image source={{ uri: product.photoUri }} style={styles.productPhoto} />
+                  ) : (
+                    <View style={[styles.productPhoto, styles.productPhotoPlaceholder]}>
+                      <Text style={styles.productPhotoPlaceholderText}>{product.name.slice(0, 1).toUpperCase()}</Text>
+                    </View>
+                  )}
+                  <Text style={styles.productName} numberOfLines={2}>{product.name}</Text>
+                  <Text style={styles.productPrice}>{formatUiCurrency(product.price)}</Text>
+                </Pressable>
+              ))}
+              <Pressable style={styles.productAddCircle} onPress={() => setProductFormVisible(true)}>
+                <Text style={styles.productAddCircleText}>+</Text>
+              </Pressable>
+            </View>
+            {catalogProducts.length === 0 ? (
+              <Text style={styles.emptyText}>{tr('products.empty')}</Text>
+            ) : null}
+
+            <View style={styles.card}>
+              <Text style={styles.cardTitle}>{tr('products.cart')}</Text>
+              {catalogCart.length === 0 ? (
+                <Text style={styles.emptyText}>{tr('products.cartEmpty')}</Text>
+              ) : (
+                <>
+                  {catalogCart.map((line) => (
+                    <View key={`${line.productId}-${line.unitPrice}`} style={styles.listItem}>
+                      <View>
+                        <Text style={styles.listItemTitle}>{line.quantity} × {line.name}</Text>
+                        <Text style={styles.listItemSubtitle}>{formatUiCurrency(line.unitPrice)} / ud.</Text>
+                      </View>
+                      <Text style={styles.listItemAmount}>{formatUiCurrency(line.unitPrice * line.quantity)}</Text>
+                    </View>
+                  ))}
+                  <Text style={[styles.listItemTitle, { marginTop: 10 }]}>
+                    {tr('products.total')}: {formatUiCurrency(sumCatalogCart(catalogCart))}
+                  </Text>
+                  <Pressable style={[styles.primaryButton, { marginTop: 12 }]} onPress={dispatchCatalogSelection}>
+                    <Text style={styles.primaryButtonText}>
+                      {productDestination === 'tpv'
+                        ? tr('products.sendTpv')
+                        : productDestination === 'factura'
+                          ? tr('products.sendInvoice')
+                          : tr('products.sendQuote')}
+                    </Text>
+                  </Pressable>
+                  <Pressable style={[styles.secondaryButton, { marginTop: 8 }]} onPress={() => setCatalogCart([])}>
+                    <Text style={styles.secondaryButtonText}>{tr('products.clearCart')}</Text>
+                  </Pressable>
+                </>
+              )}
             </View>
           </ScrollView>
         )}
@@ -5503,6 +5817,80 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         </View>
       </Modal>
 
+      {/* MODAL: AÑADIR PRODUCTO AL CATÁLOGO */}
+      <Modal visible={productFormVisible} animationType="slide" transparent>
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <ScrollView keyboardShouldPersistTaps="handled">
+              <Text style={styles.modalTitle}>{tr('products.add')}</Text>
+              <TextInput
+                style={styles.input}
+                placeholder={tr('products.name')}
+                placeholderTextColor="#94a3b8"
+                value={productNameInput}
+                onChangeText={setProductNameInput}
+              />
+              <TextInput
+                style={styles.input}
+                placeholder={tr('products.price')}
+                placeholderTextColor="#94a3b8"
+                keyboardType="decimal-pad"
+                value={productPriceInput}
+                onChangeText={setProductPriceInput}
+              />
+              <Text style={[styles.modalSubtitle, { textAlign: 'left' }]}>{tr('products.photo')}</Text>
+              <View style={styles.rowButtons}>
+                <Pressable style={styles.secondaryButton} onPress={() => void pickProductImage(true)}>
+                  <Text style={styles.secondaryButtonText}>📷 {tr('expense.photo')}</Text>
+                </Pressable>
+                <Pressable style={styles.secondaryButton} onPress={() => void pickProductImage(false)}>
+                  <Text style={styles.secondaryButtonText}>🖼️ {tr('expense.gallery')}</Text>
+                </Pressable>
+              </View>
+              {productPhotoUri ? (
+                <Image source={{ uri: productPhotoUri }} style={[styles.previewImage, { marginVertical: 10 }]} />
+              ) : null}
+              <Pressable style={styles.primaryButton} onPress={saveCatalogProduct}>
+                <Text style={styles.primaryButtonText}>{tr('products.save')}</Text>
+              </Pressable>
+              <Pressable style={[styles.secondaryButton, { marginTop: 8 }]} onPress={resetProductForm}>
+                <Text style={styles.secondaryButtonText}>{tr('common.cancel')}</Text>
+              </Pressable>
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
+      {/* MODAL: CANTIDAD DE PRODUCTO */}
+      <Modal visible={quantityProduct !== null} animationType="fade" transparent>
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <Text style={styles.modalTitle}>{quantityProduct?.name}</Text>
+            <Text style={styles.modalSubtitle}>{tr('products.quantity')}</Text>
+            <View style={styles.quantityRow}>
+              {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((value) => (
+                <Pressable
+                  key={value}
+                  style={[styles.quantityChip, quantityValue === value && styles.quantityChipActive]}
+                  onPress={() => setQuantityValue(value)}
+                >
+                  <Text style={[styles.quantityChipText, quantityValue === value && styles.quantityChipTextActive]}>×{value}</Text>
+                </Pressable>
+              ))}
+            </View>
+            <Text style={[styles.listItemTitle, { textAlign: 'center', marginVertical: 10 }]}>
+              {formatUiCurrency((quantityProduct?.price || 0) * quantityValue)}
+            </Text>
+            <Pressable style={styles.primaryButton} onPress={confirmProductQuantity}>
+              <Text style={styles.primaryButtonText}>{tr('products.addToCart')}</Text>
+            </Pressable>
+            <Pressable style={[styles.secondaryButton, { marginTop: 8 }]} onPress={() => setQuantityProduct(null)}>
+              <Text style={styles.secondaryButtonText}>{tr('common.cancel')}</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
+
       {/* MODAL: DATOS DE CLIENTE Y PRODUCTOS PARA FACTURA */}
       <Modal visible={clientModalVisible} animationType="slide" transparent={true}>
         <View style={styles.modalOverlay}>
@@ -5597,7 +5985,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                     <View style={{ marginVertical: 6 }}>
                       <Text style={{ fontWeight: 'bold', fontSize: 11, marginBottom: 4 }}>{tr('ticket.items')}:</Text>
                       {selectedTicket.items.map(it => (
-                        <Text key={it.id} style={{ fontSize: 10, color: '#334155' }}>- {it.description}: {formatUiCurrency(parseFloat(it.price.replace(',', '.')) || 0)}</Text>
+                        <Text key={it.id} style={{ fontSize: 10, color: '#334155' }}>- {formatInvoiceItemLabel(it)}: {formatUiCurrency(parseFloat(it.price.replace(',', '.')) || 0)}</Text>
                       ))}
                     </View>
                   )}
@@ -6090,6 +6478,28 @@ const styles = StyleSheet.create({
   actionBtnFacturaCompleta: { backgroundColor: '#7c3aed', borderRadius: 6, paddingVertical: 12, alignItems: 'center' },
   actionBtnDevolucion: { backgroundColor: '#dc2626', borderRadius: 6, paddingVertical: 12, alignItems: 'center' },
   actionBtnText: { color: '#ffffff', fontSize: 13, fontWeight: 'bold' },
+  catalogPendingBanner: { backgroundColor: '#ecfdf5', borderWidth: 1, borderColor: '#86efac', borderRadius: 8, padding: 12, marginBottom: 10 },
+  catalogPendingTitle: { fontSize: 12, fontWeight: 'bold', color: '#166534', marginBottom: 6 },
+  catalogPendingLine: { fontSize: 11, color: '#14532d', marginBottom: 2 },
+  productDestRow: { flexDirection: 'row', gap: 8, marginTop: 8 },
+  productDestChip: { flex: 1, paddingVertical: 8, borderRadius: 8, borderWidth: 1, borderColor: '#cbd5e1', backgroundColor: '#f8fafc', alignItems: 'center' },
+  productDestChipActive: { backgroundColor: '#0f172a', borderColor: '#0f172a' },
+  productDestChipText: { fontSize: 11, fontWeight: 'bold', color: '#334155' },
+  productDestChipTextActive: { color: '#ffffff' },
+  productGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, paddingHorizontal: 4, marginBottom: 12 },
+  productCard: { width: '30%', minWidth: 96, backgroundColor: '#ffffff', borderRadius: 10, borderWidth: 1, borderColor: '#e2e8f0', padding: 8, alignItems: 'center' },
+  productPhoto: { width: '100%', aspectRatio: 1, borderRadius: 8, marginBottom: 6, backgroundColor: '#f1f5f9' },
+  productPhotoPlaceholder: { alignItems: 'center', justifyContent: 'center' },
+  productPhotoPlaceholderText: { fontSize: 28, fontWeight: 'bold', color: '#94a3b8' },
+  productName: { fontSize: 11, fontWeight: '600', color: '#0f172a', textAlign: 'center', minHeight: 28 },
+  productPrice: { fontSize: 12, fontWeight: 'bold', color: '#16a34a', marginTop: 2 },
+  productAddCircle: { width: 72, height: 72, borderRadius: 36, backgroundColor: '#0f172a', alignItems: 'center', justifyContent: 'center', alignSelf: 'center', marginVertical: 8 },
+  productAddCircleText: { color: '#ffffff', fontSize: 36, fontWeight: '300', marginTop: -2 },
+  quantityRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, justifyContent: 'center' },
+  quantityChip: { minWidth: 48, paddingVertical: 10, paddingHorizontal: 12, borderRadius: 8, backgroundColor: '#f1f5f9', borderWidth: 1, borderColor: '#e2e8f0', alignItems: 'center' },
+  quantityChipActive: { backgroundColor: '#16a34a', borderColor: '#16a34a' },
+  quantityChipText: { fontSize: 14, fontWeight: 'bold', color: '#0f172a' },
+  quantityChipTextActive: { color: '#ffffff' },
   scanBarRow: { marginTop: 4 },
   scanBarcodeBtn: { backgroundColor: '#475569', borderRadius: 6, paddingVertical: 12, alignItems: 'center' },
   scanBarcodeText: { color: '#ffffff', fontSize: 12, fontWeight: 'bold' },

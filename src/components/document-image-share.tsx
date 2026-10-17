@@ -8,6 +8,7 @@ import { buildImageFilename, copyImageForExport, getImageCaptureSize } from '../
 import { displayFiscalDocumentType } from '../documents/invoice-number';
 import { getLogoLayout, type LogoSettings } from '../documents/logo-layout';
 import { formatCurrencyForLocale, t, type AppLocale } from '../i18n';
+import { formatInvoiceItemLabel } from '../products/catalog';
 
 export type ImageShareDocument = Readonly<{
   ticketCode: string;
@@ -175,7 +176,7 @@ export function DocumentImageShare({ document, locale, qrUri, onClose }: Props) 
           </View>}
           {!!document.items?.length && <View style={styles.section}>
             <Text style={styles.bold}>{tr('ticket.items')}</Text>
-            {document.items.map((item, index) => <View key={`${item.id}-${index}`}>{line(item.description, money(parseFloat(item.price.replace(',', '.')) || 0))}</View>)}
+            {document.items.map((item, index) => <View key={`${item.id}-${index}`}>{line(formatInvoiceItemLabel(item), money(parseFloat(item.price.replace(',', '.')) || 0))}</View>)}
           </View>}
           {!!document.refundHistory?.length && <View style={styles.section}>
             <Text style={styles.bold}>{tr('document.purchaseRefunds')}</Text>

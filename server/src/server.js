@@ -3210,7 +3210,13 @@ app.get('/documents/:token', async (req, res) => {
     errorCorrectionLevel: 'M',
   });
   const itemsHtml = Array.isArray(document.items)
-    ? document.items.map((item) => `<li>${escapeHtml(item.description)}: ${escapeHtml(item.price)} €</li>`).join('')
+    ? document.items.map((item) => {
+      const quantity = Number(item.quantity);
+      const label = Number.isFinite(quantity) && quantity > 1
+        ? `${quantity} × ${item.description}`
+        : item.description;
+      return `<li>${escapeHtml(label)}: ${escapeHtml(item.price)} €</li>`;
+    }).join('')
     : '';
   const logoHtml = typeof document.issuer?.logoUri === 'string' && document.issuer.logoUri.startsWith('data:image/')
     ? `<div class="logo"><img src="${document.issuer.logoUri}" alt="Logotipo de la empresa"></div>`
