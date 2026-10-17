@@ -58,8 +58,21 @@ const createHarness = () => {
     presupuestoClient: { name: ' Client ', nif: ' NIF ', address: ' Address ' },
     presupuestoClientEmail: ' client@example.com ', presupuestoIvaInput: '10',
     presupuestoItems: [{ id: 'old', description: ' Product ', price: '12' }],
-    presupuestoDocumentType: 'PRESUPUESTO', cashInvoiceDrafts: [], transactions: [], selectedTicket: null,
+    presupuestoTitle: 'Instalación — Cliente',
+    presupuestoDocumentType: 'PRESUPUESTO', editingQuoteId: null, savedQuotes: [],
+    cashInvoiceDrafts: [], transactions: [], selectedTicket: null,
     issuer: { name: 'Business' }, requireSubscription: () => true,
+    storageScope: 'acct-1',
+    AsyncStorage: { setItem: async () => {} },
+    accountStorageKey: (key) => key,
+    STORAGE_KEY_INVOICE_SEQ: '@tpv_invoice_seq_v1',
+    allocateNextInvoiceNumber: ({ year }) => ({
+      ticketCode: `F-${year}-0001`,
+      lastIssuedByYear: { [year]: 1 },
+    }),
+    transactionsRef: { current: [] },
+    cashInvoiceDraftsRef: { current: [] },
+    invoiceSeqRef: { current: {} },
     registerTransactionDocument: async document => { published.push(document); return { ...document, publicUrl: 'https://example.com/doc' }; },
     generatePdfFileUri: async () => 'file:///quote.pdf',
     MailComposer: {
@@ -70,12 +83,24 @@ const createHarness = () => {
     mailStatus: 'sent', tr: key => key, documentTypeLabel: type => type,
     formatCurrency: value => String(value), Alert: { alert: (...args) => alerts.push(args) },
   };
+  context.transactionsRef.current = context.transactions;
+  context.cashInvoiceDraftsRef.current = context.cashInvoiceDrafts;
   for (const [setter, state] of [
     ['setPresupuestoClient', 'presupuestoClient'], ['setPresupuestoClientEmail', 'presupuestoClientEmail'],
     ['setPresupuestoItems', 'presupuestoItems'], ['setPresupuestoIvaInput', 'presupuestoIvaInput'],
+    ['setPresupuestoTitle', 'presupuestoTitle'], ['setEditingQuoteId', 'editingQuoteId'],
+    ['setPresupuestoDocumentType', 'presupuestoDocumentType'], ['setSavedQuotes', 'savedQuotes'],
     ['setCashInvoiceDrafts', 'cashInvoiceDrafts'], ['setTransactions', 'transactions'], ['setSelectedTicket', 'selectedTicket'],
-  ]) context[setter] = value => { context[state] = typeof value === 'function' ? value(context[state]) : value; };
-  for (const name of ['measureQuoteInput', 'scheduleQuoteReveal', 'revealQuoteInput', 'blurQuoteInput', 'resetQuoteForm', 'sendPresupuestoByEmail', 'markCashInvoiceAsPaid']) {
+  ]) context[setter] = value => {
+    context[state] = typeof value === 'function' ? value(context[state]) : value;
+    if (state === 'transactions') context.transactionsRef.current = context.transactions;
+    if (state === 'cashInvoiceDrafts') context.cashInvoiceDraftsRef.current = context.cashInvoiceDrafts;
+  };
+  for (const name of [
+    'measureQuoteInput', 'scheduleQuoteReveal', 'revealQuoteInput', 'blurQuoteInput', 'resetQuoteForm',
+    'parseQuoteForm', 'upsertSavedQuoteFromForm', 'savePresupuestoDraft', 'loadSavedQuote',
+    'deleteSavedQuote', 'convertQuoteToInvoice', 'sendPresupuestoByEmail', 'markCashInvoiceAsPaid',
+  ]) {
     assert.ok(declarations.has(name), name);
     context[name] = evaluate(declarations.get(name), context);
   }
@@ -227,6 +252,8 @@ const assertReset = harness => {
   assert.equal(harness.context.presupuestoClientEmail, '');
   assert.equal(JSON.stringify(harness.context.presupuestoItems), JSON.stringify([{ id: '1', description: '', price: '' }]));
   assert.equal(harness.context.presupuestoIvaInput, '21');
+  assert.equal(harness.context.presupuestoTitle, '');
+  assert.equal(harness.context.editingQuoteId, null);
   assert.equal(harness.context.quoteFocusedInputRef.current, null);
   assert.equal(harness.context.quoteNewLineRef.current, null);
   assert.equal(harness.context.quoteKeyboardYRef.current, null);
@@ -257,22 +284,33 @@ const checkCompletion = async () => {
       await harness.context.sendPresupuestoByEmail();
       assert.equal(harness.mailed.length, 1);
       assert.equal(harness.mailed[0].recipients[0], 'client@example.com');
-      assert.equal(harness.published.length, 1);
+      // FACTURA pendiente solo local; PRESUPUESTO puede publicar PDF opcionalmente.
+      assert.equal(harness.published.length, type === 'FACTURA' ? 0 : 1);
       assert.equal(harness.context.cashInvoiceDrafts.length, type === 'FACTURA' ? 1 : 0);
       assert.equal(harness.alerts.length, 0, 'Opening composer must not claim delivery');
       if (status === 'sent' || status === 'saved') assertReset(harness);
       else { assert.equal(harness.context.presupuestoClientEmail, ' client@example.com '); assert.equal(harness.dismissals(), 0); }
       assert.equal(harness.context.presupuestoDocumentType, type);
-      assert.equal(harness.published[0].client.name, 'Client');
-      assert.equal(harness.published[0].items[0].description, 'Product');
+      if (type === 'PRESUPUESTO') {
+        assert.equal(harness.published[0].client.name, 'Client');
+        assert.equal(harness.published[0].items[0].description, 'Product');
+        if (status === 'cancelled' || status === 'undetermined') {
+          assert.equal(harness.context.savedQuotes.length, 1);
+          assert.equal(harness.context.savedQuotes[0].title, 'Instalación — Cliente');
+        }
+      } else {
+        assert.equal(harness.context.cashInvoiceDrafts[0].client.name, 'Client');
+        assert.equal(harness.context.cashInvoiceDrafts[0].items[0].description, 'Product');
+      }
       scenarios += 1;
     }
   }
-  for (const failure of ['subscription', 'client', 'email', 'items', 'unavailable', 'publish', 'pdf', 'composer']) {
+  for (const failure of ['subscription', 'client', 'email', 'title', 'items', 'unavailable', 'publish', 'pdf', 'composer']) {
     const harness = createHarness();
     if (failure === 'subscription') harness.context.requireSubscription = () => false;
     if (failure === 'client') harness.context.presupuestoClient.name = '';
     if (failure === 'email') harness.context.presupuestoClientEmail = '';
+    if (failure === 'title') harness.context.presupuestoTitle = '';
     if (failure === 'items') harness.context.presupuestoItems = [];
     if (failure === 'unavailable') harness.context.MailComposer.isAvailableAsync = async () => false;
     const fail = async () => { throw new Error('fixture failure'); };
@@ -281,15 +319,38 @@ const checkCompletion = async () => {
     if (failure === 'composer') harness.context.MailComposer.composeAsync = fail;
     await harness.context.sendPresupuestoByEmail();
     if (failure === 'publish') {
-      // Publicar es opcional: si falla, igual se abre el correo y (si es FACTURA) queda pendiente.
+      // Publicar presupuesto es opcional: si falla, igual se abre el correo.
       assert.equal(harness.mailed.length, 1, failure);
       assert.equal(harness.alerts.length, 0, failure);
+      assert.equal(harness.context.savedQuotes.length, 1, failure);
     } else {
       assert.equal(harness.dismissals(), 0, failure);
       assert.equal(harness.context.presupuestoIvaInput, '10', failure);
     }
     scenarios += 1;
   }
+  const saveDraft = createHarness();
+  saveDraft.context.savePresupuestoDraft();
+  assert.equal(saveDraft.context.savedQuotes.length, 1);
+  assert.equal(saveDraft.context.savedQuotes[0].title, 'Instalación — Cliente');
+  assert.equal(saveDraft.alerts[0][1], 'quote.saved');
+  scenarios += 1;
+  const convert = createHarness();
+  const quote = {
+    id: 'quote-1', title: 'Obra baño', client: { name: 'Ana', nif: 'X', address: 'Calle 1' },
+    clientEmail: 'ana@example.com', items: [{ id: '1', description: 'Mano de obra', price: '100' }],
+    ivaRate: 21, subtotal: 100, amount: 121, ticketCode: 'PRES-99', createdAt: '2026-01-01', updatedAt: '2026-01-02',
+  };
+  convert.context.savedQuotes = [quote];
+  convert.context.editingQuoteId = quote.id;
+  convert.context.convertQuoteToInvoice(quote);
+  assert.equal(convert.context.savedQuotes.length, 0);
+  assert.equal(convert.context.cashInvoiceDrafts.length, 1);
+  assert.equal(convert.context.cashInvoiceDrafts[0].documentType, 'FACTURA');
+  assert.equal(convert.context.cashInvoiceDrafts[0].title, 'Obra baño');
+  assert.equal(convert.context.cashInvoiceDrafts[0].ticketCode, 'F-2026-0001');
+  assert.equal(convert.alerts[0][1], 'quote.converted');
+  scenarios += 1;
   const invoiceDraftHarness = createHarness();
   invoiceDraftHarness.context.presupuestoDocumentType = 'FACTURA';
   invoiceDraftHarness.context.registerTransactionDocument = async () => { throw new Error('offline'); };

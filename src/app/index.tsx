@@ -204,7 +204,22 @@ type SubscriptionStatusResult = {
 
 interface CashInvoiceDraft extends Transaction {
   documentType: 'FACTURA';
+  title?: string;
 }
+
+type SavedQuote = {
+  id: string;
+  title: string;
+  client: Client;
+  clientEmail: string;
+  items: InvoiceItem[];
+  ivaRate: number;
+  subtotal: number;
+  amount: number;
+  ticketCode: string;
+  createdAt: string;
+  updatedAt: string;
+};
 
 /** Presupuesto: solo email/PDF; nunca entra en Gastos/Facturas. */
 const isQuoteDocument = (doc: { documentType?: string }): boolean =>
@@ -300,6 +315,7 @@ const STORAGE_KEY_OWNER_RECOVERY_EMAIL = '@tpv_owner_recovery_email_v1';
 const STORAGE_KEY_OWNER_RECOVERY_PHONE = '@tpv_owner_recovery_phone_v1';
 const STORAGE_KEY_INVOICE_SEQ = '@tpv_invoice_seq_v1';
 const STORAGE_KEY_CATALOG_PRODUCTS = '@tpv_catalog_products_v1';
+const STORAGE_KEY_SAVED_QUOTES = '@tpv_saved_quotes_v1';
 // Cobro online pendiente: permite confirmar el ticket aunque la app se recargue al volver de Stripe.
 const STORAGE_KEY_PENDING_ONLINE_PAYMENT = '@tpv_pending_online_payment_v1';
 const AUTH_TOKEN_KEY = 'tpv_access_token';
@@ -346,6 +362,7 @@ export default function TpvScreen() {
   const [digits, setDigits] = useState('0');
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [cashInvoiceDrafts, setCashInvoiceDrafts] = useState<CashInvoiceDraft[]>([]);
+  const [savedQuotes, setSavedQuotes] = useState<SavedQuote[]>([]);
   const [transactionHistory, setTransactionHistory] = useState<Transaction[]>([]);
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [issuer, setIssuer] = useState<Issuer>(initialIssuer);
@@ -719,6 +736,8 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   const [presupuestoIvaInput, setPresupuestoIvaInput] = useState('21');
   const [presupuestoClientEmail, setPresupuestoClientEmail] = useState('');
   const [presupuestoDocumentType, setPresupuestoDocumentType] = useState<'PRESUPUESTO' | 'FACTURA'>('PRESUPUESTO');
+  const [presupuestoTitle, setPresupuestoTitle] = useState('');
+  const [editingQuoteId, setEditingQuoteId] = useState<string | null>(null);
   const resetQuoteForm = () => {
     quoteFocusGenerationRef.current += 1;
     quoteFocusedInputRef.current = null;
@@ -732,6 +751,8 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     setPresupuestoClientEmail('');
     setPresupuestoItems([{ id: '1', description: '', price: '' }]);
     setPresupuestoIvaInput('21');
+    setPresupuestoTitle('');
+    setEditingQuoteId(null);
     Keyboard.dismiss();
     quoteScrollRef.current?.scrollTo({ y: 0, animated: false });
   };
@@ -765,8 +786,11 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     setTransactions([]);
     setTransactionHistory([]);
     setCashInvoiceDrafts([]);
+    setSavedQuotes([]);
     setExpenses([]);
     setIssuer({ ...initialIssuer });
+    setPresupuestoTitle('');
+    setEditingQuoteId(null);
     setOwnerPin('');
     setCompanyPinConfigured(null);
     companyPinBusyRef.current = false;
@@ -894,6 +918,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
           storedRecoveryPhone,
           storedInvoiceSeq,
           storedCatalogProducts,
+          storedSavedQuotes,
         ] = await AsyncStorage.multiGet([
           STORAGE_KEY_TRANSACTIONS,
           STORAGE_KEY_CASH_INVOICE_DRAFTS,
@@ -903,6 +928,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
           STORAGE_KEY_OWNER_RECOVERY_PHONE,
           STORAGE_KEY_INVOICE_SEQ,
           STORAGE_KEY_CATALOG_PRODUCTS,
+          STORAGE_KEY_SAVED_QUOTES,
         ].map((key) => accountStorageKey(key, storageScope))).then((entries) => entries.map(([, value]) => value)).catch((error) => {
           if (isCurrent()) issuerLoadedScopeRef.current = null;
           throw error;
@@ -964,6 +990,14 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
             if (Array.isArray(parsedProducts)) setCatalogProducts(parsedProducts);
           } catch {
             setCatalogProducts([]);
+          }
+        }
+        if (storedSavedQuotes) {
+          try {
+            const parsedQuotes = JSON.parse(storedSavedQuotes) as SavedQuote[];
+            if (Array.isArray(parsedQuotes)) setSavedQuotes(parsedQuotes);
+          } catch {
+            setSavedQuotes([]);
           }
         }
         if (storedInvoiceSeq) {
@@ -1789,6 +1823,13 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       console.error('Error al guardar catálogo:', error)
     );
   }, [catalogProducts, isLoaded, storageScope]);
+
+  useEffect(() => {
+    if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
+    AsyncStorage.setItem(accountStorageKey(STORAGE_KEY_SAVED_QUOTES, storageScope), JSON.stringify(savedQuotes)).catch((error) =>
+      console.error('Error al guardar presupuestos:', error)
+    );
+  }, [savedQuotes, isLoaded, storageScope]);
 
   useEffect(() => {
     if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
@@ -3802,30 +3843,160 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     }
   };
 
-  const sendPresupuestoByEmail = async () => {
-    if (!requireSubscription('enviar presupuestos o facturas')) return;
+  const parseQuoteForm = (options?: { requireEmail?: boolean; requireTitle?: boolean }) => {
     const validClient = Object.fromEntries(Object.entries(presupuestoClient).map(([key, value]) => [key, value.trim()])) as Client;
     if (!validClient.name || !validClient.nif || !validClient.address) {
       Alert.alert(tr('validation.error'), tr('validation.client'));
-      return;
+      return null;
     }
-    if (!presupuestoClientEmail.trim()) {
+    if (options?.requireEmail && !presupuestoClientEmail.trim()) {
       Alert.alert(tr('validation.error'), tr('validation.email'));
-      return;
+      return null;
     }
-
+    const title = presupuestoTitle.trim();
+    if (options?.requireTitle && !title) {
+      Alert.alert(tr('validation.error'), tr('quote.titleRequired'));
+      return null;
+    }
     const validItems = presupuestoItems
       .map(i => ({ ...i, description: i.description.trim(), price: i.price.trim() }))
       .filter(i => i.description !== '' && i.price !== '');
-
     if (validItems.length === 0) {
       Alert.alert(tr('validation.error'), tr('validation.items'));
-      return;
+      return null;
     }
-
     const subtotal = validItems.reduce((acc, item) => acc + (parseFloat(item.price.replace(',', '.')) || 0), 0);
+    if (subtotal <= 0) {
+      Alert.alert(tr('validation.error'), tr('validation.amount'));
+      return null;
+    }
     const parsedIva = parseFloat(presupuestoIvaInput.replace(',', '.')) || 21;
     const totalWithIva = subtotal * (1 + (parsedIva / 100));
+    return {
+      validClient,
+      validItems,
+      title,
+      clientEmail: presupuestoClientEmail.trim(),
+      subtotal,
+      parsedIva,
+      totalWithIva,
+    };
+  };
+
+  const upsertSavedQuoteFromForm = (parsed: NonNullable<ReturnType<typeof parseQuoteForm>>, ticketCode?: string) => {
+    const now = new Date().toISOString();
+    const id = editingQuoteId || `quote-${Date.now()}`;
+    const existing = savedQuotes.find((quote) => quote.id === id);
+    const next: SavedQuote = {
+      id,
+      title: parsed.title,
+      client: parsed.validClient,
+      clientEmail: parsed.clientEmail,
+      items: parsed.validItems,
+      ivaRate: parsed.parsedIva,
+      subtotal: parsed.subtotal,
+      amount: parsed.totalWithIva,
+      ticketCode: ticketCode || existing?.ticketCode || `PRES-${Date.now().toString().slice(-6)}`,
+      createdAt: existing?.createdAt || now,
+      updatedAt: now,
+    };
+    setSavedQuotes((current) => {
+      const without = current.filter((quote) => quote.id !== next.id);
+      return [next, ...without];
+    });
+    setEditingQuoteId(next.id);
+    return next;
+  };
+
+  const savePresupuestoDraft = () => {
+    if (!requireSubscription('enviar presupuestos o facturas')) return;
+    setPresupuestoDocumentType('PRESUPUESTO');
+    const parsed = parseQuoteForm({ requireTitle: true });
+    if (!parsed) return;
+    upsertSavedQuoteFromForm(parsed);
+    Alert.alert(documentTypeLabel('PRESUPUESTO'), tr('quote.saved'));
+  };
+
+  const loadSavedQuote = (quote: SavedQuote) => {
+    setPresupuestoDocumentType('PRESUPUESTO');
+    setEditingQuoteId(quote.id);
+    setPresupuestoTitle(quote.title);
+    setPresupuestoClient({ ...quote.client });
+    setPresupuestoClientEmail(quote.clientEmail || '');
+    setPresupuestoItems(quote.items.length ? quote.items.map((item) => ({ ...item })) : [{ id: '1', description: '', price: '' }]);
+    setPresupuestoIvaInput(String(quote.ivaRate));
+    Alert.alert(documentTypeLabel('PRESUPUESTO'), tr('quote.loaded'));
+  };
+
+  const deleteSavedQuote = (quote: SavedQuote) => {
+    Alert.alert(
+      tr('workflow.delete'),
+      tr('quote.deleteConfirm').replace('{title}', quote.title),
+      [
+        { text: tr('common.cancel'), style: 'cancel' },
+        {
+          text: tr('workflow.delete'),
+          style: 'destructive',
+          onPress: () => {
+            setSavedQuotes((current) => current.filter((item) => item.id !== quote.id));
+            if (editingQuoteId === quote.id) {
+              setEditingQuoteId(null);
+              setPresupuestoTitle('');
+            }
+          },
+        },
+      ],
+    );
+  };
+
+  const convertQuoteToInvoice = (quote: SavedQuote) => {
+    if (!requireSubscription('enviar presupuestos o facturas')) return;
+    const createdAt = new Date().toISOString();
+    const allocated = allocateNextInvoiceNumber({
+      year: new Date(createdAt).getFullYear(),
+      existingCodes: [
+        ...transactionsRef.current.map((item) => item.ticketCode),
+        ...cashInvoiceDraftsRef.current.map((item) => item.ticketCode),
+      ],
+      lastIssuedByYear: invoiceSeqRef.current,
+    });
+    invoiceSeqRef.current = allocated.lastIssuedByYear;
+    if (storageScope) {
+      AsyncStorage.setItem(
+        accountStorageKey(STORAGE_KEY_INVOICE_SEQ, storageScope),
+        JSON.stringify(invoiceSeqRef.current),
+      ).catch((error) => console.error('Error al guardar serie de facturas:', error));
+    }
+    const draft: CashInvoiceDraft = {
+      id: `fac-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      ticketCode: allocated.ticketCode,
+      type: 'COBRO',
+      documentType: 'FACTURA',
+      amount: quote.amount,
+      originalAmount: quote.amount,
+      subtotal: quote.subtotal,
+      iva: quote.amount - quote.subtotal,
+      ivaRateApplied: quote.ivaRate,
+      createdAt,
+      method: 'Factura',
+      issuer: { ...issuer },
+      client: { ...quote.client },
+      items: quote.items.map((item) => ({ ...item })),
+      isRefunded: false,
+      refundHistory: [],
+      title: quote.title,
+    };
+    setCashInvoiceDrafts((current) => [draft, ...current.filter((item) => item.id !== draft.id)]);
+    setSavedQuotes((current) => current.filter((item) => item.id !== quote.id));
+    if (editingQuoteId === quote.id) resetQuoteForm();
+    Alert.alert(documentTypeLabel('FACTURA'), tr('quote.converted'));
+  };
+
+  const sendPresupuestoByEmail = async () => {
+    if (!requireSubscription('enviar presupuestos o facturas')) return;
+    const requireTitle = presupuestoDocumentType === 'PRESUPUESTO';
+    const parsed = parseQuoteForm({ requireEmail: true, requireTitle });
+    if (!parsed) return;
 
     try {
       const isAvailable = await MailComposer.isAvailableAsync();
@@ -3853,21 +4024,25 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
             JSON.stringify(invoiceSeqRef.current),
           ).catch((error) => console.error('Error al guardar serie de facturas:', error));
         }
+      } else if (editingQuoteId) {
+        const existing = savedQuotes.find((quote) => quote.id === editingQuoteId);
+        if (existing?.ticketCode) ticketCode = existing.ticketCode;
       }
+
       const tempPresupuestoTransaction: Transaction = {
         id: `pres-${Date.now()}`,
         ticketCode,
         type: 'COBRO',
         documentType: presupuestoDocumentType,
-        amount: totalWithIva,
-        subtotal: subtotal,
-        iva: totalWithIva - subtotal,
-        ivaRateApplied: parsedIva,
+        amount: parsed.totalWithIva,
+        subtotal: parsed.subtotal,
+        iva: parsed.totalWithIva - parsed.subtotal,
+        ivaRateApplied: parsed.parsedIva,
         createdAt,
         method: presupuestoDocumentType === 'FACTURA' ? 'Factura' : 'Presupuesto',
         issuer: { ...issuer },
-        client: validClient,
-        items: validItems,
+        client: parsed.validClient,
+        items: parsed.validItems,
         isRefunded: false,
         refundHistory: [],
       };
@@ -3880,23 +4055,29 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         } catch (publishError) {
           console.warn('No se pudo publicar presupuesto; se continúa con PDF local.', publishError);
         }
+        upsertSavedQuoteFromForm(parsed, ticketCode);
       }
 
       if (presupuestoDocumentType === 'FACTURA') {
         // Lista pendiente local (Marcar cobrada / Eliminar). No nube ni Gastos/Facturas.
         setCashInvoiceDrafts((current) => {
-          const next = tempPresupuestoTransaction as CashInvoiceDraft;
+          const next: CashInvoiceDraft = {
+            ...tempPresupuestoTransaction,
+            documentType: 'FACTURA',
+            ...(presupuestoTitle.trim() ? { title: presupuestoTitle.trim() } : {}),
+          };
           const withoutDup = current.filter((item) => item.id !== next.id && item.ticketCode !== next.ticketCode);
           return [next, ...withoutDup];
         });
       }
 
       const pdfUri = await generatePdfFileUri(documentForPdf);
+      const titleHint = parsed.title ? ` — ${parsed.title}` : '';
 
       const result = await MailComposer.composeAsync({
-        recipients: [presupuestoClientEmail.trim()],
-        subject: `${presupuestoDocumentType === 'FACTURA' ? 'Factura' : 'Presupuesto'} de Servicios - ${presupuestoDocumentType === 'FACTURA' ? 'Factura N' : 'Ref'} ${documentForPdf.ticketCode} (${issuer.name})`,
-        body: `Estimado/a ${validClient.name},\n\nAdjunto le hacemos llegar la ${presupuestoDocumentType === 'FACTURA' ? 'factura' : 'presupuesto'} solicitada con importe total de ${formatCurrency(totalWithIva)}.\n\nAtentamente,\n${issuer.name}`,
+        recipients: [parsed.clientEmail],
+        subject: `${presupuestoDocumentType === 'FACTURA' ? 'Factura' : 'Presupuesto'}${titleHint} - ${presupuestoDocumentType === 'FACTURA' ? 'Factura N' : 'Ref'} ${documentForPdf.ticketCode} (${issuer.name})`,
+        body: `Estimado/a ${parsed.validClient.name},\n\nAdjunto le hacemos llegar la ${presupuestoDocumentType === 'FACTURA' ? 'factura' : 'presupuesto'} solicitada con importe total de ${formatCurrency(parsed.totalWithIva)}.\n\nAtentamente,\n${issuer.name}`,
         attachments: [pdfUri],
       });
 
@@ -5358,6 +5539,21 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                 </Pressable>
               </View>
               <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 8 }]}>{tr('quote.format')}</Text>
+              {presupuestoDocumentType === 'PRESUPUESTO' && (
+                <>
+                  <Text style={[styles.modalSubtitle, { textAlign: 'left', marginTop: 4 }]}>{tr('quote.titleLabel')}</Text>
+                  <TextInput
+                    style={styles.input}
+                    ref={(input) => { quoteInputRefs.current.title = input; }}
+                    onFocus={() => revealQuoteInput('title')}
+                    onBlur={() => blurQuoteInput('title')}
+                    placeholder={tr('quote.titlePlaceholder')}
+                    placeholderTextColor="#94a3b8"
+                    value={presupuestoTitle}
+                    onChangeText={setPresupuestoTitle}
+                  />
+                </>
+              )}
               <TextInput style={styles.input} ref={(input) => { quoteInputRefs.current.name = input; }} onFocus={() => revealQuoteInput('name')} onBlur={() => blurQuoteInput('name')} placeholder={tr('quote.name')} placeholderTextColor="#94a3b8" value={presupuestoClient.name} onChangeText={(t) => setPresupuestoClient(c => ({ ...c, name: t }))} />
               <TextInput style={styles.input} ref={(input) => { quoteInputRefs.current.nif = input; }} onFocus={() => revealQuoteInput('nif')} onBlur={() => blurQuoteInput('nif')} placeholder={tr('workflow.taxId')} placeholderTextColor="#94a3b8" value={presupuestoClient.nif} onChangeText={(t) => setPresupuestoClient(c => ({ ...c, nif: t }))} />
               <TextInput style={styles.input} ref={(input) => { quoteInputRefs.current.address = input; }} onFocus={() => revealQuoteInput('address')} onBlur={() => blurQuoteInput('address')} placeholder={tr('quote.address')} placeholderTextColor="#94a3b8" value={presupuestoClient.address} onChangeText={(t) => setPresupuestoClient(c => ({ ...c, address: t }))} />
@@ -5422,10 +5618,46 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                 onBlur={() => blurQuoteInput('iva')}
               />
 
+              {presupuestoDocumentType === 'PRESUPUESTO' && (
+                <Pressable style={[styles.secondaryButton, { marginTop: 10 }]} onPress={savePresupuestoDraft}>
+                  <Text style={styles.secondaryButtonText}>{tr('quote.save')}</Text>
+                </Pressable>
+              )}
               <Pressable style={styles.primaryButton} onPress={sendPresupuestoByEmail}>
                 <Text style={styles.primaryButtonText}>{tr('quote.send').replace('{document}', documentTypeLabel(presupuestoDocumentType))}</Text>
               </Pressable>
             </View>
+
+            {savedQuotes.length > 0 && (
+              <View style={styles.card}>
+                <Text style={styles.cardTitle}>💾 {tr('quote.savedList').replace('{count}', String(savedQuotes.length))}</Text>
+                <Text style={[styles.modalSubtitle, { textAlign: 'left', marginBottom: 10 }]}>{tr('quote.savedGuidance')}</Text>
+                {savedQuotes.map((quote) => (
+                  <View key={quote.id} style={[styles.listItem, { flexDirection: 'column', alignItems: 'stretch' }]}>
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <View style={{ flex: 1, paddingRight: 8 }}>
+                        <Text style={styles.listItemTitle}>{quote.title}</Text>
+                        <Text style={styles.listItemSubtitle}>
+                          {quote.client?.name || tr('workflow.generalClient')} · {quote.ticketCode} · {formatUiDate(quote.updatedAt || quote.createdAt)}
+                        </Text>
+                      </View>
+                      <Text style={styles.listItemAmount}>{formatUiCurrency(quote.amount)}</Text>
+                    </View>
+                    <View style={[styles.rowButtons, { marginTop: 8 }]}>
+                      <Pressable style={[styles.secondaryButton, { flex: 1, marginTop: 0 }]} onPress={() => loadSavedQuote(quote)}>
+                        <Text style={styles.secondaryButtonText}>{tr('quote.open')}</Text>
+                      </Pressable>
+                      <Pressable style={[styles.primaryButton, { flex: 1.4, marginLeft: 8, marginTop: 0, backgroundColor: '#2563eb' }]} onPress={() => convertQuoteToInvoice(quote)}>
+                        <Text style={styles.primaryButtonText}>{tr('quote.convert')}</Text>
+                      </Pressable>
+                    </View>
+                    <Pressable style={[styles.secondaryButton, { marginTop: 8, backgroundColor: '#fee2e2' }]} onPress={() => deleteSavedQuote(quote)}>
+                      <Text style={[styles.secondaryButtonText, { color: '#dc2626' }]}>{tr('workflow.delete')}</Text>
+                    </Pressable>
+                  </View>
+                ))}
+              </View>
+            )}
 
             {cashInvoiceDrafts.length > 0 && (
               <View style={styles.card}>
@@ -5434,9 +5666,12 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                 {cashInvoiceDrafts.map((draft) => (
                   <View key={draft.id} style={[styles.listItem, { flexDirection: 'column', alignItems: 'stretch' }]}>
                     <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
-                      <View>
-                        <Text style={styles.listItemTitle}>{draft.ticketCode}</Text>
-                        <Text style={styles.listItemSubtitle}>{draft.client?.name || tr('workflow.generalClient')} · {formatUiDate(draft.createdAt)}</Text>
+                      <View style={{ flex: 1, paddingRight: 8 }}>
+                        <Text style={styles.listItemTitle}>{draft.title || draft.ticketCode}</Text>
+                        <Text style={styles.listItemSubtitle}>
+                          {draft.title ? `${draft.ticketCode} · ` : ''}
+                          {draft.client?.name || tr('workflow.generalClient')} · {formatUiDate(draft.createdAt)}
+                        </Text>
                       </View>
                       <Text style={styles.listItemAmount}>{formatUiCurrency(draft.amount)}</Text>
                     </View>

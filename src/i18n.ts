@@ -11,6 +11,7 @@ import { imageShareTranslations } from './translations/image-share';
 import { logoTranslations } from './translations/logo';
 import { settingsReportsTranslations } from './translations/settings-reports';
 import { productTranslations } from './translations/products';
+import { quotesSavedTranslations } from './translations/quotes-saved';
 import { workflowTranslations } from './translations/workflows';
 
 export type AppLocale = 'es' | 'en' | 'fr' | 'de' | 'it' | 'pt' | 'nl' | 'pl';
@@ -684,8 +685,8 @@ const ALL: Record<AppLocale, Dict> = { es, en, fr, de, it, pt, nl, pl };
 
 // Devuelve el texto traducido; si falta la clave, usa el español.
 export const t = (locale: AppLocale, key: string): string =>
-  connectTranslations[locale]?.[key] ?? authTranslations[locale]?.[key] ?? imageShareTranslations[locale]?.[key] ?? logoTranslations[locale]?.[key] ?? emailedReportsTranslations[locale]?.[key] ?? productTranslations[locale]?.[key] ?? workflowTranslations[locale]?.[key] ?? settingsReportsTranslations[locale]?.[key] ?? ALL[locale]?.[key]
-  ?? connectTranslations.es[key] ?? authTranslations.es[key] ?? imageShareTranslations.es[key] ?? logoTranslations.es[key] ?? emailedReportsTranslations.es[key] ?? productTranslations.es[key] ?? workflowTranslations.es[key] ?? settingsReportsTranslations.es[key] ?? es[key] ?? key;
+  connectTranslations[locale]?.[key] ?? authTranslations[locale]?.[key] ?? imageShareTranslations[locale]?.[key] ?? logoTranslations[locale]?.[key] ?? emailedReportsTranslations[locale]?.[key] ?? productTranslations[locale]?.[key] ?? quotesSavedTranslations[locale]?.[key] ?? workflowTranslations[locale]?.[key] ?? settingsReportsTranslations[locale]?.[key] ?? ALL[locale]?.[key]
+  ?? connectTranslations.es[key] ?? authTranslations.es[key] ?? imageShareTranslations.es[key] ?? logoTranslations.es[key] ?? emailedReportsTranslations.es[key] ?? productTranslations.es[key] ?? quotesSavedTranslations.es[key] ?? workflowTranslations.es[key] ?? settingsReportsTranslations.es[key] ?? es[key] ?? key;
 
 export const detectDeviceLocale = (region: string | null | undefined, tag: string | null | undefined): AppLocale =>
   localeForRegion(region) ?? localeForLanguageTag(tag) ?? 'es';
