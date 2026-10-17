@@ -31,6 +31,16 @@ const rows: Record<string, readonly [string, string, string, string, string, str
   'products.addedToQuote': ['Productos añadidos al presupuesto.', 'Products added to the quote.', 'Produits ajoutés au devis.', 'Produkte zum Angebot hinzugefügt.', 'Prodotti aggiunti al preventivo.', 'Produtos adicionados ao orçamento.', 'Producten toegevoegd aan de offerte.', 'Produkty dodane do wyceny.'],
   'products.addedToInvoice': ['Productos añadidos a la factura.', 'Products added to the invoice.', 'Produits ajoutés à la facture.', 'Produkte zur Rechnung hinzugefügt.', 'Prodotti aggiunti alla fattura.', 'Produtos adicionados à fatura.', 'Producten toegevoegd aan de factuur.', 'Produkty dodane do faktury.'],
   'products.sentToTpv': ['Total enviado al TPV. Ya puedes cobrar.', 'Total sent to POS. You can charge now.', 'Total envoyé à la caisse. Vous pouvez encaisser.', 'Summe an die Kasse gesendet. Sie können jetzt kassieren.', 'Totale inviato al POS. Puoi incassare.', 'Total enviado ao TPV. Já pode cobrar.', 'Totaal naar de kassa gestuurd. U kunt nu innen.', 'Suma wysłana do kasy. Możesz pobrać płatność.'],
+  'products.cloudSyncFailed': [
+    'El producto se guardó en este móvil, pero no se pudo sincronizar con la nube. Comprueba la conexión e inténtalo de nuevo (o tira hacia abajo en Productos). Si el fallo continúa, falta crear la tabla catalog_products en Supabase.',
+    'The product was saved on this phone, but cloud sync failed. Check your connection and try again (or pull down on Products). If it keeps failing, the catalog_products table may be missing in Supabase.',
+    'Le produit est enregistré sur ce téléphone, mais la synchronisation cloud a échoué. Vérifiez la connexion et réessayez (ou tirez vers le bas dans Produits). Si cela continue, la table catalog_products manque peut-être dans Supabase.',
+    'Das Produkt wurde auf diesem Handy gespeichert, die Cloud-Synchronisation ist jedoch fehlgeschlagen. Prüfen Sie die Verbindung und versuchen Sie es erneut (oder ziehen Sie bei Produkte nach unten). Wenn es weiter fehlschlägt, fehlt möglicherweise die Tabelle catalog_products in Supabase.',
+    'Il prodotto è salvato su questo telefono, ma la sincronizzazione cloud non è riuscita. Controlla la connessione e riprova (o scorri verso il basso in Prodotti). Se continua, potrebbe mancare la tabella catalog_products in Supabase.',
+    'O produto foi guardado neste telemóvel, mas a sincronização na nuvem falhou. Verifique a ligação e tente de novo (ou puxe para baixo em Produtos). Se continuar a falhar, pode faltar a tabela catalog_products no Supabase.',
+    'Het product is op deze telefoon opgeslagen, maar cloudsynchronisatie is mislukt. Controleer de verbinding en probeer opnieuw (of trek omlaag bij Producten). Als het blijft mislukken, ontbreekt mogelijk de tabel catalog_products in Supabase.',
+    'Produkt zapisano na tym telefonie, ale synchronizacja z chmurą nie powiodła się. Sprawdź połączenie i spróbuj ponownie (lub pociągnij w dół w Produktach). Jeśli nadal nie działa, w Supabase może brakować tabeli catalog_products.',
+  ],
 };
 
 const localeIndex: Record<AppLocale, number> = { es: 0, en: 1, fr: 2, de: 3, it: 4, pt: 5, nl: 6, pl: 7 };

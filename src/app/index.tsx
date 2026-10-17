@@ -655,6 +655,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   const [invoiceIvaInput, setInvoiceIvaInput] = useState('21');
   const [pendingInvoice, setPendingInvoice] = useState<PendingInvoice | null>(null);
   const [catalogProducts, setCatalogProducts] = useState<CatalogProduct[]>([]);
+  const catalogProductsRef = useRef<CatalogProduct[]>([]);
   const [catalogCart, setCatalogCart] = useState<CatalogCartLine[]>([]);
   const [pendingCatalogCharge, setPendingCatalogCharge] = useState<PendingCatalogCharge | null>(null);
   const [productDestination, setProductDestination] = useState<ProductDestination>('tpv');
@@ -1863,6 +1864,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   }, [transactions, isLoaded, storageScope]);
 
   useEffect(() => {
+    catalogProductsRef.current = catalogProducts;
     if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
     const companyScope = companyScopeFromStorageScope(storageScope) || storageScope;
     AsyncStorage.setItem(accountStorageKey(STORAGE_KEY_CATALOG_PRODUCTS, companyScope), JSON.stringify(catalogProducts)).catch((error) =>
@@ -2528,12 +2530,26 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     }
   };
 
+  const mapCloudCatalogProducts = (
+    rows: { id?: string; name?: string; price?: number; photoUri?: string; createdAt?: string }[],
+  ): CatalogProduct[] =>
+    rows
+      .filter((row) => row && row.id && row.name)
+      .map((row) => ({
+        id: String(row.id),
+        name: String(row.name),
+        price: Math.round((Number(row.price) || 0) * 100) / 100,
+        ...(row.photoUri ? { photoUri: String(row.photoUri) } : {}),
+        createdAt: row.createdAt || new Date().toISOString(),
+      }));
+
   const uploadCatalogToCloud = async (list: CatalogProduct[]): Promise<void> => {
     if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
     const generation = cacheGenerationRef.current;
     if (!accessToken || DOCUMENT_API_URL_CANDIDATES.length === 0) return;
     const authToken = await ensureFreshAccessToken();
     if (cacheGenerationRef.current !== generation || !authToken) return;
+    // Subir sin foto primero (más fiable); las fotos se intentan después si caben.
     const products = await Promise.all(list.map(async (product) => {
       let photoData: string | undefined;
       if (product.photoUri) {
@@ -2571,6 +2587,45 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     }
   };
 
+  const pullCatalogFromCloud = async (): Promise<CatalogProduct[] | null> => {
+    if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return null;
+    const generation = cacheGenerationRef.current;
+    if (!accessToken || DOCUMENT_API_URL_CANDIDATES.length === 0) return null;
+    const authToken = await ensureFreshAccessToken();
+    if (cacheGenerationRef.current !== generation || !authToken) return null;
+    const response = await fetchWithTimeout(DOCUMENT_API_URL_CANDIDATES[0] + '/api/catalog', {
+      headers: { Authorization: 'Bearer ' + authToken },
+    }, 15000);
+    const result = await response.json().catch(() => ({}) as { ok?: boolean; products?: unknown; error?: string });
+    if (cacheGenerationRef.current !== generation) return null;
+    if (!response.ok || !result.ok || !Array.isArray(result.products)) {
+      throw new Error(result.error || 'HTTP ' + response.status);
+    }
+    return mapCloudCatalogProducts(result.products as { id?: string; name?: string; price?: number; photoUri?: string; createdAt?: string }[]);
+  };
+
+  // Al abrir Productos: bajar el catálogo compartido (principal ↔ empleados / varios móviles).
+  useEffect(() => {
+    if (activeTab !== 'productos' || !isLoaded || !accessToken || !storageScope) return;
+    if (loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
+    let cancelled = false;
+    const generation = cacheGenerationRef.current;
+    (async () => {
+      try {
+        const cloudProducts = await pullCatalogFromCloud();
+        if (cancelled || cacheGenerationRef.current !== generation || !cloudProducts) return;
+        if (cloudProducts.length > 0) {
+          setCatalogProducts(cloudProducts);
+        } else if (catalogProductsRef.current.length > 0) {
+          await uploadCatalogToCloud(catalogProductsRef.current);
+        }
+      } catch (error) {
+        console.warn('No se pudo actualizar el catálogo al abrir Productos:', error);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [activeTab, isLoaded, accessToken, storageScope]);
+
   const saveCatalogProduct = () => {
     const name = productNameInput.trim();
     const price = parseFloat(productPriceInput.replace(',', '.'));
@@ -2591,9 +2646,13 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     };
     setCatalogProducts((current) => {
       const next = [product, ...current];
-      void uploadCatalogToCloud(next).catch((error) =>
-        console.warn('No se pudo guardar el catálogo en la nube:', error)
-      );
+      void uploadCatalogToCloud(next).catch((error) => {
+        console.warn('No se pudo guardar el catálogo en la nube:', error);
+        Alert.alert(
+          tr('products.title'),
+          tr('products.cloudSyncFailed'),
+        );
+      });
       return next;
     });
     resetProductForm();
@@ -3743,9 +3802,10 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         console.warn('No se pudieron subir los gastos locales antes de sincronizar:', uploadError);
       }
       // Subir catálogo solo si hay productos locales: un móvil nuevo vacío no debe borrar la nube.
-      if (catalogProducts.length > 0) {
+      const localCatalog = catalogProductsRef.current;
+      if (localCatalog.length > 0) {
         try {
-          await uploadCatalogToCloud(catalogProducts);
+          await uploadCatalogToCloud(localCatalog);
         } catch (uploadError) {
           console.warn('No se pudo subir el catálogo antes de sincronizar:', uploadError);
         }
@@ -3834,27 +3894,30 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
 
       // 5) Catálogo de productos (compartido en la empresa).
       let restoredProductsCount = 0;
-      if (Array.isArray(result.products)) {
-        const cloudProducts = result.products
-          .filter((row) => row && row.id && row.name)
-          .map((row) => ({
-            id: String(row.id),
-            name: String(row.name),
-            price: Math.round((Number(row.price) || 0) * 100) / 100,
-            ...(row.photoUri ? { photoUri: String(row.photoUri) } : {}),
-            createdAt: row.createdAt || new Date().toISOString(),
-          }) as CatalogProduct);
+      let cloudProducts: CatalogProduct[] | null = Array.isArray(result.products)
+        ? mapCloudCatalogProducts(result.products)
+        : null;
+      // Backend antiguo o sync-all sin catálogo: pedir /api/catalog aparte.
+      if (cloudProducts === null) {
+        try {
+          cloudProducts = await pullCatalogFromCloud();
+        } catch (catalogError) {
+          console.warn('No se pudo recuperar el catálogo:', catalogError);
+        }
+      }
+      if (cloudProducts) {
         restoredProductsCount = cloudProducts.length;
+        const localNow = catalogProductsRef.current;
         if (cloudProducts.length > 0) {
+          // Nube con datos: sustituir local (fuente de verdad entre móviles).
           setCatalogProducts(cloudProducts);
-        } else if (catalogProducts.length > 0) {
-          // Nube vacía pero hay catálogo local: publicarlo para el resto de móviles.
-          void uploadCatalogToCloud(catalogProducts).catch((error) =>
+        } else if (localNow.length > 0) {
+          // Nube vacía pero hay catálogo local (p. ej. aún no subido): publicar, no borrar.
+          void uploadCatalogToCloud(localNow).catch((error) =>
             console.warn('No se pudo publicar el catálogo local en la nube:', error)
           );
-        } else {
-          setCatalogProducts([]);
         }
+        // Si ambos están vacíos, no tocar el estado (evita borrar por closure obsoleto).
       }
 
       if (restoredDocsCount === 0 && restoredExpensesCount === 0 && restoredProductsCount === 0) {
@@ -5556,7 +5619,33 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
 
         {/* PESTAÑA: PRODUCTOS */}
         {activeTab === 'productos' && (
-          <ScrollView contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled" refreshControl={otaRefreshControl}>
+          <ScrollView
+            contentContainerStyle={styles.scrollContent}
+            keyboardShouldPersistTaps="handled"
+            refreshControl={
+              <RefreshControl
+                refreshing={otaChecking || syncHistoryLoading}
+                onRefresh={() => {
+                  void checkForOta();
+                  void (async () => {
+                    try {
+                      const cloudProducts = await pullCatalogFromCloud();
+                      if (cloudProducts && cloudProducts.length > 0) {
+                        setCatalogProducts(cloudProducts);
+                      } else if (catalogProductsRef.current.length > 0) {
+                        await uploadCatalogToCloud(catalogProductsRef.current);
+                      }
+                    } catch (error) {
+                      console.warn('No se pudo refrescar el catálogo:', error);
+                    }
+                    await syncHistoryFromCloud({ silent: true });
+                  })();
+                }}
+                colors={['#b91c1c']}
+                tintColor="#b91c1c"
+              />
+            }
+          >
             <View style={styles.card}>
               <Text style={styles.cardTitle}>{tr('products.title')}</Text>
               <View style={styles.productDestRow}>
