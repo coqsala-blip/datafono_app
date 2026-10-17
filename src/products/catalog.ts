@@ -28,12 +28,17 @@ export const cartLineTotal = (line: CatalogCartLine): number =>
 export const cartTotal = (lines: readonly CatalogCartLine[]): number =>
   Math.round(lines.reduce((sum, line) => sum + cartLineTotal(line), 0) * 100) / 100;
 
+export const formatInvoiceItemLabel = (item: { description: string; quantity?: number }): string => {
+  const quantity = item.quantity && item.quantity > 1 ? item.quantity : 0;
+  return quantity ? `${quantity} × ${item.description}` : item.description;
+};
+
 export const cartToInvoiceItems = (lines: readonly CatalogCartLine[]): InvoiceLine[] =>
   lines.map((line) => ({
     id: `${line.productId}-${line.quantity}-${line.unitPrice}`,
-    description: line.name,
+    // Cantidad en la descripción para que se vea en presupuesto/factura (el precio ya es el total de línea).
+    description: formatInvoiceItemLabel({ description: line.name, quantity: line.quantity }),
     price: cartLineTotal(line).toFixed(2),
-    quantity: line.quantity,
   }));
 
 export const addOrIncrementCartLine = (
@@ -56,9 +61,4 @@ export const addOrIncrementCartLine = (
       ? { ...line, quantity: line.quantity + quantity }
       : line,
   );
-};
-
-export const formatInvoiceItemLabel = (item: { description: string; quantity?: number }): string => {
-  const quantity = item.quantity && item.quantity > 1 ? item.quantity : 0;
-  return quantity ? `${quantity} × ${item.description}` : item.description;
 };
