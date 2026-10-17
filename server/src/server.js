@@ -532,7 +532,7 @@ app.get('/api/stripe/webhook', (req, res) => {
   res.status(200).json({ ok: true, service: 'Stripe webhook' });
 });
 
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({ limit: '12mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 if (NODE_ENV === 'production') {
@@ -746,9 +746,155 @@ app.get('/api/supabase-diagnostico', async (req, res) => {
     urlConfigurada: url || null,
     tipoDeClave: keyKind,
     longitudClave: key.length,
-    acceso: { documents: await probe('documents'), expenses: await probe('expenses') },
+    acceso: {
+      documents: await probe('documents'),
+      expenses: await probe('expenses'),
+      catalog_products: await probe('catalog_products'),
+    },
   });
 });
+
+// Perfil de empresa (datos + logo + catálogo) guardado como documento especial en `documents`
+// (tabla que ya existe). Así no hace falta crear tablas nuevas en Supabase.
+const COMPANY_PROFILE_TICKET = '__COMPANY_PROFILE__';
+const COMPANY_PROFILE_TYPE = 'COMPANY_PROFILE';
+const COMPANY_PROFILE_ID = 'company-profile';
+const MAX_COMPANY_LOGO_CHARS = 900000;
+const MAX_PRODUCT_PHOTO_CHARS = 600000;
+
+const isCompanyProfileRow = (row) => (
+  row?.document_type === COMPANY_PROFILE_TYPE
+  || row?.ticket_code === COMPANY_PROFILE_TICKET
+  || row?.document_data?.documentType === COMPANY_PROFILE_TYPE
+  || row?.document_data?.kind === 'company_profile'
+);
+
+const sanitizeCompanyIssuer = (raw) => {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const text = (value) => (typeof value === 'string' ? value.trim().slice(0, 500) : '');
+  let logoUri;
+  if (typeof raw.logoUri === 'string' && raw.logoUri.startsWith('data:image/') && raw.logoUri.length <= MAX_COMPANY_LOGO_CHARS) {
+    logoUri = raw.logoUri;
+  }
+  return {
+    name: text(raw.name),
+    nif: text(raw.nif),
+    address: text(raw.address),
+    managerEmail: text(raw.managerEmail),
+    accountHolder: text(raw.accountHolder),
+    iban: text(raw.iban),
+    bankName: text(raw.bankName),
+    country: text(raw.country) || 'ES',
+    ...(logoUri ? { logoUri } : {}),
+    ...(typeof raw.logoPosition === 'string' ? { logoPosition: raw.logoPosition } : {}),
+    ...(typeof raw.logoSize === 'string' ? { logoSize: raw.logoSize } : {}),
+    ...(raw.logoOffsetA4 && typeof raw.logoOffsetA4 === 'object' ? { logoOffsetA4: raw.logoOffsetA4 } : {}),
+    ...(raw.logoOffsetTicket && typeof raw.logoOffsetTicket === 'object' ? { logoOffsetTicket: raw.logoOffsetTicket } : {}),
+  };
+};
+
+const sanitizeCompanyProducts = (raw) => {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((item) => item && typeof item.id === 'string' && item.id.trim())
+    .slice(0, 500)
+    .map((item) => {
+      let photoUri;
+      if (typeof item.photoUri === 'string' && item.photoUri.startsWith('data:image/') && item.photoUri.length <= MAX_PRODUCT_PHOTO_CHARS) {
+        photoUri = item.photoUri;
+      } else if (typeof item.photoData === 'string' && item.photoData.startsWith('data:image/') && item.photoData.length <= MAX_PRODUCT_PHOTO_CHARS) {
+        photoUri = item.photoData;
+      }
+      return {
+        id: String(item.id).trim(),
+        name: String(item.name || '').trim().slice(0, 200) || 'Producto',
+        price: Math.max(0, Number(item.price) || 0),
+        createdAt: typeof item.createdAt === 'string' ? item.createdAt : new Date().toISOString(),
+        ...(photoUri ? { photoUri } : {}),
+      };
+    });
+};
+
+const readCompanyProfile = async (ownerId) => {
+  const { data, error } = await supabase
+    .from('documents')
+    .select('id,document_data,created_at,updated_at')
+    .eq('user_id', ownerId)
+    .eq('ticket_code', COMPANY_PROFILE_TICKET)
+    .order('created_at', { ascending: false })
+    .limit(1);
+  if (error) throw error;
+  const row = Array.isArray(data) ? data[0] : null;
+  if (!row) return { row: null, issuer: null, products: [] };
+  const payload = row.document_data || {};
+  return {
+    row,
+    issuer: sanitizeCompanyIssuer(payload.issuer),
+    products: sanitizeCompanyProducts(payload.products),
+  };
+};
+
+const writeCompanyProfile = async (ownerId, { issuer, products }) => {
+  const syncedAt = new Date().toISOString();
+  const current = await readCompanyProfile(ownerId);
+  let nextIssuer = issuer !== undefined ? sanitizeCompanyIssuer(issuer) : current.issuer;
+  // Si el cliente sube datos sin logo (foto demasiado grande o solo cambió el nombre),
+  // conservar el logo que ya había en la nube.
+  if (nextIssuer && current.issuer?.logoUri && !nextIssuer.logoUri) {
+    nextIssuer = { ...nextIssuer, logoUri: current.issuer.logoUri };
+  }
+  let nextProducts = products !== undefined ? sanitizeCompanyProducts(products) : current.products;
+  if (products !== undefined && current.products.length > 0) {
+    const previousPhotos = new Map(
+      current.products.filter((item) => item.photoUri).map((item) => [item.id, item.photoUri]),
+    );
+    nextProducts = nextProducts.map((item) => (
+      item.photoUri || !previousPhotos.has(item.id)
+        ? item
+        : { ...item, photoUri: previousPhotos.get(item.id) }
+    ));
+  }
+  const documentData = {
+    id: COMPANY_PROFILE_ID,
+    ticketCode: COMPANY_PROFILE_TICKET,
+    documentType: COMPANY_PROFILE_TYPE,
+    kind: 'company_profile',
+    amount: 0,
+    createdAt: current.row?.document_data?.createdAt || syncedAt,
+    updatedAt: syncedAt,
+    issuer: nextIssuer || {
+      name: '', nif: '', address: '', managerEmail: '', accountHolder: '', iban: '', bankName: '', country: 'ES',
+    },
+    products: nextProducts,
+  };
+  const insertPayload = {
+    user_id: ownerId,
+    ticket_code: COMPANY_PROFILE_TICKET,
+    document_type: COMPANY_PROFILE_TYPE,
+    amount: 0,
+    original_amount: 0,
+    document_data: documentData,
+    public_token: crypto.randomBytes(24).toString('hex'),
+    updated_at: syncedAt,
+  };
+  if (current.row?.id) {
+    const { error } = await supabase
+      .from('documents')
+      .update({
+        document_type: COMPANY_PROFILE_TYPE,
+        amount: 0,
+        original_amount: 0,
+        document_data: documentData,
+        updated_at: syncedAt,
+      })
+      .eq('id', current.row.id);
+    if (error) throw error;
+  } else {
+    const { error } = await supabase.from('documents').insert(insertPayload);
+    if (error) throw error;
+  }
+  return { issuer: documentData.issuer, products: documentData.products, syncedAt };
+};
 
 const getBearerToken = (req) => {
   const authorization = req.headers.authorization || '';
@@ -3065,11 +3211,13 @@ app.get('/api/documents', requireAuth, async (req, res) => {
 
   res.json({
     ok: true,
-    documents: (data || []).map((row) => ({
-      ...(row.document_data || {}),
-      publicUrl: row.public_token ? `${PUBLIC_API_URL}/documents/${row.public_token}` : undefined,
-      createdAt: row.created_at || row.document_data?.createdAt,
-    })),
+    documents: (data || [])
+      .filter((row) => !isCompanyProfileRow(row))
+      .map((row) => ({
+        ...(row.document_data || {}),
+        publicUrl: row.public_token ? `${PUBLIC_API_URL}/documents/${row.public_token}` : undefined,
+        createdAt: row.created_at || row.document_data?.createdAt,
+      })),
   });
 });
 
@@ -3123,71 +3271,76 @@ app.get('/api/expenses', requireAuth, async (req, res) => {
   res.json({ ok: true, expenses: data || [] });
 });
 
-// Sustituye el catálogo de productos de la empresa (principal + empleados) para recuperarlo
-// en otro móvil. Foto opcional en base64 (si es muy grande se omite en el cliente).
+// Perfil de empresa (nombre, NIF, dirección, logo, catálogo) compartido entre móviles
+// y usuarios adicionales. Se guarda en `documents` (sin tabla nueva).
+app.post('/api/company/sync', requireAuth, async (req, res) => {
+  const ownerId = req.user.app_metadata?.company_owner_id || req.user.id;
+  const hasIssuer = Object.prototype.hasOwnProperty.call(req.body || {}, 'issuer');
+  const hasProducts = Object.prototype.hasOwnProperty.call(req.body || {}, 'products');
+  if (!hasIssuer && !hasProducts) {
+    return res.status(400).json({ ok: false, error: 'No se recibieron datos de empresa ni catálogo.' });
+  }
+  try {
+    const saved = await writeCompanyProfile(ownerId, {
+      issuer: hasIssuer ? req.body.issuer : undefined,
+      products: hasProducts ? req.body.products : undefined,
+    });
+    res.json({
+      ok: true,
+      issuer: saved.issuer,
+      products: saved.products,
+      count: saved.products.length,
+      syncedAt: saved.syncedAt,
+    });
+  } catch (error) {
+    console.error('Error sincronizando perfil de empresa:', error.message || error);
+    res.status(500).json({ ok: false, error: `Supabase: ${error.message || error}` });
+  }
+});
+
+app.get('/api/company', requireAuth, async (req, res) => {
+  const ownerId = req.user.app_metadata?.company_owner_id || req.user.id;
+  try {
+    const profile = await readCompanyProfile(ownerId);
+    res.json({
+      ok: true,
+      issuer: profile.issuer,
+      products: profile.products,
+    });
+  } catch (error) {
+    console.error('Error leyendo perfil de empresa:', error.message || error);
+    res.status(500).json({ ok: false, error: `Supabase: ${error.message || error}` });
+  }
+});
+
+// Catálogo: escribe/lee el mismo perfil de empresa (compatibilidad con clientes anteriores).
 app.post('/api/catalog/sync', requireAuth, async (req, res) => {
   const products = Array.isArray(req.body?.products) ? req.body.products : null;
   if (!products) {
     return res.status(400).json({ ok: false, error: 'No se recibió el catálogo de productos.' });
   }
   const ownerId = req.user.app_metadata?.company_owner_id || req.user.id;
-  const syncedAt = new Date().toISOString();
-  const rows = products
-    .filter((item) => item && typeof item.id === 'string' && item.id.trim())
-    .map((item) => ({
-      user_id: ownerId,
-      local_id: String(item.id).trim(),
-      name: String(item.name || '').trim() || 'Producto',
-      price: Math.max(0, Number(item.price) || 0),
-      photo_data: typeof item.photoData === 'string' && item.photoData.startsWith('data:image/')
-        ? item.photoData.slice(0, 600000)
-        : null,
-      created_at: item.createdAt || syncedAt,
-      synced_at: syncedAt,
-    }));
-
-  const { error: deleteError } = await supabase.from('catalog_products').delete().eq('user_id', ownerId);
-  if (deleteError) {
-    console.error('Error limpiando catálogo:', deleteError.message);
-    return res.status(500).json({ ok: false, error: `Supabase: ${deleteError.message}` });
+  try {
+    const saved = await writeCompanyProfile(ownerId, { products });
+    res.json({ ok: true, count: saved.products.length });
+  } catch (error) {
+    console.error('Error sincronizando catálogo:', error.message || error);
+    res.status(500).json({ ok: false, error: `Supabase: ${error.message || error}` });
   }
-  if (rows.length > 0) {
-    const { error: insertError } = await supabase.from('catalog_products').insert(rows);
-    if (insertError) {
-      console.error('Error sincronizando catálogo:', insertError.message);
-      return res.status(500).json({ ok: false, error: `Supabase: ${insertError.message}` });
-    }
-  }
-  res.json({ ok: true, count: rows.length });
 });
 
 app.get('/api/catalog', requireAuth, async (req, res) => {
   const ownerId = req.user.app_metadata?.company_owner_id || req.user.id;
-  const { data, error } = await supabase
-    .from('catalog_products')
-    .select('local_id,name,price,photo_data,created_at,synced_at')
-    .eq('user_id', ownerId)
-    .order('created_at', { ascending: false })
-    .limit(500);
-
-  if (error) {
-    console.error('Error listando catálogo:', error.message);
-    return res.status(500).json({ ok: false, error: `Supabase: ${error.message}` });
+  try {
+    const profile = await readCompanyProfile(ownerId);
+    res.json({ ok: true, products: profile.products });
+  } catch (error) {
+    console.error('Error listando catálogo:', error.message || error);
+    res.status(500).json({ ok: false, error: `Supabase: ${error.message || error}` });
   }
-  res.json({
-    ok: true,
-    products: (data || []).map((row) => ({
-      id: row.local_id,
-      name: row.name,
-      price: Number(row.price) || 0,
-      photoUri: row.photo_data || undefined,
-      createdAt: row.created_at || row.synced_at,
-    })),
-  });
 });
 
-// Recupera todo el historial (documentos + gastos + catálogo) en un solo llamado, para restaurar la app
-// tras borrar datos o instalarla en otro móvil.
+// Recupera historial + perfil de empresa (datos, logo y catálogo) en un solo llamado.
 app.get('/api/documents/sync-all', requireAuth, async (req, res) => {
   const userIds = await companyHistoryUserIds(req, res);
   if (!userIds) return;
@@ -3208,17 +3361,9 @@ app.get('/api/documents/sync-all', requireAuth, async (req, res) => {
     .order('date', { ascending: false })
     .limit(limit);
 
-  const catalogPromise = supabase
-    .from('catalog_products')
-    .select('local_id,name,price,photo_data,created_at,synced_at')
-    .eq('user_id', ownerId)
-    .order('created_at', { ascending: false })
-    .limit(500);
-
-  const [documentsResult, expensesResult, catalogResult] = await Promise.allSettled([
+  const [documentsResult, expensesResult] = await Promise.allSettled([
     documentsPromise,
     expensesPromise,
-    catalogPromise,
   ]);
 
   const documentsError = documentsResult.status === 'rejected'
@@ -3227,13 +3372,8 @@ app.get('/api/documents/sync-all', requireAuth, async (req, res) => {
   const expensesError = expensesResult.status === 'rejected'
     ? expensesResult.reason
     : expensesResult.value.error;
-  const catalogError = catalogResult.status === 'rejected'
-    ? catalogResult.reason
-    : catalogResult.value.error;
 
   if (documentsError || expensesError) {
-    // Nunca se oculta el fallo de la nube: si falta la columna user_id o los permisos de la tabla
-    // de gastos, la app debe avisar del motivo en vez de decir que "no hay historial guardado".
     const details = [];
     if (documentsError) details.push(`documentos: ${documentsError.message || documentsError}`);
     if (expensesError) details.push(`gastos: ${expensesError.message || expensesError}`);
@@ -3244,28 +3384,27 @@ app.get('/api/documents/sync-all', requireAuth, async (req, res) => {
     });
   }
 
-  const documents = (documentsResult.value.data || []).map((row) => ({
-    ...(row.document_data || {}),
-    publicUrl: row.public_token ? `${PUBLIC_API_URL}/documents/${row.public_token}` : undefined,
-    createdAt: row.created_at || row.document_data?.createdAt,
-  }));
+  const documents = (documentsResult.value.data || [])
+    .filter((row) => !isCompanyProfileRow(row))
+    .map((row) => ({
+      ...(row.document_data || {}),
+      publicUrl: row.public_token ? `${PUBLIC_API_URL}/documents/${row.public_token}` : undefined,
+      createdAt: row.created_at || row.document_data?.createdAt,
+    }));
 
   const expenses = expensesResult.value.data || [];
-  // Catálogo opcional: si la tabla aún no existe en Supabase, no tumba la sincronización
-  // ni borra el catálogo local (omitimos `products` en la respuesta).
-  if (catalogError) {
-    console.warn('Catálogo no disponible en sync-all (¿falta tabla?):', catalogError.message || catalogError);
-    return res.json({ ok: true, documents, expenses });
-  }
-  const products = (catalogResult.value.data || []).map((row) => ({
-    id: row.local_id,
-    name: row.name,
-    price: Number(row.price) || 0,
-    photoUri: row.photo_data || undefined,
-    createdAt: row.created_at || row.synced_at,
-  }));
 
-  res.json({ ok: true, documents, expenses, products });
+  let issuer = null;
+  let products = [];
+  try {
+    const profile = await readCompanyProfile(ownerId);
+    issuer = profile.issuer;
+    products = profile.products;
+  } catch (profileError) {
+    console.warn('Perfil de empresa no disponible en sync-all:', profileError.message || profileError);
+  }
+
+  res.json({ ok: true, documents, expenses, products, issuer });
 });
 
 
@@ -3281,12 +3420,12 @@ const formatMoney = (value) => Number(value || 0).toFixed(2);
 app.get('/documents/:token', async (req, res) => {
   const { data, error } = await supabase
     .from('documents')
-    .select('document_data')
+    .select('ticket_code,document_type,document_data')
     .eq('public_token', req.params.token)
     .maybeSingle();
   const document = data?.document_data;
 
-  if (error || !document) {
+  if (error || !document || isCompanyProfileRow(data)) {
     if (error) console.error('Error consultando documento en Supabase:', error.message);
     return res.status(404).send('<h1>Documento no encontrado</h1><p>El enlace no es válido o ha caducado.</p>');
   }

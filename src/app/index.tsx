@@ -125,6 +125,7 @@ type SyncAllResult = {
   documents?: (Record<string, unknown> & { id?: string; ticketCode?: string; publicUrl?: string; createdAt?: string })[];
   expenses?: { local_id?: string; description?: string; amount?: number; date?: string | null; category?: string; synced_at?: string }[];
   products?: { id?: string; name?: string; price?: number; photoUri?: string; createdAt?: string }[];
+  issuer?: Partial<Issuer> | null;
   error?: string;
 };
 
@@ -909,10 +910,22 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       try {
         await issuerWriteQueueRef.current;
         if (!isCurrent()) return;
-        const storedIssuer = await AsyncStorage.getItem(accountStorageKey(STORAGE_KEY_ISSUER, storageScope));
+        const companyScope = companyScopeFromStorageScope(storageScope);
+        const issuerCompanyKey = companyScope
+          ? accountStorageKey(STORAGE_KEY_ISSUER, companyScope)
+          : accountStorageKey(STORAGE_KEY_ISSUER, storageScope);
+        const issuerLegacyKey = accountStorageKey(STORAGE_KEY_ISSUER, storageScope);
+        const [storedIssuerCompany, storedIssuerLegacy] = await AsyncStorage.multiGet([
+          issuerCompanyKey,
+          issuerLegacyKey,
+        ]).then((entries) => entries.map(([, value]) => value));
         if (!isCurrent()) return;
+        const storedIssuer = storedIssuerCompany || storedIssuerLegacy;
         if (storedIssuer !== null) {
           setIssuer(restoreIssuerSettings(JSON.parse(storedIssuer)));
+          if (!storedIssuerCompany && storedIssuerLegacy && companyScope) {
+            AsyncStorage.setItem(issuerCompanyKey, storedIssuerLegacy).catch(() => undefined);
+          }
         }
         issuerLoadedScopeRef.current = storageScope;
       } catch (error) {
@@ -1898,11 +1911,12 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     );
   }, [expenses, isLoaded, storageScope]);
 
-  // GUARDAR EMISOR AUTOMÁTICAMENTE
+  // GUARDAR EMISOR AUTOMÁTICAMENTE (clave de empresa: compartida principal ↔ empleados).
   const writeIssuerSettings = (scope: string, settings: Issuer): Promise<void> => {
+    const companyScope = companyScopeFromStorageScope(scope) || scope;
     const serialized = JSON.stringify(settings);
     const pending = issuerWriteQueueRef.current.then(() =>
-      AsyncStorage.setItem(accountStorageKey(STORAGE_KEY_ISSUER, scope), serialized)
+      AsyncStorage.setItem(accountStorageKey(STORAGE_KEY_ISSUER, companyScope), serialized)
     ).catch((error) => console.error('Error al guardar emisor:', error));
     issuerWriteQueueRef.current = pending;
     return pending;
@@ -2543,24 +2557,18 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         createdAt: row.createdAt || new Date().toISOString(),
       }));
 
-  const uploadCatalogToCloud = async (list: CatalogProduct[]): Promise<void> => {
-    if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
-    const generation = cacheGenerationRef.current;
-    if (!accessToken || DOCUMENT_API_URL_CANDIDATES.length === 0) return;
-    const authToken = await ensureFreshAccessToken();
-    if (cacheGenerationRef.current !== generation || !authToken) return;
-    // Subir sin foto primero (más fiable); las fotos se intentan después si caben.
-    const products = await Promise.all(list.map(async (product) => {
-      let photoData: string | undefined;
+  const prepareProductsForCloud = async (list: CatalogProduct[]) =>
+    Promise.all(list.map(async (product) => {
+      let photoUri: string | undefined;
       if (product.photoUri) {
         if (product.photoUri.startsWith('data:image/')) {
-          photoData = product.photoUri.length <= 600000 ? product.photoUri : undefined;
+          photoUri = product.photoUri.length <= 600000 ? product.photoUri : undefined;
         } else {
           try {
             const encoded = await convertImageToBase64(product.photoUri);
-            if (encoded && encoded.length <= 600000) photoData = encoded;
+            if (encoded && encoded.length <= 600000) photoUri = encoded;
           } catch {
-            photoData = undefined;
+            photoUri = undefined;
           }
         }
       }
@@ -2569,39 +2577,133 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         name: product.name,
         price: product.price,
         createdAt: product.createdAt,
-        ...(photoData ? { photoData } : {}),
+        ...(photoUri ? { photoUri } : {}),
       };
     }));
+
+  const prepareIssuerForCloud = async (settings: Issuer) => {
+    let logoUri: string | undefined;
+    if (settings.logoUri) {
+      if (settings.logoUri.startsWith('data:image/')) {
+        logoUri = settings.logoUri.length <= 900000 ? settings.logoUri : undefined;
+      } else {
+        try {
+          const encoded = await convertImageToBase64(settings.logoUri);
+          if (encoded && encoded.length <= 900000) logoUri = encoded;
+        } catch {
+          logoUri = undefined;
+        }
+      }
+    }
+    return {
+      name: settings.name || '',
+      nif: settings.nif || '',
+      address: settings.address || '',
+      managerEmail: settings.managerEmail || '',
+      accountHolder: settings.accountHolder || '',
+      iban: settings.iban || '',
+      bankName: settings.bankName || '',
+      country: settings.country || 'ES',
+      ...(logoUri ? { logoUri } : {}),
+      ...(settings.logoPosition ? { logoPosition: settings.logoPosition } : {}),
+      ...(settings.logoSize ? { logoSize: settings.logoSize } : {}),
+      ...(settings.logoOffsetA4 ? { logoOffsetA4: settings.logoOffsetA4 } : {}),
+      ...(settings.logoOffsetTicket ? { logoOffsetTicket: settings.logoOffsetTicket } : {}),
+    };
+  };
+
+  const applyCloudIssuer = (cloudIssuer: Partial<Issuer> | null | undefined) => {
+    if (!cloudIssuer || typeof cloudIssuer !== 'object') return false;
+    const hasUsefulData = Boolean(
+      (cloudIssuer.name && String(cloudIssuer.name).trim())
+      || (cloudIssuer.nif && String(cloudIssuer.nif).trim())
+      || (cloudIssuer.address && String(cloudIssuer.address).trim())
+      || (cloudIssuer.logoUri && String(cloudIssuer.logoUri).trim())
+      || (cloudIssuer.managerEmail && String(cloudIssuer.managerEmail).trim())
+      || (cloudIssuer.iban && String(cloudIssuer.iban).trim()),
+    );
+    if (!hasUsefulData) return false;
+    setIssuer((current) => {
+      try {
+        const restored = restoreIssuerSettings({
+          ...current,
+          ...cloudIssuer,
+          // Las plazas las marca Stripe; no las machacar con un valor viejo de la nube.
+          additionalUsers: current.additionalUsers,
+        });
+        return restored;
+      } catch {
+        return current;
+      }
+    });
+    return true;
+  };
+
+  const uploadCompanyToCloud = async (options?: {
+    issuer?: Issuer;
+    products?: CatalogProduct[];
+  }): Promise<void> => {
+    if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
+    const generation = cacheGenerationRef.current;
+    if (!accessToken || DOCUMENT_API_URL_CANDIDATES.length === 0) return;
+    const authToken = await ensureFreshAccessToken();
+    if (cacheGenerationRef.current !== generation || !authToken) return;
+    const body: { issuer?: Awaited<ReturnType<typeof prepareIssuerForCloud>>; products?: Awaited<ReturnType<typeof prepareProductsForCloud>> } = {};
+    if (options?.issuer) body.issuer = await prepareIssuerForCloud(options.issuer);
+    if (options?.products) body.products = await prepareProductsForCloud(options.products);
+    if (!body.issuer && !body.products) return;
     if (cacheGenerationRef.current !== generation) return;
-    const response = await fetchWithTimeout(DOCUMENT_API_URL_CANDIDATES[0] + '/api/catalog/sync', {
+    const response = await fetchWithTimeout(DOCUMENT_API_URL_CANDIDATES[0] + '/api/company/sync', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: 'Bearer ' + authToken,
       },
-      body: JSON.stringify({ products }),
-    }, 20000);
+      body: JSON.stringify(body),
+    }, 30000);
     if (!response.ok) {
       const result = await response.json().catch(() => ({}) as { error?: string });
       throw new Error(result.error || 'HTTP ' + response.status);
     }
   };
 
-  const pullCatalogFromCloud = async (): Promise<CatalogProduct[] | null> => {
-    if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return null;
+  const uploadCatalogToCloud = async (list: CatalogProduct[]): Promise<void> => {
+    await uploadCompanyToCloud({ products: list });
+  };
+
+  const pullCompanyFromCloud = async (): Promise<{ products: CatalogProduct[] | null; issuer: Partial<Issuer> | null }> => {
+    if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) {
+      return { products: null, issuer: null };
+    }
     const generation = cacheGenerationRef.current;
-    if (!accessToken || DOCUMENT_API_URL_CANDIDATES.length === 0) return null;
+    if (!accessToken || DOCUMENT_API_URL_CANDIDATES.length === 0) return { products: null, issuer: null };
     const authToken = await ensureFreshAccessToken();
-    if (cacheGenerationRef.current !== generation || !authToken) return null;
-    const response = await fetchWithTimeout(DOCUMENT_API_URL_CANDIDATES[0] + '/api/catalog', {
+    if (cacheGenerationRef.current !== generation || !authToken) return { products: null, issuer: null };
+    const response = await fetchWithTimeout(DOCUMENT_API_URL_CANDIDATES[0] + '/api/company', {
       headers: { Authorization: 'Bearer ' + authToken },
-    }, 15000);
-    const result = await response.json().catch(() => ({}) as { ok?: boolean; products?: unknown; error?: string });
-    if (cacheGenerationRef.current !== generation) return null;
-    if (!response.ok || !result.ok || !Array.isArray(result.products)) {
+    }, 20000);
+    const result = await response.json().catch(() => ({}) as {
+      ok?: boolean;
+      products?: unknown;
+      issuer?: Partial<Issuer> | null;
+      error?: string;
+    });
+    if (cacheGenerationRef.current !== generation) return { products: null, issuer: null };
+    if (!response.ok || !result.ok) {
       throw new Error(result.error || 'HTTP ' + response.status);
     }
-    return mapCloudCatalogProducts(result.products as { id?: string; name?: string; price?: number; photoUri?: string; createdAt?: string }[]);
+    return {
+      products: Array.isArray(result.products)
+        ? mapCloudCatalogProducts(result.products as { id?: string; name?: string; price?: number; photoUri?: string; createdAt?: string }[])
+        : null,
+      issuer: result.issuer && typeof result.issuer === 'object' ? result.issuer : null,
+    };
+  };
+
+  const pullCatalogFromCloud = async (): Promise<CatalogProduct[] | null> => {
+    const company = await pullCompanyFromCloud();
+    if (company.issuer) applyCloudIssuer(company.issuer);
+    return company.products;
   };
 
   // Al abrir Productos: bajar el catálogo compartido (principal ↔ empleados / varios móviles).
@@ -2612,10 +2714,11 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     const generation = cacheGenerationRef.current;
     (async () => {
       try {
-        const cloudProducts = await pullCatalogFromCloud();
-        if (cancelled || cacheGenerationRef.current !== generation || !cloudProducts) return;
-        if (cloudProducts.length > 0) {
-          setCatalogProducts(cloudProducts);
+        const company = await pullCompanyFromCloud();
+        if (cancelled || cacheGenerationRef.current !== generation) return;
+        if (company.issuer) applyCloudIssuer(company.issuer);
+        if (company.products && company.products.length > 0) {
+          setCatalogProducts(company.products);
         } else if (catalogProductsRef.current.length > 0) {
           await uploadCatalogToCloud(catalogProductsRef.current);
         }
@@ -2625,6 +2728,24 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     })();
     return () => { cancelled = true; };
   }, [activeTab, isLoaded, accessToken, storageScope]);
+
+  // Subir datos de empresa (logo incluido) a la nube al cambiar Configuración.
+  useEffect(() => {
+    if (!isLoaded || !accessToken || !storageScope || userRole !== 'principal') return;
+    if (loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
+    if (issuerLoadedScopeRef.current !== storageScope) return;
+    const hasData = Boolean(
+      issuer.name.trim() || issuer.nif.trim() || issuer.address.trim() || issuer.logoUri
+      || (issuer.managerEmail || '').trim() || (issuer.iban || '').trim(),
+    );
+    if (!hasData) return;
+    const timer = setTimeout(() => {
+      void uploadCompanyToCloud({ issuer: issuerRef.current }).catch((error) =>
+        console.warn('No se pudo sincronizar los datos de empresa:', error)
+      );
+    }, 1500);
+    return () => clearTimeout(timer);
+  }, [issuer, isLoaded, accessToken, storageScope, userRole]);
 
   const saveCatalogProduct = () => {
     const name = productNameInput.trim();
@@ -3801,13 +3922,21 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       } catch (uploadError) {
         console.warn('No se pudieron subir los gastos locales antes de sincronizar:', uploadError);
       }
-      // Subir catálogo solo si hay productos locales: un móvil nuevo vacío no debe borrar la nube.
+      // Subir empresa + catálogo locales antes de bajar (móvil nuevo vacío no borra la nube).
       const localCatalog = catalogProductsRef.current;
-      if (localCatalog.length > 0) {
+      const localIssuer = issuerRef.current;
+      const hasLocalIssuer = Boolean(
+        localIssuer.name.trim() || localIssuer.nif.trim() || localIssuer.address.trim() || localIssuer.logoUri
+        || (localIssuer.managerEmail || '').trim() || (localIssuer.iban || '').trim(),
+      );
+      if (localCatalog.length > 0 || hasLocalIssuer) {
         try {
-          await uploadCatalogToCloud(localCatalog);
+          await uploadCompanyToCloud({
+            ...(hasLocalIssuer ? { issuer: localIssuer } : {}),
+            ...(localCatalog.length > 0 ? { products: localCatalog } : {}),
+          });
         } catch (uploadError) {
-          console.warn('No se pudo subir el catálogo antes de sincronizar:', uploadError);
+          console.warn('No se pudo subir empresa/catálogo antes de sincronizar:', uploadError);
         }
       }
 
@@ -3892,32 +4021,35 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         });
       }
 
-      // 5) Catálogo de productos (compartido en la empresa).
+      // 5) Perfil de empresa (datos + logo) y catálogo de productos.
       let restoredProductsCount = 0;
       let cloudProducts: CatalogProduct[] | null = Array.isArray(result.products)
         ? mapCloudCatalogProducts(result.products)
         : null;
-      // Backend antiguo o sync-all sin catálogo: pedir /api/catalog aparte.
-      if (cloudProducts === null) {
+      let cloudIssuer: Partial<Issuer> | null = result.issuer && typeof result.issuer === 'object'
+        ? result.issuer
+        : null;
+      // Backend antiguo o sync-all sin perfil: pedir /api/company aparte.
+      if (cloudProducts === null || cloudIssuer === null) {
         try {
-          cloudProducts = await pullCatalogFromCloud();
+          const company = await pullCompanyFromCloud();
+          if (cloudProducts === null) cloudProducts = company.products;
+          if (cloudIssuer === null) cloudIssuer = company.issuer;
         } catch (catalogError) {
-          console.warn('No se pudo recuperar el catálogo:', catalogError);
+          console.warn('No se pudo recuperar el perfil de empresa:', catalogError);
         }
       }
+      if (cloudIssuer) applyCloudIssuer(cloudIssuer);
       if (cloudProducts) {
         restoredProductsCount = cloudProducts.length;
         const localNow = catalogProductsRef.current;
         if (cloudProducts.length > 0) {
-          // Nube con datos: sustituir local (fuente de verdad entre móviles).
           setCatalogProducts(cloudProducts);
         } else if (localNow.length > 0) {
-          // Nube vacía pero hay catálogo local (p. ej. aún no subido): publicar, no borrar.
           void uploadCatalogToCloud(localNow).catch((error) =>
             console.warn('No se pudo publicar el catálogo local en la nube:', error)
           );
         }
-        // Si ambos están vacíos, no tocar el estado (evita borrar por closure obsoleto).
       }
 
       if (restoredDocsCount === 0 && restoredExpensesCount === 0 && restoredProductsCount === 0) {

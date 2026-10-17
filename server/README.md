@@ -155,7 +155,8 @@ en el entorno autorizado. No se han usado claves, API real ni Dashboard para est
 - `GET /api/documents` (lista los documentos de la cuenta)
 - `GET /api/documents/sync-all` (recupera documentos + gastos en una llamada: "Sincronizar historial")
 - `POST /api/expenses/sync` / `GET /api/expenses` (guardar y listar los gastos de la cuenta)
-- `POST /api/catalog/sync` / `GET /api/catalog` (catálogo de productos de la empresa; requiere tabla `catalog_products`, ver `supabase-catalog-products.sql`)
+- `POST /api/company/sync` / `GET /api/company` (datos de empresa, logo y catálogo; se guarda en `documents`, sin tabla nueva)
+- `POST /api/catalog/sync` / `GET /api/catalog` (atajo del catálogo; mismo almacenamiento que `/api/company`)
 
 ### Plan actual
 
