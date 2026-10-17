@@ -124,6 +124,7 @@ type SyncAllResult = {
   ok?: boolean;
   documents?: (Record<string, unknown> & { id?: string; ticketCode?: string; publicUrl?: string; createdAt?: string })[];
   expenses?: { local_id?: string; description?: string; amount?: number; date?: string | null; category?: string; synced_at?: string }[];
+  products?: { id?: string; name?: string; price?: number; photoUri?: string; createdAt?: string }[];
   error?: string;
 };
 
@@ -348,6 +349,13 @@ const storageScopeFromUser = (user?: AuthenticatedUser): string | null => {
   const ownerId = user.app_metadata?.company_owner_id;
   const companyId = typeof ownerId === 'string' && ownerId.trim() ? ownerId : user.id;
   return `${encodeURIComponent(companyId)}:${encodeURIComponent(user.id)}`;
+};
+
+/** Ámbito de empresa (sin userId): catálogo compartido entre principal y empleados. */
+const companyScopeFromStorageScope = (scope: string | null | undefined): string | null => {
+  if (!scope) return null;
+  const company = scope.split(':')[0];
+  return company || null;
 };
 
 // Las claves globales antiguas se conservan sin leer ni migrar: no tienen propietario verificable.
@@ -911,6 +919,11 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       }
       try {
         if (!isCurrent()) return;
+        const companyScope = companyScopeFromStorageScope(storageScope);
+        const catalogCompanyKey = companyScope
+          ? accountStorageKey(STORAGE_KEY_CATALOG_PRODUCTS, companyScope)
+          : accountStorageKey(STORAGE_KEY_CATALOG_PRODUCTS, storageScope);
+        const catalogLegacyKey = accountStorageKey(STORAGE_KEY_CATALOG_PRODUCTS, storageScope);
         const [
           storedTransactions,
           storedCashInvoiceDrafts,
@@ -920,18 +933,20 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
           storedRecoveryPhone,
           storedInvoiceSeq,
           storedCatalogProducts,
+          storedCatalogProductsLegacy,
           storedSavedQuotes,
         ] = await AsyncStorage.multiGet([
-          STORAGE_KEY_TRANSACTIONS,
-          STORAGE_KEY_CASH_INVOICE_DRAFTS,
-          STORAGE_KEY_EXPENSES,
-          STORAGE_KEY_OWNER_PIN,
-          STORAGE_KEY_OWNER_RECOVERY_EMAIL,
-          STORAGE_KEY_OWNER_RECOVERY_PHONE,
-          STORAGE_KEY_INVOICE_SEQ,
-          STORAGE_KEY_CATALOG_PRODUCTS,
-          STORAGE_KEY_SAVED_QUOTES,
-        ].map((key) => accountStorageKey(key, storageScope))).then((entries) => entries.map(([, value]) => value)).catch((error) => {
+          accountStorageKey(STORAGE_KEY_TRANSACTIONS, storageScope),
+          accountStorageKey(STORAGE_KEY_CASH_INVOICE_DRAFTS, storageScope),
+          accountStorageKey(STORAGE_KEY_EXPENSES, storageScope),
+          accountStorageKey(STORAGE_KEY_OWNER_PIN, storageScope),
+          accountStorageKey(STORAGE_KEY_OWNER_RECOVERY_EMAIL, storageScope),
+          accountStorageKey(STORAGE_KEY_OWNER_RECOVERY_PHONE, storageScope),
+          accountStorageKey(STORAGE_KEY_INVOICE_SEQ, storageScope),
+          catalogCompanyKey,
+          catalogLegacyKey,
+          accountStorageKey(STORAGE_KEY_SAVED_QUOTES, storageScope),
+        ]).then((entries) => entries.map(([, value]) => value)).catch((error) => {
           if (isCurrent()) issuerLoadedScopeRef.current = null;
           throw error;
         });
@@ -986,10 +1001,17 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         if (storedOwnerPin) setOwnerPin(storedOwnerPin);
         if (storedRecoveryEmail) setOwnerRecoveryEmail(storedRecoveryEmail);
         if (storedRecoveryPhone) setOwnerRecoveryPhone(storedRecoveryPhone);
-        if (storedCatalogProducts) {
+        const catalogRaw = storedCatalogProducts || storedCatalogProductsLegacy;
+        if (catalogRaw) {
           try {
-            const parsedProducts = JSON.parse(storedCatalogProducts) as CatalogProduct[];
-            if (Array.isArray(parsedProducts)) setCatalogProducts(parsedProducts);
+            const parsedProducts = JSON.parse(catalogRaw) as CatalogProduct[];
+            if (Array.isArray(parsedProducts)) {
+              setCatalogProducts(parsedProducts);
+              // Migrar catálogo de clave por usuario a clave de empresa (compartida).
+              if (!storedCatalogProducts && storedCatalogProductsLegacy && companyScope) {
+                AsyncStorage.setItem(catalogCompanyKey, catalogRaw).catch(() => undefined);
+              }
+            }
           } catch {
             setCatalogProducts([]);
           }
@@ -1842,10 +1864,15 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
 
   useEffect(() => {
     if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
-    AsyncStorage.setItem(accountStorageKey(STORAGE_KEY_CATALOG_PRODUCTS, storageScope), JSON.stringify(catalogProducts)).catch((error) =>
+    const companyScope = companyScopeFromStorageScope(storageScope) || storageScope;
+    AsyncStorage.setItem(accountStorageKey(STORAGE_KEY_CATALOG_PRODUCTS, companyScope), JSON.stringify(catalogProducts)).catch((error) =>
       console.error('Error al guardar catálogo:', error)
     );
   }, [catalogProducts, isLoaded, storageScope]);
+
+  useEffect(() => {
+    if (userRole === 'empleado') setProductDestination('tpv');
+  }, [userRole]);
 
   useEffect(() => {
     if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
@@ -2501,6 +2528,49 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     }
   };
 
+  const uploadCatalogToCloud = async (list: CatalogProduct[]): Promise<void> => {
+    if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
+    const generation = cacheGenerationRef.current;
+    if (!accessToken || DOCUMENT_API_URL_CANDIDATES.length === 0) return;
+    const authToken = await ensureFreshAccessToken();
+    if (cacheGenerationRef.current !== generation || !authToken) return;
+    const products = await Promise.all(list.map(async (product) => {
+      let photoData: string | undefined;
+      if (product.photoUri) {
+        if (product.photoUri.startsWith('data:image/')) {
+          photoData = product.photoUri.length <= 600000 ? product.photoUri : undefined;
+        } else {
+          try {
+            const encoded = await convertImageToBase64(product.photoUri);
+            if (encoded && encoded.length <= 600000) photoData = encoded;
+          } catch {
+            photoData = undefined;
+          }
+        }
+      }
+      return {
+        id: product.id,
+        name: product.name,
+        price: product.price,
+        createdAt: product.createdAt,
+        ...(photoData ? { photoData } : {}),
+      };
+    }));
+    if (cacheGenerationRef.current !== generation) return;
+    const response = await fetchWithTimeout(DOCUMENT_API_URL_CANDIDATES[0] + '/api/catalog/sync', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer ' + authToken,
+      },
+      body: JSON.stringify({ products }),
+    }, 20000);
+    if (!response.ok) {
+      const result = await response.json().catch(() => ({}) as { error?: string });
+      throw new Error(result.error || 'HTTP ' + response.status);
+    }
+  };
+
   const saveCatalogProduct = () => {
     const name = productNameInput.trim();
     const price = parseFloat(productPriceInput.replace(',', '.'));
@@ -2519,12 +2589,24 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       ...(productPhotoUri ? { photoUri: productPhotoUri } : {}),
       createdAt: new Date().toISOString(),
     };
-    setCatalogProducts((current) => [product, ...current]);
+    setCatalogProducts((current) => {
+      const next = [product, ...current];
+      void uploadCatalogToCloud(next).catch((error) =>
+        console.warn('No se pudo guardar el catálogo en la nube:', error)
+      );
+      return next;
+    });
     resetProductForm();
   };
 
   const deleteCatalogProduct = (productId: string) => {
-    setCatalogProducts((current) => current.filter((product) => product.id !== productId));
+    setCatalogProducts((current) => {
+      const next = current.filter((product) => product.id !== productId);
+      void uploadCatalogToCloud(next).catch((error) =>
+        console.warn('No se pudo sincronizar el catálogo tras borrar:', error)
+      );
+      return next;
+    });
     setCatalogCart((current) => current.filter((line) => line.productId !== productId));
   };
 
@@ -2543,7 +2625,8 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     }
     const items = cartToInvoiceItems(catalogCart);
     const total = sumCatalogCart(catalogCart);
-    if (productDestination === 'tpv') {
+    // Empleados: solo pueden enviar el carrito al TPV (no presupuesto/factura).
+    if (userRole === 'empleado' || productDestination === 'tpv') {
       setDigits(String(Math.max(0, Math.round(total * 100))));
       setPendingCatalogCharge({ items, total });
       setActiveTab('tpv');
@@ -3659,8 +3742,16 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       } catch (uploadError) {
         console.warn('No se pudieron subir los gastos locales antes de sincronizar:', uploadError);
       }
+      // Subir catálogo solo si hay productos locales: un móvil nuevo vacío no debe borrar la nube.
+      if (catalogProducts.length > 0) {
+        try {
+          await uploadCatalogToCloud(catalogProducts);
+        } catch (uploadError) {
+          console.warn('No se pudo subir el catálogo antes de sincronizar:', uploadError);
+        }
+      }
 
-      // 2) Descargar todo el historial del usuario (documentos + gastos) en una sola llamada.
+      // 2) Descargar todo el historial del usuario (documentos + gastos + catálogo) en una sola llamada.
       // Se renueva la sesión si hace falta: con un token caducado el servidor respondería 401.
       const authToken = await ensureFreshAccessToken();
       if (cacheGenerationRef.current !== generation) return;
@@ -3741,7 +3832,32 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         });
       }
 
-      if (restoredDocsCount === 0 && restoredExpensesCount === 0) {
+      // 5) Catálogo de productos (compartido en la empresa).
+      let restoredProductsCount = 0;
+      if (Array.isArray(result.products)) {
+        const cloudProducts = result.products
+          .filter((row) => row && row.id && row.name)
+          .map((row) => ({
+            id: String(row.id),
+            name: String(row.name),
+            price: Math.round((Number(row.price) || 0) * 100) / 100,
+            ...(row.photoUri ? { photoUri: String(row.photoUri) } : {}),
+            createdAt: row.createdAt || new Date().toISOString(),
+          }) as CatalogProduct);
+        restoredProductsCount = cloudProducts.length;
+        if (cloudProducts.length > 0) {
+          setCatalogProducts(cloudProducts);
+        } else if (catalogProducts.length > 0) {
+          // Nube vacía pero hay catálogo local: publicarlo para el resto de móviles.
+          void uploadCatalogToCloud(catalogProducts).catch((error) =>
+            console.warn('No se pudo publicar el catálogo local en la nube:', error)
+          );
+        } else {
+          setCatalogProducts([]);
+        }
+      }
+
+      if (restoredDocsCount === 0 && restoredExpensesCount === 0 && restoredProductsCount === 0) {
         // En modo silencioso (sincronización automática al abrir) no se avisa de que no hay nada.
         if (!silent) setSyncHistoryMessage(tr('sync.empty'));
       } else {
@@ -5444,11 +5560,14 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
             <View style={styles.card}>
               <Text style={styles.cardTitle}>{tr('products.title')}</Text>
               <View style={styles.productDestRow}>
-                {([
-                  ['tpv', 'products.destTpv'],
-                  ['factura', 'products.destInvoice'],
-                  ['presupuesto', 'products.destQuote'],
-                ] as const).map(([key, labelKey]) => (
+                {(userRole === 'empleado'
+                  ? ([['tpv', 'products.destTpv']] as const)
+                  : ([
+                    ['tpv', 'products.destTpv'],
+                    ['factura', 'products.destInvoice'],
+                    ['presupuesto', 'products.destQuote'],
+                  ] as const)
+                ).map(([key, labelKey]) => (
                   <Pressable
                     key={key}
                     style={[styles.productDestChip, productDestination === key && styles.productDestChipActive]}

@@ -3123,11 +3123,75 @@ app.get('/api/expenses', requireAuth, async (req, res) => {
   res.json({ ok: true, expenses: data || [] });
 });
 
-// Recupera todo el historial (documentos + gastos) en un solo llamado, para restaurar la app
+// Sustituye el catálogo de productos de la empresa (principal + empleados) para recuperarlo
+// en otro móvil. Foto opcional en base64 (si es muy grande se omite en el cliente).
+app.post('/api/catalog/sync', requireAuth, async (req, res) => {
+  const products = Array.isArray(req.body?.products) ? req.body.products : null;
+  if (!products) {
+    return res.status(400).json({ ok: false, error: 'No se recibió el catálogo de productos.' });
+  }
+  const ownerId = req.user.app_metadata?.company_owner_id || req.user.id;
+  const syncedAt = new Date().toISOString();
+  const rows = products
+    .filter((item) => item && typeof item.id === 'string' && item.id.trim())
+    .map((item) => ({
+      user_id: ownerId,
+      local_id: String(item.id).trim(),
+      name: String(item.name || '').trim() || 'Producto',
+      price: Math.max(0, Number(item.price) || 0),
+      photo_data: typeof item.photoData === 'string' && item.photoData.startsWith('data:image/')
+        ? item.photoData.slice(0, 600000)
+        : null,
+      created_at: item.createdAt || syncedAt,
+      synced_at: syncedAt,
+    }));
+
+  const { error: deleteError } = await supabase.from('catalog_products').delete().eq('user_id', ownerId);
+  if (deleteError) {
+    console.error('Error limpiando catálogo:', deleteError.message);
+    return res.status(500).json({ ok: false, error: `Supabase: ${deleteError.message}` });
+  }
+  if (rows.length > 0) {
+    const { error: insertError } = await supabase.from('catalog_products').insert(rows);
+    if (insertError) {
+      console.error('Error sincronizando catálogo:', insertError.message);
+      return res.status(500).json({ ok: false, error: `Supabase: ${insertError.message}` });
+    }
+  }
+  res.json({ ok: true, count: rows.length });
+});
+
+app.get('/api/catalog', requireAuth, async (req, res) => {
+  const ownerId = req.user.app_metadata?.company_owner_id || req.user.id;
+  const { data, error } = await supabase
+    .from('catalog_products')
+    .select('local_id,name,price,photo_data,created_at,synced_at')
+    .eq('user_id', ownerId)
+    .order('created_at', { ascending: false })
+    .limit(500);
+
+  if (error) {
+    console.error('Error listando catálogo:', error.message);
+    return res.status(500).json({ ok: false, error: `Supabase: ${error.message}` });
+  }
+  res.json({
+    ok: true,
+    products: (data || []).map((row) => ({
+      id: row.local_id,
+      name: row.name,
+      price: Number(row.price) || 0,
+      photoUri: row.photo_data || undefined,
+      createdAt: row.created_at || row.synced_at,
+    })),
+  });
+});
+
+// Recupera todo el historial (documentos + gastos + catálogo) en un solo llamado, para restaurar la app
 // tras borrar datos o instalarla en otro móvil.
 app.get('/api/documents/sync-all', requireAuth, async (req, res) => {
   const userIds = await companyHistoryUserIds(req, res);
   if (!userIds) return;
+  const ownerId = req.user.app_metadata?.company_owner_id || req.user.id;
   const limit = Math.max(1, Math.min(500, Number(req.query.limit) || 100));
 
   const documentsPromise = supabase
@@ -3144,9 +3208,17 @@ app.get('/api/documents/sync-all', requireAuth, async (req, res) => {
     .order('date', { ascending: false })
     .limit(limit);
 
-  const [documentsResult, expensesResult] = await Promise.allSettled([
+  const catalogPromise = supabase
+    .from('catalog_products')
+    .select('local_id,name,price,photo_data,created_at,synced_at')
+    .eq('user_id', ownerId)
+    .order('created_at', { ascending: false })
+    .limit(500);
+
+  const [documentsResult, expensesResult, catalogResult] = await Promise.allSettled([
     documentsPromise,
     expensesPromise,
+    catalogPromise,
   ]);
 
   const documentsError = documentsResult.status === 'rejected'
@@ -3155,6 +3227,9 @@ app.get('/api/documents/sync-all', requireAuth, async (req, res) => {
   const expensesError = expensesResult.status === 'rejected'
     ? expensesResult.reason
     : expensesResult.value.error;
+  const catalogError = catalogResult.status === 'rejected'
+    ? catalogResult.reason
+    : catalogResult.value.error;
 
   if (documentsError || expensesError) {
     // Nunca se oculta el fallo de la nube: si falta la columna user_id o los permisos de la tabla
@@ -3176,8 +3251,21 @@ app.get('/api/documents/sync-all', requireAuth, async (req, res) => {
   }));
 
   const expenses = expensesResult.value.data || [];
+  // Catálogo opcional: si la tabla aún no existe en Supabase, no tumba la sincronización
+  // ni borra el catálogo local (omitimos `products` en la respuesta).
+  if (catalogError) {
+    console.warn('Catálogo no disponible en sync-all (¿falta tabla?):', catalogError.message || catalogError);
+    return res.json({ ok: true, documents, expenses });
+  }
+  const products = (catalogResult.value.data || []).map((row) => ({
+    id: row.local_id,
+    name: row.name,
+    price: Number(row.price) || 0,
+    photoUri: row.photo_data || undefined,
+    createdAt: row.created_at || row.synced_at,
+  }));
 
-  res.json({ ok: true, documents, expenses });
+  res.json({ ok: true, documents, expenses, products });
 });
 
 
