@@ -316,6 +316,7 @@ const STORAGE_KEY_OWNER_RECOVERY_PHONE = '@tpv_owner_recovery_phone_v1';
 const STORAGE_KEY_INVOICE_SEQ = '@tpv_invoice_seq_v1';
 const STORAGE_KEY_CATALOG_PRODUCTS = '@tpv_catalog_products_v1';
 const STORAGE_KEY_SAVED_QUOTES = '@tpv_saved_quotes_v1';
+const STORAGE_KEY_LEGAL_DISCLAIMER_SEEN = '@tpv_legal_disclaimer_seen_v1';
 // Cobro online pendiente: permite confirmar el ticket aunque la app se recargue al volver de Stripe.
 const STORAGE_KEY_PENDING_ONLINE_PAYMENT = '@tpv_pending_online_payment_v1';
 const AUTH_TOKEN_KEY = 'tpv_access_token';
@@ -771,6 +772,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   const [client, setClient] = useState<Client>({ name: '', nif: '', address: '' });
   const [hasPermission, setHasPermission] = useState<boolean | null>(null);
   const [scanned, setScanned] = useState(false);
+  const [legalDisclaimerVisible, setLegalDisclaimerVisible] = useState(false);
 
   const resetAccountCache = () => {
     cacheGenerationRef.current += 1;
@@ -1319,6 +1321,27 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     refreshSubscriptionStatusRef.current = runStatusCheck;
     void runStatusCheck();
   }, [accessToken, isLoaded, storageScope]);
+
+  useEffect(() => {
+    if (!isLoaded || !accessToken || !storageScope || loadedScopeRef.current !== storageScope) return;
+    let cancelled = false;
+    AsyncStorage.getItem(accountStorageKey(STORAGE_KEY_LEGAL_DISCLAIMER_SEEN, storageScope))
+      .then((value) => {
+        if (!cancelled && value !== '1') setLegalDisclaimerVisible(true);
+      })
+      .catch(() => {
+        if (!cancelled) setLegalDisclaimerVisible(true);
+      });
+    return () => { cancelled = true; };
+  }, [accessToken, isLoaded, storageScope]);
+
+  const acknowledgeLegalDisclaimer = () => {
+    setLegalDisclaimerVisible(false);
+    if (!storageScope) return;
+    AsyncStorage.setItem(accountStorageKey(STORAGE_KEY_LEGAL_DISCLAIMER_SEEN, storageScope), '1').catch((error) =>
+      console.error('Error al guardar aviso legal:', error)
+    );
+  };
 
   useEffect(() => {
     (async () => {
@@ -5951,10 +5974,27 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                 label={tr('config.vatTaxLabel')}
                 placeholder="21"
               />
+              <Text style={{ marginTop: 20, fontSize: 11, color: '#64748b', textAlign: 'center', lineHeight: 16 }}>
+                {tr('legal.disclaimer')}
+              </Text>
             </View>
           </ScrollView>
         )}
       </View>
+
+      <Modal visible={legalDisclaimerVisible} animationType="fade" transparent>
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <Text style={styles.modalTitle}>{tr('legal.disclaimerTitle')}</Text>
+            <Text style={[styles.modalSubtitle, { textAlign: 'center', color: '#64748b', marginTop: 8 }]}>
+              {tr('legal.disclaimer')}
+            </Text>
+            <Pressable style={[styles.primaryButton, { marginTop: 16 }]} onPress={acknowledgeLegalDisclaimer}>
+              <Text style={styles.primaryButtonText}>{tr('legal.disclaimerOk')}</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
 
       {/* MODAL: ESCANEAR CÓDIGO QR / BARRAS */}
       <Modal visible={scannerModalVisible} animationType="slide" transparent={false}>

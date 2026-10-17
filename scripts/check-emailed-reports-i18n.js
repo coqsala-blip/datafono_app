@@ -26,7 +26,7 @@ const loadModule = (filePath) => {
 
 const { emailedReportsTranslations } = loadModule(path.join(root, 'src/translations/emailed-reports.ts'));
 const { APP_LOCALES, t, formatCurrencyForLocale } = loadModule(path.join(root, 'src/i18n.ts'));
-const { buildEmailedReport } = loadModule(path.join(root, 'src/reports/emailed-report.ts'));
+const { buildEmailedReport, resolveReportTaxLine } = loadModule(path.join(root, 'src/reports/emailed-report.ts'));
 const { buildReportPdfFilename } = loadModule(path.join(root, 'src/documents/pdf-export.ts'));
 const keys = Object.keys(emailedReportsTranslations.es).sort();
 const placeholders = (value) => Array.from(value.matchAll(/\{\w+\}/g), match => match[0]).sort();
@@ -34,9 +34,9 @@ const input = {
   issuer: { name: 'Atelier <Nord> & "Co" \'Élodie\' {range}', nif: 'ID<&>' },
   range: { start: new Date(2026, 0, 2), end: new Date(2026, 1, 3) },
   transactions: [
-    { ticketCode: 'SALE<&>', createdAt: '2026-01-02T12:00:00Z', type: 'COBRO', client: { name: 'Zoë <Client> & "A"' }, amount: 71.23, originalAmount: 123.45 },
-    { ticketCode: 'REFUND', createdAt: '2026-02-03T12:00:00Z', type: 'DEVOLUCIÓN', amount: 19.87, originalAmount: 999 },
-    { ticketCode: 'SALE2', createdAt: '2026-01-03T12:00:00Z', type: 'COBRO', amount: 8.76 },
+    { ticketCode: 'SALE<&>', createdAt: '2026-01-02T12:00:00Z', type: 'COBRO', client: { name: 'Zoë <Client> & "A"' }, amount: 71.23, originalAmount: 123.45, subtotal: 58.87, iva: 12.36, ivaRateApplied: 21 },
+    { ticketCode: 'REFUND', createdAt: '2026-02-03T12:00:00Z', type: 'DEVOLUCIÓN', amount: 19.87, originalAmount: 999, subtotal: 16.42, iva: 3.45, ivaRateApplied: 21 },
+    { ticketCode: 'SALE2', createdAt: '2026-01-03T12:00:00Z', type: 'COBRO', amount: 8.76, subtotal: 7.24, iva: 1.52, ivaRateApplied: 10 },
   ],
   expenses: [{ expenseCode: 'EXP<&>', createdAt: '2026-01-04T12:00:00Z', provider: 'Müller <Supply> & \'Sons\'', amount: 45.67 }],
   totals: { income: 132.21, refunds: 72.09, expenses: 45.67, netIncome: 60.12, netBalance: 14.45 },
@@ -74,18 +74,36 @@ for (const { code: locale } of APP_LOCALES) {
     assert.ok(report.html.includes('Müller &lt;Supply&gt; &amp; &#39;Sons&#39;'));
     assert.ok(report.html.includes(`<td>${currency(45.67)}</td>`));
     assert.ok(report.html.includes(`<strong>${t(locale, kind === 'expenses' ? 'emailReport.periodExpenses' : 'emailReport.expenseTotal')}:</strong> ${currency(input.totals.expenses)}`));
+    assert.ok(report.html.includes(t(locale, 'legal.disclaimer')));
     if (kind !== 'expenses') {
       assert.ok(report.html.includes('Zoë &lt;Client&gt; &amp; &quot;A&quot;'));
       assert.ok(report.html.includes(`<td>${t(locale, 'emailReport.charge')}</td>`));
       assert.ok(report.html.includes(`<td>${t(locale, 'emailReport.refund')}</td>`));
-      assert.ok(report.html.includes(`<td>${currency(kind === 'manager' ? 123.45 : 71.23)}</td>`));
-      assert.ok(report.html.includes(`<td>${currency(19.87)}</td>`));
-      assert.ok(report.html.includes(`<td>${currency(8.76)}</td>`));
+      assert.ok(report.html.includes(`<th>${t(locale, 'ticket.taxBase')}</th>`));
+      assert.ok(report.html.includes(`<th>${t(locale, 'emailReport.vatRate')}</th>`));
+      assert.ok(report.html.includes(`<th>${t(locale, 'emailReport.vatAmount')}</th>`));
+      assert.ok(report.html.includes('<td>21%</td>'));
+      assert.ok(report.html.includes('<td>10%</td>'));
+      const sale = resolveReportTaxLine(input.transactions[0], kind);
+      const refund = resolveReportTaxLine(input.transactions[1], kind);
+      const sale2 = resolveReportTaxLine(input.transactions[2], kind);
+      assert.ok(report.html.includes(`<td>${currency(sale.total)}</td>`));
+      assert.ok(report.html.includes(`<td>${currency(refund.total)}</td>`));
+      assert.ok(report.html.includes(`<td>${currency(sale2.total)}</td>`));
+      assert.ok(report.html.includes(`<td>${currency(sale.taxBase)}</td>`));
+      assert.ok(report.html.includes(`<td>${currency(sale.vatAmount)}</td>`));
       assert.ok(report.html.includes(`<td>${t(locale, 'workflow.generalClient')}</td>`));
-      for (const [key, amount] of [['emailReport.income', 132.21], ['emailReport.refunds', 72.09], [kind === 'manager' ? 'emailReport.netBalance' : 'report.totalVat', 14.45]]) {
-        assert.ok(report.html.includes(`<strong>${t(locale, key)}:</strong> ${currency(amount)}`));
+      const periodTaxBase = Math.round((sale.taxBase - refund.taxBase + sale2.taxBase) * 100) / 100;
+      const periodVat = Math.round((sale.vatAmount - refund.vatAmount + sale2.vatAmount) * 100) / 100;
+      for (const [key, amount] of [
+        ['emailReport.income', 132.21],
+        ['emailReport.refunds', 72.09],
+        ['emailReport.taxBaseTotal', periodTaxBase],
+        ['emailReport.vatTotal', periodVat],
+        [kind === 'manager' ? 'emailReport.netBalance' : 'report.totalVat', 14.45],
+      ]) {
+        assert.ok(report.html.includes(`<strong>${t(locale, key)}:</strong> ${currency(amount)}`), `${locale}/${kind}/${key}`);
       }
-      assert.equal(report.html.includes(t(locale, 'emailReport.disclaimer')), kind === 'manager');
       if (kind === 'manager') assert.ok(report.html.includes(`<strong>${t(locale, 'emailReport.netIncome')}:</strong> ${currency(60.12)}`));
     }
     assert.ok(report.html.includes(new Intl.DateTimeFormat(locale, { dateStyle: 'short', timeStyle: 'short', hourCycle: 'h23' }).format(new Date(input.expenses[0].createdAt))));
@@ -112,7 +130,7 @@ for (const { code: locale } of APP_LOCALES) {
     const empty = buildEmailedReport({ ...input, locale, kind, transactions: [], expenses: [] });
     assert.equal((empty.html.match(/<tr>/g) || []).length, kind === 'combined' ? 4 : kind === 'manager' ? 2 : 1);
     if (kind === 'combined') {
-      assert.ok(empty.html.includes(`<td colspan="5">${t(locale, 'emailReport.noTransactions')}</td>`));
+      assert.ok(empty.html.includes(`<td colspan="8">${t(locale, 'emailReport.noTransactions')}</td>`));
       assert.ok(empty.html.includes(`<td colspan="4">${t(locale, 'emailReport.noExpenses')}</td>`));
       for (const missing of ['transactions', 'expenses']) {
         const partial = buildEmailedReport({ ...input, locale, kind, [missing]: [] });
@@ -175,6 +193,7 @@ const checkSendFunctions = async () => {
             return `file:///export/${filename}`;
           },
           appLocale: locale, translateKey: t, parseDateInput, Date, transactions, expenses, issuer: input.issuer,
+          isSalesHistoryDocument: () => true,
           startDateInput: startInput, endDateInput: validEnd,
           transactionStartDateInput: startInput, transactionEndDateInput: validEnd,
           expenseStartDateInput: startInput, expenseEndDateInput: validEnd,
