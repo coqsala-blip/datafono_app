@@ -598,6 +598,8 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   const cashInvoiceDraftsRef = useRef<CashInvoiceDraft[]>([]);
   cashInvoiceDraftsRef.current = cashInvoiceDrafts;
   const invoiceSeqRef = useRef<InvoiceSequenceByYear>({});
+  const paymentCancelledRef = useRef(false);
+  const terminalConnectInFlightRef = useRef(false);
   registerTransactionDocumentRef.current = registerTransactionDocument;
 
   const onlinePaymentRef = useRef<{
@@ -2644,64 +2646,105 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     createOnlinePaymentRef.current = createTransactionFromConfirmedPayment;
   });
 
+  const mapTerminalErrorMessage = (raw: string): string => {
+    if (/Timed out waiting for connection token|connection token/i.test(raw)) return tr('tpv.tokenTimeout');
+    if (/SDK is busy|busy with another command/i.test(raw)) return tr('tpv.sdkBusy');
+    return raw;
+  };
+
+  const warmBackendForTerminal = async () => {
+    if (!configuredDocumentApiUrl || !accessToken) return;
+    setTerminalMessage('tpv.warming');
+    try {
+      await fetchWithTimeout(`${configuredDocumentApiUrl}/health`, {}, 20000);
+    } catch {
+      // Seguimos: el tokenProvider también intentará despertar el servidor.
+    }
+    if (paymentCancelledRef.current) return;
+    // Prefetch del connection-token para que Render esté caliente cuando el SDK lo pida.
+    try {
+      await fetchWithTimeout(`${configuredDocumentApiUrl}/api/stripe/terminal/connection-token`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${accessToken}` },
+      }, 45000);
+    } catch (error) {
+      const aborted = error instanceof Error && (error.name === 'AbortError' || /aborted/i.test(error.message));
+      if (aborted) throw new Error(tr('tpv.tokenTimeout'));
+      // Si falla el prefetch, el SDK reintentará en initialize/easyConnect.
+    }
+  };
+
   const ensureTapToPayReader = async (locationId?: string | null, options?: { livemode?: boolean }) => {
     const resolvedLocationId = (typeof locationId === 'string' && locationId.trim()) || STRIPE_TERMINAL_LOCATION_ID;
     if (!resolvedLocationId) {
       throw new Error('Falta la ubicación de Stripe Terminal. Completa Connect o configura EXPO_PUBLIC_STRIPE_TERMINAL_LOCATION_ID.');
     }
 
-    if (!isStripeTerminalInitialized) {
+    if (terminalConnectInFlightRef.current) {
+      throw new Error(tr('tpv.sdkBusy'));
+    }
+    terminalConnectInFlightRef.current = true;
+
+    try {
+      if (!isStripeTerminalInitialized) {
+        setTerminalMessage('tpv.preparing');
+        const { error } = await initialize();
+        if (paymentCancelledRef.current) throw new Error(tr('tpv.alreadyCharging'));
+        if (error) throw new Error(mapTerminalErrorMessage(error.message || 'No se pudo iniciar Stripe Terminal.'));
+      }
+
+      // Si el lector ya conectado apunta a otra Location (p. ej. tras Connect), reconectar.
+      const readerLocationId = connectedReader?.locationId || connectedReader?.location?.id || null;
+      // Cobro live: siempre Tap to Pay real. Simulado solo en Connect test (o __DEV__ sin live).
+      const isLiveTerminal = options?.livemode === true;
+      const preferSimulated = !isLiveTerminal && (__DEV__ || options?.livemode === false);
+      if (connectedReader && readerLocationId === resolvedLocationId && !preferSimulated) {
+        return connectedReader;
+      }
+      if (connectedReader) {
+        try {
+          await disconnectReader();
+        } catch {
+          // Continuar e intentar conectar de nuevo.
+        }
+      }
+
+      if (paymentCancelledRef.current) throw new Error(tr('tpv.alreadyCharging'));
+
+      const connectTapToPay = async (simulated: boolean) => easyConnect({
+        discoveryMethod: 'tapToPay',
+        simulated,
+        locationId: resolvedLocationId,
+        merchantDisplayName: issuer.name,
+        autoReconnectOnUnexpectedDisconnect: true,
+      });
+
       setTerminalMessage('tpv.preparing');
-      const { error } = await initialize();
-      if (error) throw new Error(error.message || 'No se pudo iniciar Stripe Terminal.');
-    }
-
-    // Si el lector ya conectado apunta a otra Location (p. ej. tras Connect), reconectar.
-    const readerLocationId = connectedReader?.locationId || connectedReader?.location?.id || null;
-    // Cobro live: siempre Tap to Pay real. Simulado solo en Connect test (o __DEV__ sin live).
-    const isLiveTerminal = options?.livemode === true;
-    const preferSimulated = !isLiveTerminal && (__DEV__ || options?.livemode === false);
-    if (connectedReader && readerLocationId === resolvedLocationId && !preferSimulated) {
-      return connectedReader;
-    }
-    if (connectedReader) {
-      try {
-        await disconnectReader();
-      } catch {
-        // Continuar e intentar conectar de nuevo.
+      let connectionResult = await connectTapToPay(preferSimulated);
+      if (paymentCancelledRef.current) throw new Error(tr('tpv.alreadyCharging'));
+      const developerOptionsBlocked = /Developer Options must not be enabled/i.test(
+        connectionResult.error?.message || '',
+      );
+      // En test, si Developer Options bloquean Tap to Pay real, se puede usar simulado.
+      // En live nunca: el usuario vería "pulsa para simular" y no un cobro real.
+      if (connectionResult.error && !preferSimulated && !isLiveTerminal && developerOptionsBlocked) {
+        connectionResult = await connectTapToPay(true);
       }
-    }
-
-    const connectTapToPay = async (simulated: boolean) => easyConnect({
-      discoveryMethod: 'tapToPay',
-      simulated,
-      locationId: resolvedLocationId,
-      merchantDisplayName: issuer.name,
-      autoReconnectOnUnexpectedDisconnect: true,
-    });
-
-    setTerminalMessage('tpv.preparing');
-    let connectionResult = await connectTapToPay(preferSimulated);
-    const developerOptionsBlocked = /Developer Options must not be enabled/i.test(
-      connectionResult.error?.message || '',
-    );
-    // En test, si Developer Options bloquean Tap to Pay real, se puede usar simulado.
-    // En live nunca: el usuario vería "pulsa para simular" y no un cobro real.
-    if (connectionResult.error && !preferSimulated && !isLiveTerminal && developerOptionsBlocked) {
-      connectionResult = await connectTapToPay(true);
-    }
-    if (connectionResult.error) {
-      const message = connectionResult.error.message || 'No se pudo conectar Tap to Pay.';
-      if (/Developer Options must not be enabled/i.test(message)) {
-        throw new Error(
-          'Para cobrar de verdad con tarjeta o móvil, desactiva «Opciones de desarrollador» '
-          + 'en Ajustes del teléfono y vuelve a intentarlo. (USB debugging también las activa.)',
-        );
+      if (connectionResult.error) {
+        const message = mapTerminalErrorMessage(connectionResult.error.message || 'No se pudo conectar Tap to Pay.');
+        if (/Developer Options must not be enabled/i.test(connectionResult.error.message || '')) {
+          throw new Error(
+            'Para cobrar de verdad con tarjeta o móvil, desactiva «Opciones de desarrollador» '
+            + 'en Ajustes del teléfono y vuelve a intentarlo. (USB debugging también las activa.)',
+          );
+        }
+        throw new Error(message);
       }
-      throw new Error(message);
-    }
 
-    return connectionResult.reader;
+      return connectionResult.reader;
+    } finally {
+      terminalConnectInFlightRef.current = false;
+    }
   };
 
   const completePayment = async () => {
@@ -2709,17 +2752,30 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       Alert.alert(tr('pay.sessionRequired'), tr('pay.sessionRequiredBody'));
       return;
     }
+    if (isProcessing || terminalConnectInFlightRef.current) {
+      Alert.alert('Stripe', tr('tpv.alreadyCharging'));
+      return;
+    }
 
-    const paymentAmount = pendingInvoice ? pendingInvoice.total : amount;
+    const paymentAmount = pendingInvoice
+      ? pendingInvoice.total
+      : (pendingCatalogCharge?.total ?? amount);
     const orderId = `stripe-terminal-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    paymentCancelledRef.current = false;
     setIsProcessing(true);
     setTerminalError('');
-    setTerminalMessage('tpv.preparing');
+    setTerminalMessage('tpv.warming');
 
     try {
+      await warmBackendForTerminal();
+      if (paymentCancelledRef.current) return;
+
       // Primero el PaymentIntent (y location Connect); después el lector Tap to Pay.
+      setTerminalMessage('tpv.preparing');
       const intent = await createStripeTerminalPaymentIntent(paymentAmount, orderId);
+      if (paymentCancelledRef.current) return;
       await ensureTapToPayReader(intent.locationId, { livemode: intent.livemode });
+      if (paymentCancelledRef.current) return;
       const retrievedResult = await retrievePaymentIntent(intent.clientSecret);
       if (retrievedResult.error || !retrievedResult.paymentIntent) {
         throw new Error(retrievedResult.error?.message || 'No se pudo preparar el cobro presencial.');
@@ -2731,8 +2787,9 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         paymentIntent: retrievedResult.paymentIntent,
         customerCancellation: 'disableIfAvailable',
       });
+      if (paymentCancelledRef.current) return;
       if (processedResult.error || !processedResult.paymentIntent) {
-        throw new Error(processedResult.error?.message || 'No se pudo completar el cobro presencial.');
+        throw new Error(mapTerminalErrorMessage(processedResult.error?.message || 'No se pudo completar el cobro presencial.'));
       }
       if (processedResult.paymentIntent.status !== 'succeeded') {
         throw new Error(`Stripe Terminal devolvió el estado ${processedResult.paymentIntent.status || 'desconocido'}.`);
@@ -2746,17 +2803,26 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         chargeMode: intent.chargeMode || 'destination',
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'No se pudo completar el cobro presencial.';
+      if (paymentCancelledRef.current) return;
+      const message = mapTerminalErrorMessage(
+        error instanceof Error ? error.message : 'No se pudo completar el cobro presencial.',
+      );
       setTerminalError(message);
       Alert.alert('Error de Stripe', message);
     } finally {
       setIsProcessing(false);
+      terminalConnectInFlightRef.current = false;
     }
   };
 
   const cancelPayment = () => {
+    paymentCancelledRef.current = true;
+    setIsProcessing(false);
+    terminalConnectInFlightRef.current = false;
     setNfcModalVisible(false);
     setPendingInvoice(null);
+    setTerminalError('');
+    setTerminalMessage('tpv.ready');
   };
 
   const closeOnlinePaymentModal = () => {
@@ -2768,6 +2834,9 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   };
 
   const openOnlinePaymentModal = () => {
+    paymentCancelledRef.current = true;
+    setIsProcessing(false);
+    terminalConnectInFlightRef.current = false;
     setNfcModalVisible(false);
     setOnlinePayment(null);
     setOnlinePaymentError('');
