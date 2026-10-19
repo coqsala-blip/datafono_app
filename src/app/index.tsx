@@ -227,11 +227,11 @@ type SavedQuote = {
 const isQuoteDocument = (doc: { documentType?: string }): boolean =>
   doc.documentType === 'PRESUPUESTO';
 
-/** Factura del formulario Presupuesto/Factura aún no marcada como cobrada.
- * Solo pasa a Gastos/Facturas cuando method es "Efectivo" (Marcar cobrada).
- * Sin method (docs antiguos en la nube) se trata como pendiente. */
+/** Factura del formulario Presupuesto/Factura aún no cobrada.
+ * Pendiente: method "Factura" (o ausente en docs antiguos).
+ * Cobrada: Efectivo, tarjeta, Bizum, etc. (cualquier otro method). */
 const isUnpaidCashInvoice = (doc: { documentType?: string; method?: string }): boolean =>
-  doc.documentType === 'FACTURA' && doc.method !== 'Efectivo';
+  doc.documentType === 'FACTURA' && (!doc.method || doc.method === 'Factura');
 
 const isSalesHistoryDocument = (doc: Transaction): boolean =>
   !isQuoteDocument(doc) && !isUnpaidCashInvoice(doc);
@@ -659,6 +659,8 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   const catalogProductsRef = useRef<CatalogProduct[]>([]);
   const [catalogCart, setCatalogCart] = useState<CatalogCartLine[]>([]);
   const [pendingCatalogCharge, setPendingCatalogCharge] = useState<PendingCatalogCharge | null>(null);
+  /** Factura pendiente enlazada al cobro TPV (tarjeta/Bizum/QR): al pagar se cierra ese borrador. */
+  const [pendingCashInvoiceCharge, setPendingCashInvoiceCharge] = useState<CashInvoiceDraft | null>(null);
   const [productDestination, setProductDestination] = useState<ProductDestination>('tpv');
   const [productFormVisible, setProductFormVisible] = useState(false);
   const [productNameInput, setProductNameInput] = useState('');
@@ -798,6 +800,8 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     setTransactions([]);
     setTransactionHistory([]);
     setCashInvoiceDrafts([]);
+    setPendingCashInvoiceCharge(null);
+    setPendingCatalogCharge(null);
     setSavedQuotes([]);
     setExpenses([]);
     setIssuer({ ...initialIssuer });
@@ -2932,8 +2936,55 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     };
   };
 
+  /** Cierra una factura pendiente conservando número/cliente/líneas (efectivo o tarjeta TPV). */
+  const finalizeCashInvoicePayment = (
+    draft: CashInvoiceDraft,
+    method: string,
+    paymentRefs?: StripePaymentRefs,
+  ) => {
+    if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) return;
+    const generation = cacheGenerationRef.current;
+    const createdAt = new Date().toISOString();
+    const paidTransaction: Transaction = {
+      ...draft,
+      createdAt,
+      type: 'COBRO',
+      documentType: 'FACTURA',
+      method,
+      publicUrl: undefined,
+      ...(paymentRefs?.stripePaymentIntentId ? { stripePaymentIntentId: paymentRefs.stripePaymentIntentId } : {}),
+      ...(paymentRefs?.stripeAccountId ? { stripeAccountId: paymentRefs.stripeAccountId } : {}),
+      ...(paymentRefs?.chargeMode ? { chargeMode: paymentRefs.chargeMode } : {}),
+      ...(paymentRefs?.stripeCheckoutSessionId ? { stripeCheckoutSessionId: paymentRefs.stripeCheckoutSessionId } : {}),
+    };
+
+    setCashInvoiceDrafts((current) => current.filter((item) => item.id !== draft.id));
+    setTransactions((current) => [paidTransaction, ...current]);
+    setSelectedTicket(paidTransaction);
+    setDigits('0');
+    setPendingCashInvoiceCharge(null);
+    setNfcModalVisible(false);
+    setOnlinePaymentModalVisible(false);
+
+    setTimeout(async () => {
+      if (cacheGenerationRef.current !== generation) return;
+      const publishedTransaction = await registerTransactionDocumentRef.current(paidTransaction);
+      if (cacheGenerationRef.current !== generation) return;
+      setTransactions((current) => current.map((item) =>
+        item.id === publishedTransaction.id ? publishedTransaction : item
+      ));
+      setSelectedTicket(publishedTransaction);
+    }, 0);
+  };
+
   const createTransactionFromConfirmedPayment = (method: string, paymentAmount: number, paymentRefs?: StripePaymentRefs): void => {
     setNfcModalVisible(false);
+
+    // Factura pendiente enlazada: se cierra ese borrador (mismo nº de factura), no se crea un ticket nuevo.
+    if (pendingCashInvoiceCharge) {
+      finalizeCashInvoicePayment(pendingCashInvoiceCharge, method, paymentRefs);
+      return;
+    }
 
     // createTransaction ya deja el ticket seleccionado (setSelectedTicket) y lo publica con su QR,
     // asi que al confirmarse el pago se abre directamente el recibo/factura para el cliente.
@@ -3084,9 +3135,11 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       return;
     }
 
-    const paymentAmount = pendingInvoice
-      ? pendingInvoice.total
-      : (pendingCatalogCharge?.total ?? amount);
+    const paymentAmount = pendingCashInvoiceCharge
+      ? pendingCashInvoiceCharge.amount
+      : pendingInvoice
+        ? pendingInvoice.total
+        : (pendingCatalogCharge?.total ?? amount);
     const orderId = `stripe-terminal-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     paymentCancelledRef.current = false;
     setIsProcessing(true);
@@ -3185,7 +3238,11 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       return;
     }
 
-    const paymentAmount = pendingInvoice ? pendingInvoice.total : amount;
+    const paymentAmount = pendingCashInvoiceCharge
+      ? pendingCashInvoiceCharge.amount
+      : pendingInvoice
+        ? pendingInvoice.total
+        : amount;
     if (!Number.isFinite(paymentAmount) || paymentAmount < 0.5) {
       setOnlinePaymentError('El importe debe ser de al menos 0,50 €.');
       return;
@@ -3286,6 +3343,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
           paymentAmount,
           pendingDocumentType,
           pendingInvoice,
+          pendingCashInvoiceCharge,
           createdAt: new Date().toISOString(),
         }));
       } catch {
@@ -3358,7 +3416,11 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     const status = payment?.status;
     if (!status) return false;
 
-    const paymentAmount = pendingInvoice ? pendingInvoice.total : amount;
+    const paymentAmount = pendingCashInvoiceCharge
+      ? pendingCashInvoiceCharge.amount
+      : pendingInvoice
+        ? pendingInvoice.total
+        : amount;
     const usedMethod = methodLabelFor(payment?.usedMethod);
 
     if (status === 'SUCCEEDED') {
@@ -3505,6 +3567,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         paymentAmount?: number;
         pendingDocumentType?: DocumentType;
         pendingInvoice?: PendingInvoice | null;
+        pendingCashInvoiceCharge?: CashInvoiceDraft | null;
       } | null = null;
       try {
         pending = JSON.parse(stored);
@@ -3519,6 +3582,9 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         setDigits(String(Math.max(0, Math.round(pending.paymentAmount * 100))));
       }
       if (pending.pendingDocumentType) setPendingDocumentType(pending.pendingDocumentType);
+      if (pending.pendingCashInvoiceCharge?.id) {
+        setPendingCashInvoiceCharge(pending.pendingCashInvoiceCharge);
+      }
       if (pending.pendingInvoice) {
         setPendingInvoice(pending.pendingInvoice);
         setClient(pending.pendingInvoice.client);
@@ -3543,7 +3609,11 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       setOnlinePaymentMessage('Comprobando el pago realizado...');
       setOnlinePaymentModalVisible(true);
 
-      const amountToConfirm = pending.pendingInvoice ? pending.pendingInvoice.total : (pending.paymentAmount || 0);
+      const amountToConfirm = pending.pendingCashInvoiceCharge
+        ? pending.pendingCashInvoiceCharge.amount
+        : pending.pendingInvoice
+          ? pending.pendingInvoice.total
+          : (pending.paymentAmount || 0);
       let attempts = 0;
       while (isCurrent() && attempts < 120) {
         attempts += 1;
@@ -4423,26 +4493,25 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     }
   };
 
-  const markCashInvoiceAsPaid = async (draft: CashInvoiceDraft) => {
-    const createdAt = new Date().toISOString();
-    const paidTransaction: Transaction = {
-      ...draft,
-      createdAt,
-      method: 'Efectivo',
-      publicUrl: undefined,
-    };
-
-    setCashInvoiceDrafts((current) => current.filter((item) => item.id !== draft.id));
-    setTransactions((current) => [paidTransaction, ...current]);
-    setSelectedTicket(paidTransaction);
-
-    const publishedTransaction = await registerTransactionDocument(paidTransaction);
-    setTransactions((current) => current.map((item) =>
-      item.id === publishedTransaction.id ? publishedTransaction : item
-    ));
-    setSelectedTicket(publishedTransaction);
+  const markCashInvoiceAsPaid = (draft: CashInvoiceDraft) => {
+    finalizeCashInvoicePayment(draft, 'Efectivo');
     resetQuoteForm();
     Alert.alert(documentTypeLabel('FACTURA'), tr('cash.saved'));
+  };
+
+  const chargeCashInvoiceViaTpv = (draft: CashInvoiceDraft) => {
+    if (!requireSubscription('realizar cobros')) return;
+    if (!(draft.amount > 0)) {
+      Alert.alert(tr('validation.error'), tr('validation.amount'));
+      return;
+    }
+    setPendingCatalogCharge(null);
+    setPendingInvoice(null);
+    setPendingCashInvoiceCharge(draft);
+    setDigits(String(Math.max(0, Math.round(draft.amount * 100))));
+    setPendingDocumentType('FACTURA');
+    setActiveTab('tpv');
+    Alert.alert(documentTypeLabel('FACTURA'), tr('cash.sentToTpv'));
   };
 
   const deleteCashInvoiceDraft = (draft: CashInvoiceDraft) => {
@@ -4451,7 +4520,14 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       tr('cash.deleteConfirm').replace('{code}', draft.ticketCode),
       [
         { text: tr('common.cancel'), style: 'cancel' },
-        { text: tr('workflow.delete'), style: 'destructive', onPress: () => setCashInvoiceDrafts((current) => current.filter((item) => item.id !== draft.id)) },
+        {
+          text: tr('workflow.delete'),
+          style: 'destructive',
+          onPress: () => {
+            setCashInvoiceDrafts((current) => current.filter((item) => item.id !== draft.id));
+            setPendingCashInvoiceCharge((current) => (current?.id === draft.id ? null : current));
+          },
+        },
       ],
     );
   };
@@ -5700,7 +5776,38 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                 <Text style={styles.displayText}>{formatUiCurrency(amount)}</Text>
               </View>
 
-              {pendingCatalogCharge ? (
+              {pendingCashInvoiceCharge ? (
+                <View style={styles.catalogPendingBanner}>
+                  <Text style={styles.catalogPendingTitle}>{tr('cash.pendingBanner')}</Text>
+                  <Text style={styles.catalogPendingLine}>
+                    {pendingCashInvoiceCharge.ticketCode}
+                    {pendingCashInvoiceCharge.client?.name ? ` · ${pendingCashInvoiceCharge.client.name}` : ''}
+                    {' — '}
+                    {formatUiCurrency(pendingCashInvoiceCharge.amount)}
+                  </Text>
+                  {(pendingCashInvoiceCharge.items || []).slice(0, 4).map((item) => (
+                    <Text key={item.id} style={styles.catalogPendingLine}>
+                      {formatInvoiceItemLabel(item)}
+                    </Text>
+                  ))}
+                  <Pressable
+                    style={[styles.actionBtnTicket, { marginTop: 8 }]}
+                    onPress={() => {
+                      setDigits(String(Math.max(0, Math.round(pendingCashInvoiceCharge.amount * 100))));
+                      setPendingDocumentType('FACTURA');
+                      setNfcModalVisible(true);
+                    }}
+                  >
+                    <Text style={styles.actionBtnText}>{tr('products.chargeNow')}</Text>
+                  </Pressable>
+                  <Pressable
+                    style={[styles.secondaryButton, { marginTop: 6 }]}
+                    onPress={() => { setPendingCashInvoiceCharge(null); setDigits('0'); }}
+                  >
+                    <Text style={styles.secondaryButtonText}>{tr('products.clearPending')}</Text>
+                  </Pressable>
+                </View>
+              ) : pendingCatalogCharge ? (
                 <View style={styles.catalogPendingBanner}>
                   <Text style={styles.catalogPendingTitle}>{tr('products.pendingBanner')}</Text>
                   {pendingCatalogCharge.items.map((item) => (
@@ -6039,13 +6146,16 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                       <Text style={styles.listItemAmount}>{formatUiCurrency(draft.amount)}</Text>
                     </View>
                     <View style={[styles.rowButtons, { marginTop: 8 }]}>
-                      <Pressable style={[styles.primaryButton, { flex: 1, marginTop: 0, backgroundColor: '#16a34a' }]} onPress={() => void markCashInvoiceAsPaid(draft)}>
+                      <Pressable style={[styles.primaryButton, { flex: 1, marginTop: 0, backgroundColor: '#16a34a' }]} onPress={() => markCashInvoiceAsPaid(draft)}>
                         <Text style={styles.primaryButtonText}>{tr('cash.paid')}</Text>
                       </Pressable>
-                      <Pressable style={[styles.secondaryButton, { flex: 1, marginLeft: 8, marginTop: 0, backgroundColor: '#fee2e2' }]} onPress={() => deleteCashInvoiceDraft(draft)}>
-                        <Text style={[styles.secondaryButtonText, { color: '#dc2626' }]}>{tr('workflow.delete')}</Text>
+                      <Pressable style={[styles.primaryButton, { flex: 1, marginLeft: 8, marginTop: 0, backgroundColor: '#b91c1c' }]} onPress={() => chargeCashInvoiceViaTpv(draft)}>
+                        <Text style={styles.primaryButtonText}>{tr('cash.chargeTpv')}</Text>
                       </Pressable>
                     </View>
+                    <Pressable style={[styles.secondaryButton, { marginTop: 8, backgroundColor: '#fee2e2' }]} onPress={() => deleteCashInvoiceDraft(draft)}>
+                      <Text style={[styles.secondaryButtonText, { color: '#dc2626' }]}>{tr('workflow.delete')}</Text>
+                    </Pressable>
                   </View>
                 ))}
               </View>
@@ -6360,7 +6470,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
             <Text style={styles.modalTitle}>💳 {tr('tpv.contactless')}</Text>
-            <Text style={styles.modalSubtitle}>{tr('tpv.amount')}: {formatUiCurrency(pendingInvoice ? pendingInvoice.total : amount)}</Text>
+            <Text style={styles.modalSubtitle}>{tr('tpv.amount')}: {formatUiCurrency(pendingCashInvoiceCharge ? pendingCashInvoiceCharge.amount : pendingInvoice ? pendingInvoice.total : amount)}</Text>
             <Text style={[styles.modalSubtitle, { marginBottom: 8 }]}>{tr('tpv.contactlessHint')}</Text>
             <Text style={[styles.modalSubtitle, { color: terminalError ? '#b91c1c' : '#166534', fontWeight: 'bold' }]}>{tr(terminalMessage)}</Text>
 
@@ -6388,7 +6498,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
             <ScrollView contentContainerStyle={{ alignItems: 'center' }}>
               <Text style={styles.modalTitle}>🔗 {tr('tpv.online')}</Text>
               <Text style={styles.modalSubtitle}>
-                {tr('tpv.amount')}: {formatUiCurrency(pendingInvoice ? pendingInvoice.total : amount)}
+                {tr('tpv.amount')}: {formatUiCurrency(pendingCashInvoiceCharge ? pendingCashInvoiceCharge.amount : pendingInvoice ? pendingInvoice.total : amount)}
               </Text>
               <Text style={[styles.modalSubtitle, { marginBottom: 8 }]}>
                 {tr('pay.waitBody')}
