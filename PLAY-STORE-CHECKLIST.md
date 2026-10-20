@@ -79,7 +79,8 @@ Sube el `.aab` a **Prueba interna** antes de producción.
 - [ ] (Opcional) capturas tablet
 
 ### Privacidad y datos (casi obligatorio con pagos)
-- [ ] **URL de política de privacidad** pública (HTTPS)
+- [ ] **URL de política de privacidad** pública (HTTPS): `https://tpv-gestor-backend.onrender.com/privacy`
+- [ ] **URL de eliminación de cuenta** (Data safety): `https://tpv-gestor-backend.onrender.com/delete-account`
 - [ ] Formulario **Data safety**: cuenta de usuario, datos de negocio, pagos procesados por Stripe, ubicación/NFC/Bluetooth para Tap to Pay
 - [ ] Declarar que los cobros los procesa **Stripe** (no almacenáis PAN de tarjeta en vuestros servidores)
 

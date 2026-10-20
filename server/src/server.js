@@ -537,7 +537,14 @@ app.use(express.urlencoded({ extended: true }));
 
 if (NODE_ENV === 'production') {
   app.use((req, res, next) => {
-    if (req.path === '/health' || req.path === '/privacy' || req.path === '/terms' || req.secure) {
+    if (
+      req.path === '/health'
+      || req.path === '/privacy'
+      || req.path === '/terms'
+      || req.path === '/delete-account'
+      || req.path === '/account-deletion'
+      || req.secure
+    ) {
       return next();
     }
 
@@ -672,10 +679,84 @@ app.get('/privacy', (_req, res) => {
     <p>Puedes solicitar acceso, rectificación, supresión, limitación u oposición, y la portabilidad
     de tus datos, contactando con nosotros. También puedes reclamar ante la autoridad de protección
     de datos competente (en España, la AEPD).</p>
+    <p>Para solicitar la <strong>eliminación completa de tu cuenta</strong> y los datos asociados,
+    sigue las instrucciones de
+    <a href="/delete-account">Eliminación de cuenta (TPV &amp; GESTIÓN)</a>.</p>
     <h2>7. Seguridad</h2>
     <p>Aplicamos medidas técnicas y organizativas razonables (HTTPS, control de sesión, claves en
     el servidor). Ningún sistema es 100&nbsp;% seguro; te pedimos proteger tus credenciales.</p>
   `));
+});
+
+// Página exigida por Google Play (Data safety): pasos claros para pedir el borrado de cuenta.
+const accountDeletionPage = () => legalPage('Eliminación de cuenta', `
+    <p>Esta página explica cómo solicitar la eliminación de tu cuenta y de los datos asociados
+    en la aplicación <strong>TPV &amp; GESTIÓN</strong> (desarrollador / operador del servicio
+    TPV &amp; GESTIÓN en Google Play).</p>
+
+    <h2>1. Cómo solicitar la eliminación de la cuenta</h2>
+    <ol>
+      <li>Envía un correo desde la <strong>misma dirección de correo</strong> con la que te registraste
+      en TPV &amp; GESTIÓN.</li>
+      <li>Asunto sugerido: <strong>Solicitud de eliminación de cuenta — TPV &amp; GESTIÓN</strong>.</li>
+      <li>En el cuerpo indica: nombre de la empresa (si lo conoces), si eres usuario principal o adicional,
+      y confirma que quieres eliminar la cuenta de forma permanente.</li>
+      <li>Escribe a:
+        ${legalContactEmail
+    ? `<a href="mailto:${legalContactEmail}?subject=${encodeURIComponent('Solicitud de eliminación de cuenta — TPV & GESTIÓN')}">${legalContactEmail}</a>`
+    : 'el correo de soporte de TPV &amp; GESTIÓN indicado en la ficha de Google Play o en la política de privacidad.'}
+      </li>
+      <li>Te confirmaremos la recepción y, tras verificar la titularidad de la cuenta, procederemos
+      a la eliminación.</li>
+    </ol>
+
+    <h2>2. Plazo</h2>
+    <p>Tramitamos las solicitudes en un plazo máximo de <strong>30 días</strong> desde la verificación
+    de la petición (salvo obligaciones legales que impongan un plazo distinto).</p>
+
+    <h2>3. Datos que se eliminan</h2>
+    <ul>
+      <li>Cuenta de acceso (correo, nombre, rol y metadatos de sesión/dispositivo).</li>
+      <li>Datos de empresa guardados en la app (perfil, logotipo, catálogo de productos sincronizado).</li>
+      <li>Historial operativo asociado a la cuenta en nuestros sistemas (tickets/facturas sincronizados,
+      gastos sincronizados y documentos publicados en la nube), cuando no deba conservarse por ley.</li>
+      <li>Usuarios adicionales (empleados) vinculados a esa empresa, cuando se elimina la cuenta principal.</li>
+      <li>Datos de suscripción del software en la medida en que podamos solicitar su baja/cierre
+      ante el proveedor de pagos (<strong>Stripe</strong>).</li>
+    </ul>
+
+    <h2>4. Datos que pueden conservarse (y por qué)</h2>
+    <ul>
+      <li><strong>Obligaciones legales / fiscales / contables:</strong> cierta información de facturación
+      o cobros puede conservarse el tiempo exigido por la normativa aplicable (en España, a menudo
+      varios años para documentación mercantil y fiscal).</li>
+      <li><strong>Stripe:</strong> los datos de pago y cobros que trata Stripe se rigen por su propia
+      política (<a href="https://stripe.com/privacy" rel="noopener noreferrer">stripe.com/privacy</a>).
+      Podemos pedirle a Stripe la baja de la suscripción y la eliminación cuando proceda; algunos
+      registros de pago pueden permanecer en Stripe por requisitos legales o de prevención del fraude.</li>
+      <li><strong>Registros de seguridad mínimos:</strong> logs técnicos anonimizados o limitados
+      pueden retenerse un tiempo breve para seguridad y resolución de incidencias.</li>
+    </ul>
+
+    <h2>5. Eliminación parcial sin borrar la cuenta</h2>
+    <p>También puedes solicitar la rectificación o el borrado de <strong>algunos datos concretos</strong>
+    (por ejemplo, corregir datos de empresa o eliminar cierto historial) <strong>sin cerrar la cuenta</strong>,
+    escribiendo al mismo correo de contacto e indicando qué datos quieres modificar o suprimir.
+    Evaluaremos la solicitud conforme al RGPD y a las obligaciones legales de conservación.</p>
+
+    <h2>6. Más información</h2>
+    <p>Consulta la
+    <a href="/privacy">Política de Privacidad de TPV &amp; GESTIÓN</a>
+    y las
+    <a href="/terms">Condiciones de Servicio</a>.</p>
+  `);
+
+app.get('/delete-account', (_req, res) => {
+  res.type('html').send(accountDeletionPage());
+});
+
+app.get('/account-deletion', (_req, res) => {
+  res.redirect(301, '/delete-account');
 });
 
 app.get('/terms', (_req, res) => {
