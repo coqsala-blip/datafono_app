@@ -671,6 +671,7 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   const [productPhotoUri, setProductPhotoUri] = useState<string | null>(null);
   const [quantityProduct, setQuantityProduct] = useState<CatalogProduct | null>(null);
   const [quantityValue, setQuantityValue] = useState(1);
+  const [quantityCustomInput, setQuantityCustomInput] = useState('1');
 
   // Estados específicos para Presupuesto
   const [presupuestoClient, setPresupuestoClient] = useState<Client>({ name: '', nif: '', address: '' });
@@ -2846,11 +2847,23 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     setCatalogCart((current) => current.filter((line) => line.productId !== productId));
   };
 
+  const parseCatalogQuantity = (raw: string): number => {
+    const parsed = Math.floor(Number(String(raw).replace(',', '.').trim()));
+    if (!Number.isFinite(parsed) || parsed < 1) return 0;
+    return Math.min(9999, parsed);
+  };
+
   const confirmProductQuantity = () => {
-    if (!quantityProduct || quantityValue < 1) return;
-    setCatalogCart((current) => addOrIncrementCartLine(current, quantityProduct, quantityValue));
+    if (!quantityProduct) return;
+    const qty = parseCatalogQuantity(quantityCustomInput) || quantityValue;
+    if (qty < 1) {
+      Alert.alert(tr('validation.error'), tr('products.quantityInvalid'));
+      return;
+    }
+    setCatalogCart((current) => addOrIncrementCartLine(current, quantityProduct, qty));
     setQuantityProduct(null);
     setQuantityValue(1);
+    setQuantityCustomInput('1');
   };
 
   const dispatchCatalogSelection = () => {
@@ -5976,7 +5989,11 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                 <Pressable
                   key={product.id}
                   style={styles.productCard}
-                  onPress={() => { setQuantityProduct(product); setQuantityValue(1); }}
+                  onPress={() => {
+                    setQuantityProduct(product);
+                    setQuantityValue(1);
+                    setQuantityCustomInput('1');
+                  }}
                   onLongPress={() => {
                     Alert.alert(product.name, undefined, [
                       { text: tr('common.cancel'), style: 'cancel' },
@@ -6728,19 +6745,49 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                 <Pressable
                   key={value}
                   style={[styles.quantityChip, quantityValue === value && styles.quantityChipActive]}
-                  onPress={() => setQuantityValue(value)}
+                  onPress={() => {
+                    setQuantityValue(value);
+                    setQuantityCustomInput(String(value));
+                  }}
                 >
                   <Text style={[styles.quantityChipText, quantityValue === value && styles.quantityChipTextActive]}>×{value}</Text>
                 </Pressable>
               ))}
             </View>
+            <View style={styles.quantityCustomRow}>
+              <Text style={styles.quantityCustomLabel}>×</Text>
+              <TextInput
+                style={styles.quantityCustomInput}
+                value={quantityCustomInput}
+                onChangeText={(text) => {
+                  const cleaned = text.replace(/[^\d]/g, '').slice(0, 4);
+                  setQuantityCustomInput(cleaned);
+                  const parsed = parseCatalogQuantity(cleaned);
+                  if (parsed >= 1 && parsed <= 10) setQuantityValue(parsed);
+                  else if (parsed > 10) setQuantityValue(0);
+                }}
+                keyboardType="number-pad"
+                placeholder={tr('products.quantityCustom')}
+                placeholderTextColor="#94a3b8"
+                maxLength={4}
+              />
+            </View>
             <Text style={[styles.listItemTitle, { textAlign: 'center', marginVertical: 10 }]}>
-              {formatUiCurrency((quantityProduct?.price || 0) * quantityValue)}
+              {formatUiCurrency(
+                (quantityProduct?.price || 0) * (parseCatalogQuantity(quantityCustomInput) || Math.max(1, quantityValue)),
+              )}
             </Text>
             <Pressable style={styles.primaryButton} onPress={confirmProductQuantity}>
               <Text style={styles.primaryButtonText}>{tr('products.addToCart')}</Text>
             </Pressable>
-            <Pressable style={[styles.secondaryButton, { marginTop: 8 }]} onPress={() => setQuantityProduct(null)}>
+            <Pressable
+              style={[styles.secondaryButton, { marginTop: 8 }]}
+              onPress={() => {
+                setQuantityProduct(null);
+                setQuantityValue(1);
+                setQuantityCustomInput('1');
+              }}
+            >
               <Text style={styles.secondaryButtonText}>{tr('common.cancel')}</Text>
             </Pressable>
           </View>
@@ -7356,6 +7403,20 @@ const styles = StyleSheet.create({
   quantityChipActive: { backgroundColor: '#16a34a', borderColor: '#16a34a' },
   quantityChipText: { fontSize: 14, fontWeight: 'bold', color: '#0f172a' },
   quantityChipTextActive: { color: '#ffffff' },
+  quantityCustomRow: { flexDirection: 'row', alignItems: 'center', marginTop: 12, gap: 8 },
+  quantityCustomLabel: { fontSize: 22, fontWeight: '700', color: '#0f172a', minWidth: 24, textAlign: 'center' },
+  quantityCustomInput: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#0f172a',
+    backgroundColor: '#ffffff',
+  },
   scanBarRow: { marginTop: 4 },
   scanBarcodeBtn: { backgroundColor: '#475569', borderRadius: 6, paddingVertical: 12, alignItems: 'center' },
   scanBarcodeText: { color: '#ffffff', fontSize: 12, fontWeight: 'bold' },

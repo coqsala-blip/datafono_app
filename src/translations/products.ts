@@ -11,6 +11,8 @@ const rows: Record<string, readonly [string, string, string, string, string, str
   'products.save': ['Guardar producto', 'Save product', 'Enregistrer le produit', 'Produkt speichern', 'Salva prodotto', 'Guardar produto', 'Product opslaan', 'Zapisz produkt'],
   'products.delete': ['Eliminar', 'Delete', 'Supprimer', 'Löschen', 'Elimina', 'Eliminar', 'Verwijderen', 'Usuń'],
   'products.quantity': ['¿Cuántas unidades?', 'How many units?', 'Combien d’unités ?', 'Wie viele Einheiten?', 'Quante unità?', 'Quantas unidades?', 'Hoeveel stuks?', 'Ile sztuk?'],
+  'products.quantityCustom': ['Otra cantidad (ej. 35)', 'Other qty (e.g. 35)', 'Autre qté (ex. 35)', 'Andere Menge (z. B. 35)', 'Altra qtà (es. 35)', 'Outra qtd (ex. 35)', 'Andere aantal (bijv. 35)', 'Inna ilość (np. 35)'],
+  'products.quantityInvalid': ['Indica una cantidad válida (1 o más).', 'Enter a valid quantity (1 or more).', 'Indiquez une quantité valide (1 ou plus).', 'Gültige Menge eingeben (1 oder mehr).', 'Inserisci una quantità valida (1 o più).', 'Indique uma quantidade válida (1 ou mais).', 'Voer een geldig aantal in (1 of meer).', 'Podaj prawidłową ilość (1 lub więcej).'],
   'products.addToCart': ['Añadir', 'Add', 'Ajouter', 'Hinzufügen', 'Aggiungi', 'Adicionar', 'Toevoegen', 'Dodaj'],
   'products.cart': ['Selección actual', 'Current selection', 'Sélection actuelle', 'Aktuelle Auswahl', 'Selezione attuale', 'Seleção atual', 'Huidige selectie', 'Bieżący wybór'],
   'products.cartEmpty': ['Selecciona productos y cantidades.', 'Select products and quantities.', 'Sélectionnez des produits et quantités.', 'Produkte und Mengen wählen.', 'Seleziona prodotti e quantità.', 'Selecione produtos e quantidades.', 'Selecteer producten en aantallen.', 'Wybierz produkty i ilości.'],
