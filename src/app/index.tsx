@@ -657,6 +657,9 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   const [pendingInvoice, setPendingInvoice] = useState<PendingInvoice | null>(null);
   const [catalogProducts, setCatalogProducts] = useState<CatalogProduct[]>([]);
   const catalogProductsRef = useRef<CatalogProduct[]>([]);
+  /** Cola de subidas del catálogo: evita que una sync antigua machaque productos recién creados. */
+  const catalogUploadChainRef = useRef<Promise<void>>(Promise.resolve());
+  const catalogUploadBusyRef = useRef(0);
   const [catalogCart, setCatalogCart] = useState<CatalogCartLine[]>([]);
   const [pendingCatalogCharge, setPendingCatalogCharge] = useState<PendingCatalogCharge | null>(null);
   /** Factura pendiente enlazada al cobro TPV (tarjeta/Bizum/QR): al pagar se cierra ese borrador. */
@@ -833,6 +836,9 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     setPendingInvoice(null);
     setPendingCatalogCharge(null);
     setCatalogProducts([]);
+    catalogProductsRef.current = [];
+    catalogUploadChainRef.current = Promise.resolve();
+    catalogUploadBusyRef.current = 0;
     setCatalogCart([]);
     setProductDestination('tpv');
     setProductFormVisible(false);
@@ -2675,6 +2681,47 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     await uploadCompanyToCloud({ products: list });
   };
 
+  /** Encola una subida del catálogo actual (siempre el ref más reciente al ejecutar). */
+  const scheduleCatalogUpload = (): Promise<void> => {
+    catalogUploadBusyRef.current += 1;
+    const pending = catalogUploadChainRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        const list = catalogProductsRef.current;
+        await uploadCatalogToCloud(list);
+      })
+      .catch((error) => {
+        console.warn('No se pudo sincronizar el catálogo en cola:', error);
+        throw error;
+      })
+      .finally(() => {
+        catalogUploadBusyRef.current = Math.max(0, catalogUploadBusyRef.current - 1);
+      });
+    catalogUploadChainRef.current = pending.then(() => undefined, () => undefined);
+    return pending;
+  };
+
+  /** Une nube + local: no se pierden productos creados aquí que aún no están en la nube. */
+  const mergeCloudCatalogWithLocal = (local: CatalogProduct[], cloud: CatalogProduct[]): CatalogProduct[] => {
+    const byId = new Map<string, CatalogProduct>();
+    for (const product of cloud) byId.set(product.id, product);
+    for (const product of local) {
+      if (!byId.has(product.id)) byId.set(product.id, product);
+    }
+    return [...byId.values()].sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+  };
+
+  const applyCloudCatalog = (cloudProducts: CatalogProduct[]) => {
+    const localNow = catalogProductsRef.current;
+    const merged = mergeCloudCatalogWithLocal(localNow, cloudProducts);
+    const localOnlyCount = localNow.filter((product) => !cloudProducts.some((cloud) => cloud.id === product.id)).length;
+    setCatalogProducts(merged);
+    // Había productos locales pendientes de subir: publicar el merge (sin pisar con una nube vieja).
+    if (localOnlyCount > 0) {
+      void scheduleCatalogUpload().catch(() => undefined);
+    }
+  };
+
   const pullCompanyFromCloud = async (): Promise<{ products: CatalogProduct[] | null; issuer: Partial<Issuer> | null }> => {
     if (!isLoaded || !storageScope || loadedScopeRef.current !== storageScope || storageScopeRef.current !== storageScope) {
       return { products: null, issuer: null };
@@ -2718,13 +2765,16 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     const generation = cacheGenerationRef.current;
     (async () => {
       try {
+        // Si hay una subida en curso, no bajar aún: evitar machacar productos recién añadidos.
+        if (catalogUploadBusyRef.current > 0) return;
         const company = await pullCompanyFromCloud();
         if (cancelled || cacheGenerationRef.current !== generation) return;
+        if (catalogUploadBusyRef.current > 0) return;
         if (company.issuer) applyCloudIssuer(company.issuer);
         if (company.products && company.products.length > 0) {
-          setCatalogProducts(company.products);
+          applyCloudCatalog(company.products);
         } else if (catalogProductsRef.current.length > 0) {
-          await uploadCatalogToCloud(catalogProductsRef.current);
+          await scheduleCatalogUpload();
         }
       } catch (error) {
         console.warn('No se pudo actualizar el catálogo al abrir Productos:', error);
@@ -2771,7 +2821,8 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
     };
     setCatalogProducts((current) => {
       const next = [product, ...current];
-      void uploadCatalogToCloud(next).catch((error) => {
+      catalogProductsRef.current = next;
+      void scheduleCatalogUpload().catch((error) => {
         console.warn('No se pudo guardar el catálogo en la nube:', error);
         Alert.alert(
           tr('products.title'),
@@ -2786,7 +2837,8 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
   const deleteCatalogProduct = (productId: string) => {
     setCatalogProducts((current) => {
       const next = current.filter((product) => product.id !== productId);
-      void uploadCatalogToCloud(next).catch((error) =>
+      catalogProductsRef.current = next;
+      void scheduleCatalogUpload().catch((error) =>
         console.warn('No se pudo sincronizar el catálogo tras borrar:', error)
       );
       return next;
@@ -3999,14 +4051,18 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
         localIssuer.name.trim() || localIssuer.nif.trim() || localIssuer.address.trim() || localIssuer.logoUri
         || (localIssuer.managerEmail || '').trim() || (localIssuer.iban || '').trim(),
       );
-      if (localCatalog.length > 0 || hasLocalIssuer) {
+      if (localCatalog.length > 0) {
         try {
-          await uploadCompanyToCloud({
-            ...(hasLocalIssuer ? { issuer: localIssuer } : {}),
-            ...(localCatalog.length > 0 ? { products: localCatalog } : {}),
-          });
+          await scheduleCatalogUpload();
         } catch (uploadError) {
-          console.warn('No se pudo subir empresa/catálogo antes de sincronizar:', uploadError);
+          console.warn('No se pudo subir el catálogo antes de sincronizar:', uploadError);
+        }
+      }
+      if (hasLocalIssuer) {
+        try {
+          await uploadCompanyToCloud({ issuer: localIssuer });
+        } catch (uploadError) {
+          console.warn('No se pudieron subir los datos de empresa antes de sincronizar:', uploadError);
         }
       }
 
@@ -4111,12 +4167,16 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
       }
       if (cloudIssuer) applyCloudIssuer(cloudIssuer);
       if (cloudProducts) {
-        restoredProductsCount = cloudProducts.length;
         const localNow = catalogProductsRef.current;
         if (cloudProducts.length > 0) {
-          setCatalogProducts(cloudProducts);
+          // No aplicar un pull que pise una subida en curso.
+          if (catalogUploadBusyRef.current === 0) {
+            applyCloudCatalog(cloudProducts);
+          }
+          restoredProductsCount = mergeCloudCatalogWithLocal(localNow, cloudProducts).length;
         } else if (localNow.length > 0) {
-          void uploadCatalogToCloud(localNow).catch((error) =>
+          restoredProductsCount = localNow.length;
+          void scheduleCatalogUpload().catch((error) =>
             console.warn('No se pudo publicar el catálogo local en la nube:', error)
           );
         }
@@ -5868,11 +5928,13 @@ const refreshSubscriptionStatusRef = useRef<() => Promise<void>>(() => Promise.r
                   void checkForOta();
                   void (async () => {
                     try {
-                      const cloudProducts = await pullCatalogFromCloud();
-                      if (cloudProducts && cloudProducts.length > 0) {
-                        setCatalogProducts(cloudProducts);
-                      } else if (catalogProductsRef.current.length > 0) {
-                        await uploadCatalogToCloud(catalogProductsRef.current);
+                      if (catalogUploadBusyRef.current === 0) {
+                        const cloudProducts = await pullCatalogFromCloud();
+                        if (cloudProducts && cloudProducts.length > 0) {
+                          applyCloudCatalog(cloudProducts);
+                        } else if (catalogProductsRef.current.length > 0) {
+                          await scheduleCatalogUpload();
+                        }
                       }
                     } catch (error) {
                       console.warn('No se pudo refrescar el catálogo:', error);
